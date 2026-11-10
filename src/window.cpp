@@ -111,6 +111,7 @@ void StyleSci() {
             if (role == R_Heading || role == R_Strong) Sci(SCI_STYLESETBOLD, style, 1);
             if (role == R_Em) Sci(SCI_STYLESETITALIC, style, 1);
         }
+    Sci(SCI_SETMARGINRIGHT, 0, MulDiv(12, g_dpi, 96));  // gap between line numbers and text
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_BACK, p.sel | 0xFF000000);
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_INACTIVE_BACK, p.sel | 0xFF000000);
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET, p.role[R_Default] | 0xFF000000);
@@ -397,6 +398,15 @@ void Layout() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     int top = (int)std::ceil(kTitleH * g_dpi / 96);
+    // Mica everywhere, except under Scintilla: GDI writes alpha 0, which DWM would add onto the backdrop.
+    static int glassTop = -2;
+    int want = g_kind == K_Text ? top : -1;
+    if (want != glassTop) {
+        MARGINS m{0, 0, want, 0};
+        if (want < 0) m = {-1};
+        DwmExtendFrameIntoClientArea(g_hwnd, &m);
+        glassTop = want;
+    }
     if (g_kind == K_Text)
         SetWindowPos(g_sci, nullptr, 0, top, rc.right, rc.bottom - top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     else
@@ -696,8 +706,6 @@ bool PreviewInit(HINSTANCE inst) {
                              g_sizeDip.cx, g_sizeDip.cy, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return false;
     g_dpi = GetDpiForWindow(g_hwnd);
-    MARGINS margins{-1};
-    DwmExtendFrameIntoClientArea(g_hwnd, &margins);
     DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_MAINWINDOW;  // Mica
     DwmSetWindowAttribute(g_hwnd, DWMWA_SYSTEMBACKDROP_TYPE, &backdrop, sizeof backdrop);
     DWM_WINDOW_CORNER_PREFERENCE corner = DWMWCP_ROUND;
@@ -713,7 +721,7 @@ bool PreviewInit(HINSTANCE inst) {
                             g_hwnd, nullptr, inst, nullptr);
     g_sciFn = (SciFnDirect)SendMessageW(g_sci, SCI_GETDIRECTFUNCTION, 0, 0);
     g_sciPtr = (sptr_t)SendMessageW(g_sci, SCI_GETDIRECTPOINTER, 0, 0);
-    Sci(SCI_SETTECHNOLOGY, SC_TECHNOLOGY_DEFAULT);
+    Sci(SCI_SETTECHNOLOGY, SC_TECHNOLOGY_DEFAULT);  // GDI: faster than software DirectWrite, no GPU driver
     Sci(SCI_SETBUFFEREDDRAW, 0);
     Sci(SCI_SETCODEPAGE, SC_CP_UTF8);
     Sci(SCI_SETUNDOCOLLECTION, 0);

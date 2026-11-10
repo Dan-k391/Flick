@@ -219,6 +219,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool bench = argc > 1 && !wcscmp(argv[1], L"--bench");
 
+    if (argc > 1 && !wcscmp(argv[1], L"--selftest")) {
+        auto lexer = [](const wchar_t* f) { const Lang* l = LangForFile(f); return l ? l->lexer : ""; };
+        bool ok = !strcmp(lexer(LR"(C:\a\Main.CPP)"), "cpp") && !strcmp(lexer(L"x.py"), "python") &&
+                  !strcmp(lexer(L"CMakeLists.txt"), "cmake") && !strcmp(lexer(L"Makefile"), "makefile") &&
+                  !strcmp(lexer(L"a.json"), "json") && !strcmp(lexer(L"notes.txt"), "") &&
+                  !strcmp(lexer(L"a.c.bak"), "") && !strcmp(lexer(L"x.h"), "cpp") && !strcmp(lexer(L"noext"), "");
+        return ok ? 0 : 1;
+    }
     if (argc > 1 && !wcscmp(argv[1], L"--exit")) {
         if (HWND h = FindWindowW(L"FlickPreview", nullptr)) PostMessageW(h, WM_FLICK_QUIT, 0, 0);
         return 0;
@@ -233,8 +241,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\Flick", logPath, MAX_PATH);
     CreateDirectoryW(logPath, nullptr);
     wcscat_s(logPath, bench ? L"\\bench.log" : L"\\flick.log");
-    g_logFile = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS,
-                            FILE_ATTRIBUTE_NORMAL, nullptr);
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    bool tooBig = GetFileAttributesExW(logPath, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > (1 << 20);
+    g_logFile = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            tooBig ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);  // keep it < ~1 MB
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     LONGLONG t0 = Now();
