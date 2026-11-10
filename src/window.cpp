@@ -86,16 +86,8 @@ bool g_imgReduced;  // image decoded below full size to fit the window
 Hot g_hot;
 D2D1_RECT_F g_openRc, g_closeRc;
 
-// Scrollable documents (Markdown, PDF, tables), in DIPs. Index 0 = horizontal, 1 = vertical,
-// 2 = the sidebar.
-float g_scroll[3], g_doc[3];  // g_doc[0] = 0: nothing scrolls sideways
-float g_natW, g_natH;         // natural size of a picture/SVG (pixels), for fitting the window
-bool g_natVector;             // SVG: may be scaled up to fill the window
-bool g_userSized;             // the user resized the window in this size/move loop
-bool g_sideFocus;             // last click was in the sidebar: arrow keys step through its items
-float g_pdfSlot;              // PDF: view height each page was laid out for (one page per view)
-int g_wheelAcc;               // PDF: wheel delta not yet turned into a page step
-void FitWindow();
+// Scrollable documents (Markdown, PDF, tables), in DIPs. Index 0 = horizontal, 1 = vertical.
+float g_scroll[2], g_doc[2];  // g_doc[0] = 0: nothing scrolls sideways
 bool g_sizing;  // inside a move/size loop: don't re-render PDF pages for every intermediate width
 constexpr float kBarHit = 14;  // thickness of a scrollbar's mouse area along the window edge
 int g_dragAxis = -1;           // scrollbar being dragged
@@ -121,13 +113,15 @@ std::atomic<int> g_gridGen;
 bool g_gridPending;
 
 // Sidebar for Markdown (contents) and PDF (page thumbnails), when the window is wide enough.
-constexpr float kSideW = 220, kSideMinWindow = 600, kThumbW = 132, kHeadRowH = 30, kThumbLabel = 24;
+constexpr float kSideW = 220, kSideMinWindow = 760, kThumbW = 132, kHeadRowH = 30, kThumbLabel = 24;
+float g_sideScroll;
 int g_sideCurrent = -1;  // item the reading position is in, last time it was drawn
 std::vector<ComPtr<ID2D1Bitmap>> g_thumbBmp;
 std::vector<UINT> g_thumbW;  // pixel width each thumbnail was rendered at (0 = never)
 bool g_pdfReqThumb;          // the page the worker is rendering is a thumbnail
 
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
+constexpr float kPageGap = 12;
 int g_pdfGen;
 bool g_pdfIdle = true, g_pdfFailed;
 LONGLONG g_pdfT0;
@@ -216,17 +210,6 @@ ComPtr<ID2D1Bitmap> ToD2D(IWICBitmapSource* src) {
     return bmp;
 }
 
-// Content area (physical pixels) of the remembered window size. Pictures are decoded for it before
-// the window is fitted to them, so showing one costs a single resize.
-void BoxArea(double& w, double& h) {
-    RECT wr, cr;
-    GetWindowRect(g_hwnd, &wr);
-    GetClientRect(g_hwnd, &cr);
-    double frameW = (wr.right - wr.left) - cr.right, frameH = (wr.bottom - wr.top) - cr.bottom;  // resize borders
-    w = std::max(64.0, g_sizeDip.cx * g_dpi / 96.0 - frameW - 2 * kPad * g_dpi / 96);
-    h = std::max(64.0, g_sizeDip.cy * g_dpi / 96.0 - frameH - (kTitleH + kPad) * g_dpi / 96);
-}
-
 bool LoadImage(const std::wstring& path) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
@@ -244,11 +227,12 @@ bool LoadImage(const std::wstring& path) {
         SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &pv)) && pv.vt == VT_UI2 && pv.uiVal <= 8)
         g_orient = pv.uiVal;
     PropVariantClear(&pv);
-    g_natW = (float)(g_orient >= 5 ? h : w), g_natH = (float)(g_orient >= 5 ? w : h);
 
     // Decode no more pixels than the window shows; WM_EXITSIZEMOVE re-decodes after a resize.
-    double maxW, maxH;
-    BoxArea(maxW, maxH);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    double maxW = std::max(64.f, rc.right - 2 * kPad * g_dpi / 96);
+    double maxH = std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96);
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = std::min({1.0, maxW / w, maxH / h});
     g_imgReduced = s < 1;
@@ -361,14 +345,14 @@ bool LoadText(const std::wstring& path) {
 }
 
 bool LoadSvg(const std::wstring& path) {
-    double maxW, maxH;
-    BoxArea(maxW, maxH);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
     UINT w, h;
-    auto bmp = SvgRender(path, (float)maxW, (float)maxH, g_wic.Get(), w, h);
+    auto bmp = SvgRender(path, std::max(64.f, rc.right - 2 * kPad * g_dpi / 96),
+                         std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96), g_wic.Get(), w, h);
     if (!bmp || !(g_bmp = ToD2D(bmp.Get()))) return false;
     g_orient = 1;
     g_imgReduced = true;  // vector: render again at the new size after a resize
-    g_natW = (float)w, g_natH = (float)h, g_natVector = true;
     g_sub = std::to_wstring(w) + L" × " + std::to_wstring(h);
     return true;
 }
@@ -435,30 +419,20 @@ void SideItems(std::vector<float>& top, std::vector<float>& height) {
     }
 }
 
-constexpr float kPageMargin = 12;
-
-float SlotH() {  // one page per view: each page owns a slot as high as the view
+float PageWidth() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    return std::max(1.f, Dip(rc.bottom) - kTitleH);
+    return Dip(rc.right) - 2 * kPad - SideW();
 }
 
-// Page i (pw x ph points) fitted whole into its slot, in document coordinates (window DIPs at scroll 0).
-D2D1_RECT_F PageRect(float pw, float ph, size_t i) {
-    RECT rc;
-    GetClientRect(g_hwnd, &rc);
-    float slot = SlotH(), left = kPad + SideW(), availW = std::max(1.f, Dip(rc.right) - kPad - left);
-    float k = std::min(availW / pw, (slot - 2 * kPageMargin) / ph), w = std::round(pw * k), h = std::round(ph * k);
-    float x = std::round(left + (availW - w) / 2), y = std::round(kTitleH + i * slot + (slot - h) / 2);
-    return {x, y, x + w, y + h};
+// Document position of PDF page i (as DrawPdf lays the pages out).
+float PageTop(size_t i) {
+    float w = PageWidth(), y = kPad / 2;
+    for (size_t k = 0; k < i && k < g_pages.size(); k++) y += std::round(w * g_pages[k].second / g_pages[k].first) + kPageGap;
+    return y;
 }
 
-UINT PagePx(size_t i) {
-    D2D1_RECT_F r = PageRect(g_pages[i].first, g_pages[i].second, i);
-    return (UINT)std::lround((r.right - r.left) * g_dpi / 96);
-}
-
-// Item the reading position is in: the heading above the top of the view, or the page in view.
+// Item the reading position is in: the heading above the top of the view, or the page a third down.
 int CurrentItem() {
     if (g_kind == K_Md) {
         int cur = 0;
@@ -469,20 +443,29 @@ int CurrentItem() {
         }
         return cur;
     }
-    if (g_pages.empty()) return 0;
-    return std::clamp((int)std::lround(g_scroll[1] / SlotH()), 0, (int)g_pages.size() - 1);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float at = g_scroll[1] + (Dip(rc.bottom) - kTitleH) / 3, w = PageWidth(), y = kPad / 2;
+    for (size_t i = 0; i < g_pages.size(); i++) {
+        y += std::round(w * g_pages[i].second / g_pages[i].first) + kPageGap;
+        if (at < y) return (int)i;
+    }
+    return g_pages.empty() ? 0 : (int)g_pages.size() - 1;
 }
 
 // Next page the PDF worker should render, in WM_FLICK_PDF reply format: the first page in or just
 // below the view that hasn't been rendered at the current width.
 LRESULT NextPdfPage(bool* thumb = nullptr) {
     if (thumb) *thumb = false;
-    float viewH = SlotH();
-    // The page(s) in view, then the next one (ready before the user steps to it).
-    size_t first = (size_t)std::max(0.f, std::floor(g_scroll[1] / viewH));
-    for (size_t i = first; i < g_pages.size() && i <= first + 2; i++) {
-        UINT px = PagePx(i);
-        if (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)) return ((LRESULT)px << 32) | (i + 1);
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float w = PageWidth(), viewH = Dip(rc.bottom) - kTitleH, y = kPad / 2;
+    UINT px = (UINT)std::lround(w * g_dpi / 96);
+    for (size_t i = 0; i < g_pages.size() && y < g_scroll[1] + 2 * viewH; i++) {
+        float h = std::round(w * g_pages[i].second / g_pages[i].first);
+        if (y + h > g_scroll[1] && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
+            return ((LRESULT)px << 32) | (i + 1);
+        y += h + kPageGap;
     }
     // Then the thumbnails in view in the sidebar.
     if (SideW() > 0 && g_thumbW.size() == g_pages.size()) {
@@ -490,7 +473,7 @@ LRESULT NextPdfPage(bool* thumb = nullptr) {
         SideItems(top, height);
         UINT tpx = (UINT)std::lround(kThumbW * g_dpi / 96);
         for (size_t i = 0; i < top.size(); i++)
-            if (top[i] + height[i] > g_scroll[2] && top[i] < g_scroll[2] + viewH && !g_thumbW[i]) {
+            if (top[i] + height[i] > g_sideScroll && top[i] < g_sideScroll + viewH && !g_thumbW[i]) {
                 if (thumb) *thumb = true;
                 return ((LRESULT)tpx << 32) | (i + 1);
             }
@@ -510,7 +493,6 @@ LRESULT OnPdf(PdfMsg& m) {
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
                                 : std::to_wstring(m.pageCount) + (m.pageCount == 1 ? L" page" : L" pages");
-        if (m.page == -1 && !g_pdfFailed) FitWindow();  // before page 1 is requested, so it renders at the final size
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
     if (m.page >= 0 && (size_t)m.page < g_pages.size() && g_pdfReqThumb) {
@@ -518,7 +500,7 @@ LRESULT OnPdf(PdfMsg& m) {
         if (m.bmp) g_thumbBmp[m.page] = ToD2D(m.bmp.Get());
         InvalidateRect(g_hwnd, nullptr, FALSE);
     } else if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
-        g_pageW[m.page] = PagePx(m.page);
+        g_pageW[m.page] = (UINT)std::lround(PageWidth() * g_dpi / 96);
         if (m.bmp) g_pageBmp[m.page] = ToD2D(m.bmp.Get());
         if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -546,17 +528,16 @@ void WaitForContent() {
     }
 }
 
-// One page per view, each fitted whole. Pages far from the view drop their bitmaps.
+// Pages stacked at the content width. Pages far from the view drop their bitmaps.
 float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
-    float viewH = bottom - top;
-    g_pdfSlot = SlotH();
+    float w = PageWidth(), y = top + kPad / 2 - g_scroll[1], viewH = bottom - top;
     // Until the worker reports the real sizes, show one blank Letter-shaped page.
     const std::vector<std::pair<float, float>> placeholder{{612.f, 792.f}};
     const auto& pages = g_pages.empty() && !g_pdfFailed ? placeholder : g_pages;
     fill->SetColor(C(0xFFFFFF));
     for (size_t i = 0; i < pages.size(); i++) {
-        D2D1_RECT_F r = PageRect(pages[i].first, pages[i].second, i);
-        r.top -= g_scroll[1], r.bottom -= g_scroll[1];
+        float h = std::round(w * pages[i].second / pages[i].first);
+        D2D1_RECT_F r{kPad + SideW(), y, kPad + SideW() + w, y + h};
         if (r.bottom > top && r.top < bottom) {
             g_rt->FillRectangle(r, fill);
             if (i < g_pageBmp.size() && g_pageBmp[i])
@@ -564,48 +545,9 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
         } else if (i < g_pageBmp.size() && (r.bottom < top - 2 * viewH || r.top > bottom + 2 * viewH)) {
             g_pageBmp[i].Reset(), g_pageW[i] = 0;
         }
+        y += h + kPageGap;
     }
-    return pages.size() * SlotH();
-}
-
-// Photos, SVGs, videos and PDFs: the window takes the content's shape inside the remembered size
-// (pictures at most at their natural size); everything else uses the remembered size. Keeps the centre.
-void FitWindow() {
-    constexpr float kMinW = 420, kMinH = 300;
-    RECT wr, cr;
-    GetWindowRect(g_hwnd, &wr);
-    GetClientRect(g_hwnd, &cr);
-    float frameW = Dip((wr.right - wr.left) - cr.right), frameH = Dip((wr.bottom - wr.top) - cr.bottom);  // resize borders
-    float w = (float)g_sizeDip.cx, h = (float)g_sizeDip.cy;
-    float cw = 0, ch = 0, extraW = 0, chromeH = kTitleH + kPad;
-    bool upscale = true;
-    if (g_kind == K_Image && g_natW > 0) {
-        cw = g_natW * 96 / g_dpi, ch = g_natH * 96 / g_dpi, upscale = g_natVector;
-    } else if (g_kind == K_Media && g_mediaVideo) {
-        MediaState ms = MediaGet();
-        cw = (float)(ms.videoW ? ms.videoW : g_posterW), ch = (float)(ms.videoW ? ms.videoH : g_posterH);
-    } else if (g_kind == K_Pdf && !g_pages.empty()) {
-        cw = g_pages[0].first, ch = g_pages[0].second, chromeH = kTitleH + 2 * kPageMargin;
-        if (g_pages.size() > 1) extraW = kSideW;
-    }
-    if (cw > 0 && ch > 0) {
-        float availW = w - frameW - 2 * kPad - extraW, availH = h - frameH - chromeH;
-        float k = std::min(availW / cw, availH / ch);
-        if (!upscale) k = std::min(k, 1.f);
-        w = std::max(kMinW, std::round(cw * k) + 2 * kPad + extraW + frameW);
-        h = std::max(kMinH, std::round(ch * k) + chromeH + frameH);
-    }
-    int pw = (int)std::lround(w * g_dpi / 96), ph = (int)std::lround(h * g_dpi / 96);
-    if (pw == wr.right - wr.left && ph == wr.bottom - wr.top) return;
-    MONITORINFO mi{sizeof mi};
-    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-    RECT wa = mi.rcWork;
-    pw = std::min(pw, (int)(wa.right - wa.left)), ph = std::min(ph, (int)(wa.bottom - wa.top));
-    int x = std::clamp((int)(wr.left + wr.right - pw) / 2, (int)wa.left, (int)wa.right - pw);
-    int y = std::clamp((int)(wr.top + wr.bottom - ph) / 2, (int)wa.top, (int)wa.bottom - ph);
-    g_placing = true;
-    SetWindowPos(g_hwnd, nullptr, x, y, pw, ph, SWP_NOZORDER | SWP_NOACTIVATE);
-    g_placing = false;
+    return y + g_scroll[1] - top - kPageGap + kPad / 2;
 }
 
 bool LoadCsv(const std::wstring& path) {
@@ -801,7 +743,6 @@ void OnMediaEvent(DWORD event) {
         else g_sub = L"can't play this file";
     } else if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
         g_sub = (s.videoW ? std::to_wstring(s.videoW) + L" × " + std::to_wstring(s.videoH) + L" · " : L"") + Clock(s.dur);
-        if (g_mediaVideo) FitWindow();
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -830,7 +771,6 @@ void OnPoster(int gen, IWICBitmap* frame) {
     g_posterDone = true;
     if (frame && !g_frame) {  // the engine's own frames win once they flow
         frame->GetSize(&g_posterW, &g_posterH);
-        FitWindow();
         g_frame = ToD2D(frame);
         Log(L"video poster ready %.2f ms after key press", MsSince(g_mediaT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -876,8 +816,7 @@ void ClearContent() {
     MdClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
-    g_sideCurrent = -1, g_sideFocus = false, g_wheelAcc = 0;
-    g_natW = g_natH = 0, g_natVector = false;
+    g_sideScroll = 0, g_sideCurrent = -1;
     GridSet(nullptr);
     FontClear();
     MediaClose();
@@ -885,7 +824,7 @@ void ClearContent() {
     g_mediaVideo = g_seekDrag = false, g_shownPos = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
     g_gridGen++, g_gridPending = false;
-    for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
+    g_scroll[0] = g_scroll[1] = g_doc[0] = g_doc[1] = 0;
     g_kind = K_None;
 }
 
@@ -1009,16 +948,15 @@ void DrawSidebar(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrus
     int cur = CurrentItem();
     if (cur != g_sideCurrent) {  // keep the current item in view as the document scrolls
         g_sideCurrent = cur;
-        if (top[cur] < g_scroll[2]) g_scroll[2] = top[cur] - 10;
-        else if (top[cur] + height[cur] > g_scroll[2] + viewH) g_scroll[2] = top[cur] + height[cur] - viewH + 10;
+        if (top[cur] < g_sideScroll) g_sideScroll = top[cur] - 10;
+        else if (top[cur] + height[cur] > g_sideScroll + viewH) g_sideScroll = top[cur] + height[cur] - viewH + 10;
     }
-    g_doc[2] = top.back() + height.back() + 10;
-    g_scroll[2] = std::clamp(g_scroll[2], 0.f, std::max(0.f, g_doc[2] - viewH));
+    g_sideScroll = std::clamp(g_sideScroll, 0.f, std::max(0.f, top.back() + height.back() + 10 - viewH));
     fill->SetColor(p.codeBg);
     g_rt->FillRectangle({0, kTitleH, kSideW, sz.height}, fill);
     g_rt->PushAxisAlignedClip({0, kTitleH, kSideW, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
     for (size_t i = 0; i < top.size(); i++) {
-        float y = kTitleH + top[i] - g_scroll[2];
+        float y = kTitleH + top[i] - g_sideScroll;
         bool current = (int)i == cur;
         if (g_kind == K_Pdf && i < g_thumbBmp.size() && (y + height[i] < kTitleH - 2 * viewH || y > sz.height + 2 * viewH))
             g_thumbBmp[i].Reset(), g_thumbW[i] = 0;  // far out of view: drop
@@ -1049,25 +987,20 @@ void DrawSidebar(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrus
     g_rt->PopAxisAlignedClip();
 }
 
-// Jumps the document to sidebar item i: a heading or a page.
-void GoToItem(int i) {
-    if (i < 0 || i >= (int)SideCount()) return;
-    float target = g_kind == K_Md ? MdHeadingY(i, true) - 8 : i * SlotH();
-    RECT rc;
-    GetClientRect(g_hwnd, &rc);
-    g_doc[1] = std::max(g_doc[1], target + Dip(rc.bottom) - kTitleH);  // Markdown's height is an estimate
-    g_scroll[1] = std::max(0.f, target);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
-}
-
-// Sidebar click at y (DIPs): jumps there; arrow keys then step through the items.
+// Sidebar click at y (DIPs): jumps the document to that heading or page.
 void SideClick(float y) {
     std::vector<float> top, height;
     SideItems(top, height);
-    g_sideFocus = true;
     for (size_t i = 0; i < top.size(); i++) {
-        float t = kTitleH + top[i] - g_scroll[2];
-        if (y >= t && y < t + height[i]) return GoToItem((int)i);
+        float t = kTitleH + top[i] - g_sideScroll;
+        if (y < t || y >= t + height[i]) continue;
+        float target = g_kind == K_Md ? MdHeadingY(i, true) - 8 : PageTop(i) - kPad / 2;
+        RECT rc;
+        GetClientRect(g_hwnd, &rc);
+        g_doc[1] = std::max(g_doc[1], target + Dip(rc.bottom) - kTitleH);  // Markdown's height is an estimate
+        g_scroll[1] = std::max(0.f, target);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
     }
 }
 
@@ -1143,10 +1076,10 @@ void Paint() {
         g_rt->PopAxisAlignedClip();
         if (SideW() > 0) DrawSidebar(sz, text.Get(), sub.Get(), fill.Get());
         fill->SetColor(p.sub);
-        for (int axis = 0; axis < 3; axis++)
+        for (int axis = 0; axis < 2; axis++)
             if (float at, len; Thumb(axis, at, len)) {  // overlay scrollbars: thin, wider under the mouse
-                float bw = g_barHot == axis || g_dragAxis == axis ? 6 : 3, right = axis == 2 ? SideW() : sz.width;
-                D2D1_RECT_F r = axis ? D2D1_RECT_F{right - 3 - bw, at + 2, right - 3, at + len - 2}
+                float bw = g_barHot == axis || g_dragAxis == axis ? 6 : 3;
+                D2D1_RECT_F r = axis ? D2D1_RECT_F{sz.width - 3 - bw, at + 2, sz.width - 3, at + len - 2}
                                      : D2D1_RECT_F{at + 2, sz.height - 3 - bw, at + len - 2, sz.height - 3};
                 g_rt->FillRoundedRectangle({r, bw / 2, bw / 2}, fill.Get());
             }
@@ -1168,25 +1101,24 @@ bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid
 float View(int axis) {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    return axis ? Dip(rc.bottom) - kTitleH : Dip(rc.right) - 2 * kPad;  // the sidebar is as high as the view
+    return axis ? Dip(rc.bottom) - kTitleH : Dip(rc.right) - 2 * kPad;
 }
 
 // Scrollbar thumb along an axis (position from the window edge, length) in DIPs; false: nothing to scroll.
 bool Thumb(int axis, float& at, float& len) {
     float view = View(axis);
-    if (!Scrollable() || g_doc[axis] <= view || (axis == 2 && SideW() <= 0)) return false;
+    if (!Scrollable() || g_doc[axis] <= view) return false;
     len = std::max(24.f, view * view / g_doc[axis]);
     at = (axis ? kTitleH : kPad) + (view - len) * g_scroll[axis] / (g_doc[axis] - view);
     return true;
 }
 
-// Scrollbar under the mouse: 1 vertical (right edge), 0 horizontal (bottom edge), 2 sidebar, -1 none.
+// Scrollbar under the mouse: 1 vertical (right edge), 0 horizontal (bottom edge), -1 none.
 int OnBar(LPARAM l) {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     float x = Dip(GET_X_LPARAM(l)), y = Dip(GET_Y_LPARAM(l)), at, len;
     if (Thumb(1, at, len) && x >= Dip(rc.right) - kBarHit && y >= kTitleH) return 1;
-    if (Thumb(2, at, len) && x >= SideW() - kBarHit && x < SideW() && y >= kTitleH) return 2;
     if (Thumb(0, at, len) && y >= Dip(rc.bottom) - kBarHit && x < Dip(rc.right) - kBarHit) return 0;
     return -1;
 }
@@ -1283,11 +1215,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 1;
         case WM_SIZE:
             if (g_rt) g_rt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
-            if (g_sizing && !g_placing) g_userSized = true;
-            if (g_kind == K_Pdf && g_pdfSlot > 0) {  // keep the same page in view
-                g_scroll[1] = std::round(g_scroll[1] / g_pdfSlot) * SlotH();
-                g_pdfSlot = SlotH();
-            }
             Layout();
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -1306,7 +1233,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_EXITSIZEMOVE:
             g_sizing = false;
-            if (g_userSized) g_userSized = false, SaveSize();  // only a size the user chose is remembered
             if (g_kind == K_Image && g_imgReduced) LoadContent(g_path, Now());
             InvalidateRect(h, nullptr, FALSE);  // PDF: re-render pages at the final width
             return 0;
@@ -1319,11 +1245,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 float d = GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * std::min(lines, 10u) * 36;
                 POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};  // wheel positions are in screen coordinates
                 ScreenToClient(h, &pt);
-                if (m == WM_MOUSEWHEEL && Dip(pt.x) < SideW()) return ScrollBy(2, -d), 0;  // over the sidebar
-                if (g_kind == K_Pdf && !sideways) {  // one page per notch (touchpads: once a notch adds up)
-                    g_wheelAcc += GET_WHEEL_DELTA_WPARAM(w);
-                    for (; g_wheelAcc >= WHEEL_DELTA; g_wheelAcc -= WHEEL_DELTA) GoToItem(CurrentItem() - 1);
-                    for (; g_wheelAcc <= -WHEEL_DELTA; g_wheelAcc += WHEEL_DELTA) GoToItem(CurrentItem() + 1);
+                if (m == WM_MOUSEWHEEL && Dip(pt.x) < SideW()) {  // over the sidebar: scroll the sidebar
+                    g_sideScroll -= d;
+                    InvalidateRect(h, nullptr, FALSE);
                     return 0;
                 }
                 ScrollBy(sideways ? 0 : 1, m == WM_MOUSEHWHEEL ? d : -d);
@@ -1345,9 +1269,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN:
-            if (Dip(GET_X_LPARAM(l)) < SideW() - kBarHit && Dip(GET_Y_LPARAM(l)) > kTitleH)
-                return SideClick(Dip(GET_Y_LPARAM(l))), 0;
-            g_sideFocus = false;
+            if (Dip(GET_X_LPARAM(l)) < SideW() && Dip(GET_Y_LPARAM(l)) > kTitleH) return SideClick(Dip(GET_Y_LPARAM(l))), 0;
             if (g_kind == K_Media) {
                 D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
@@ -1374,7 +1296,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_CAPTURECHANGED:
             g_seekDrag = false;
-            if (g_dragAxis == 1 && g_kind == K_Pdf) GoToItem(CurrentItem());  // dragged: settle on a page
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
@@ -1590,26 +1511,24 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     LONGLONG start = Now();
     g_source = source;
     if (!g_visible) {
-        // Centre on the source window's monitor; FitWindow then sets the size (one resize at most).
+        // Centre on the source window's monitor at the remembered size.
         HMONITOR mon = MonitorFromWindow(source ? source : GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{sizeof mi};
         GetMonitorInfoW(mon, &mi);
         UINT dx = 96, dy = 96;
         GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
         RECT wa = mi.rcWork;
-        RECT wr;
-        GetWindowRect(g_hwnd, &wr);
-        int w = wr.right - wr.left, h = wr.bottom - wr.top;
+        int w = std::min(MulDiv(g_sizeDip.cx, dx, 96), (int)(wa.right - wa.left));
+        int h = std::min(MulDiv(g_sizeDip.cy, dx, 96), (int)(wa.bottom - wa.top));
         g_placing = true;
-        SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, w, h,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
         g_placing = false;
         g_dpi = GetDpiForWindow(g_hwnd);
     }
     LoadContent(path, t0);
     t.load = MsSince(start);
     WaitForContent();
-    FitWindow();
     Layout();
     if (!g_visible)
         // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
@@ -1630,6 +1549,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
 void PreviewHide(bool restoreFocus) {
     if (!g_visible) return;
     bool wasForeground = GetForegroundWindow() == g_hwnd;
+    SaveSize();
     Cloak(TRUE);
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
@@ -1647,11 +1567,7 @@ bool PreviewKey(const MSG& m) {
     else if (m.wParam == VK_RETURN) OpenFile(false);
     else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_LEFT || m.wParam == VK_RIGHT))
         MediaSeek(MediaGet().pos + (m.wParam == VK_LEFT ? -5 : 5));
-    else if (m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN &&
-             (g_kind == K_Pdf || (g_kind == K_Md && g_sideFocus && SideW() > 0))) {  // step page / heading
-        bool back = m.wParam == VK_UP || m.wParam == VK_LEFT || m.wParam == VK_PRIOR;
-        GoToItem(m.wParam == VK_HOME ? 0 : m.wParam == VK_END ? (int)SideCount() - 1 : CurrentItem() + (back ? -1 : 1));
-    } else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
+    else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
         float page = View(1) * 0.9f;
         switch (m.wParam) {
             case VK_LEFT: ScrollBy(0, -40); break;
