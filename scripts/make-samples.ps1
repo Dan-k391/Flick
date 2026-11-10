@@ -32,6 +32,66 @@ if (-not (Test-Path "$dir\big.log")) {
     [IO.File]::WriteAllText("$dir\big.log", (($line + "`n") * 60000))  # ~5.6 MB, exceeds the 2 MB text cap
 }
 if (-not (Test-Path "$dir\data.bin")) { [IO.File]::WriteAllBytes("$dir\data.bin", [byte[]]::new(100000)) }
+Copy-Item "$PSScriptRoot\..\AGENTS.md" "$dir\readme.md" -Force
+Set-Content -Encoding utf8 "$dir\features.md" @'
+# Markdown features
+
+Some **bold**, *italic*, ***both***, ~~struck~~, `inline code` and a [link](https://example.com).
+Entities: &copy; &amp; &#x2192; and a hard line break here\
+on the next line.
+
+## Lists
+
+- First item with `code`
+- Second item
+  - Nested bullet
+    - Third level
+1. Ordered one
+2. Ordered two
+- [x] Done task
+- [ ] Open task
+
+> A quote with **emphasis**.
+> > Nested quote.
+
+### Table
+
+| Format | Engine | Open time |
+|:-------|:------:|----------:|
+| Markdown | md4c + DirectWrite | fast |
+| PDF | Windows.Data.Pdf | async pages |
+
+```cpp
+int main() {
+    return 0;  // a fenced code block
+}
+```
+
+---
+
+![an image](logo.png) shows its alt text. <b>Inline HTML</b> shows its text.
+'@
+# A 30-page Letter PDF with text and a coloured bar on every page (ASCII, so offsets are char counts).
+if (-not (Test-Path "$dir\doc.pdf")) {
+    $n = 30
+    $kids = (0..($n - 1) | ForEach-Object { "$(4 + 2 * $_) 0 R" }) -join ' '
+    $objs = [Collections.Generic.List[string]]@('<< /Type /Catalog /Pages 2 0 R >>', "<< /Type /Pages /Kids [$kids] /Count $n >>",
+        '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>')
+    $para = 'Flick renders PDF pages with the Windows PDF engine on a worker thread, page by page, at the window width.'
+    for ($p = 1; $p -le $n; $p++) {
+        $body = (1..34 | ForEach-Object { "($_. $para) '" }) -join "`n"
+        $stream = "0.15 0.45 0.85 rg 72 690 468 6 re f`nBT /F1 26 Tf 72 712 Td (Sample document - page $p) Tj ET`nBT /F1 10 Tf 72 660 Td 16 TL`n$body`nET"
+        $objs.Add("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents $(5 + 2 * ($p - 1)) 0 R >>")
+        $objs.Add("<< /Length $($stream.Length) >>`nstream`n$stream`nendstream")
+    }
+    $sb = [Text.StringBuilder]::new("%PDF-1.4`n")
+    $offsets = foreach ($i in 0..($objs.Count - 1)) { $sb.Length; [void]$sb.Append("$($i + 1) 0 obj`n$($objs[$i])`nendobj`n") }
+    $xref = $sb.Length
+    [void]$sb.Append("xref`n0 $($objs.Count + 1)`n0000000000 65535 f `n")
+    foreach ($o in $offsets) { [void]$sb.Append(("{0:D10} 00000 n `n" -f $o)) }
+    [void]$sb.Append("trailer`n<< /Size $($objs.Count + 1) /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
+    [IO.File]::WriteAllText("$dir\doc.pdf", $sb.ToString(), [Text.Encoding]::ASCII)
+}
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null
 1..50 | ForEach-Object { Set-Content "$dir\folder\file$_.txt" "hello $_" }
 Write-Output $dir

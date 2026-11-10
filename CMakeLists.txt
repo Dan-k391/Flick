@@ -1,5 +1,5 @@
-﻿cmake_minimum_required(VERSION 3.25)
-project(Flick CXX)
+cmake_minimum_required(VERSION 3.25)
+project(Flick C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -18,7 +18,11 @@ target_include_directories(lexilla PUBLIC third_party/lexilla/include PRIVATE th
 target_link_libraries(lexilla PUBLIC scintilla)
 target_compile_definitions(lexilla PRIVATE LEXILLA_NO_EXPORT)
 
-add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/flick.manifest)
+add_library(md4c STATIC third_party/md4c/md4c.c)
+target_include_directories(md4c PUBLIC third_party/md4c)
+target_compile_definitions(md4c PUBLIC MD4C_USE_UTF16)  # parse wchar_t text directly
+
+add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/flick.manifest)
 target_compile_definitions(Flick PRIVATE UNICODE _UNICODE NOMINMAX)
-target_link_libraries(Flick PRIVATE lexilla scintilla
+target_link_libraries(Flick PRIVATE lexilla scintilla md4c windowsapp windows.data.pdf d3d11
   d2d1 dwrite windowscodecs dwmapi shlwapi uxtheme shcore imm32 msimg32 ole32 oleaut32 uuid psapi)

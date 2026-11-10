@@ -1,6 +1,11 @@
 #pragma once
 #include <windows.h>
 #include <string>
+#include <vector>
+#include <d2d1.h>
+#include <dwrite.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 
 // Messages posted to the preview window by the keyboard hook thread.
 // wParam = Explorer top-level HWND, lParam = QueryPerformanceCounter at key press.
@@ -10,6 +15,7 @@ enum : UINT {
     WM_FLICK_HIDE,                 // Esc in Explorer while preview open
     WM_FLICK_QUIT,                 // `Flick.exe --exit`
     WM_FLICK_INFO,                 // worker thread finished a thumbnail (lParam = InfoJob*)
+    WM_FLICK_PDF,                  // sent by the PDF worker (lParam = PdfMsg*); reply = next page
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -35,6 +41,24 @@ void PreviewHide(bool restoreFocus);
 bool PreviewVisible();
 bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;
+
+// ---- pdf.cpp: PDF worker. Reply to WM_FLICK_PDF with (pixelWidth << 32 | page + 1), or 0 for "nothing".
+struct PdfMsg {
+    int gen, page;                                // page -1: opened (sizes empty = failed); -2: idle
+    std::vector<std::pair<float, float>> sizes;   // page sizes in points
+    Microsoft::WRL::ComPtr<IWICBitmap> bmp;       // rendered page (null if it failed)
+    UINT32 pageCount = 0;                         // with page -1
+};
+void PdfOpen(const std::wstring& path, int gen);  // "" closes the document
+void PdfWake();                                   // worker idle and the UI needs a page
+
+// ---- markdown.cpp: parsed into blocks, laid out lazily with DirectWrite
+struct MdColors { D2D1_COLOR_F text, dim, link, codeBg, rule; };
+void MdInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* monoFont);
+void MdLoad(const std::wstring& text);
+void MdClear();
+float MdPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
+std::wstring MdOutline();  // --selftest: one "<kind><level><bullet>:<text>|" per block
 
 // ---- main.cpp
 std::wstring ExplorerSelection(HWND explorer);  // first selected item's file-system path, or ""

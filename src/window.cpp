@@ -13,6 +13,7 @@
 #include <propvarutil.h>
 #include <windowsx.h>
 #include <wrl/client.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <vector>
@@ -31,13 +32,14 @@ namespace {
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
-enum Kind { K_None, K_Text, K_Image, K_Info };
+enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf };
 enum Hot { H_None, H_Open, H_Close };
 
 struct Palette {
     COLORREF role[R_Count];
     COLORREF bg, lineFg, sel;
     D2D1_COLOR_F text, sub, btn, btnHot, btnBorder;
+    D2D1_COLOR_F link, codeBg, rule;  // Markdown
 };
 constexpr COLORREF Hex(unsigned rgb) { return RGB(rgb >> 16, (rgb >> 8) & 0xFF, rgb & 0xFF); }
 constexpr D2D1_COLOR_F C(unsigned rgb, float a = 1) {
@@ -48,13 +50,15 @@ const Palette kDark{
      Hex(0xC586C0), Hex(0xD4D4D4), Hex(0x569CD6), Hex(0x9CDCFE), Hex(0x569CD6), Hex(0xD4D4D4), Hex(0xD4D4D4),
      Hex(0xF44747), Hex(0x81B88B), Hex(0xF14C4C)},
     Hex(0x1C1C1C), Hex(0x6E7681), Hex(0x264F78),
-    C(0xFFFFFF), C(0xFFFFFF, 0.55f), C(0xFFFFFF, 0.06f), C(0xFFFFFF, 0.10f), C(0xFFFFFF, 0.08f)};
+    C(0xFFFFFF), C(0xFFFFFF, 0.55f), C(0xFFFFFF, 0.06f), C(0xFFFFFF, 0.10f), C(0xFFFFFF, 0.08f),
+    C(0x4CC2FF), C(0xFFFFFF, 0.07f), C(0xFFFFFF, 0.13f)};
 const Palette kLight{
     {Hex(0x1F1F1F), Hex(0x008000), Hex(0x0000FF), Hex(0x267F99), Hex(0x795E26), Hex(0xA31515), Hex(0x098658),
      Hex(0xAF00DB), Hex(0x1F1F1F), Hex(0x800000), Hex(0x0451A5), Hex(0x0000FF), Hex(0x1F1F1F), Hex(0x1F1F1F),
      Hex(0xCD3131), Hex(0x098658), Hex(0xA31515)},
     Hex(0xFFFFFF), Hex(0x8C8C8C), Hex(0xADD6FF),
-    C(0x1A1A1A), C(0x000000, 0.55f), C(0xFFFFFF, 0.7f), C(0xF9F9F9, 0.5f), C(0x000000, 0.08f)};
+    C(0x1A1A1A), C(0x000000, 0.55f), C(0xFFFFFF, 0.7f), C(0xF9F9F9, 0.5f), C(0x000000, 0.08f),
+    C(0x005FB8), C(0x000000, 0.05f), C(0x000000, 0.12f)};
 
 HWND g_sci, g_source;
 SciFnDirect g_sciFn;
@@ -79,6 +83,19 @@ UINT g_orient = 1;  // EXIF orientation
 bool g_imgReduced;  // image decoded below full size to fit the window
 Hot g_hot;
 D2D1_RECT_F g_openRc, g_closeRc;
+
+// Scrollable documents (Markdown, PDF), in DIPs.
+float g_scroll, g_docH;
+bool g_sizing;  // inside a move/size loop: don't re-render PDF pages for every intermediate width
+
+// PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
+constexpr float kPageGap = 12;
+int g_pdfGen;
+bool g_pdfIdle = true, g_pdfFailed;
+LONGLONG g_pdfT0;
+std::vector<std::pair<float, float>> g_pages;  // points
+std::vector<ComPtr<ID2D1Bitmap>> g_pageBmp;
+std::vector<UINT> g_pageW;  // pixel width each page was last rendered at (0 = never)
 
 bool g_warming = true;
 void Cloak(BOOL on) { DwmSetWindowAttribute(g_hwnd, DWMWA_CLOAK, &on, sizeof on); }
@@ -138,17 +155,26 @@ void CreateTarget() {
 }
 
 // D2D bitmap at the window DPI, so GetSize() in DIPs maps 1 bitmap pixel to 1 screen pixel.
+// Shares the pixels of a WIC bitmap instead of copying them: the software render target never gives
+// the memory of its own bitmaps back to the OS (~50 MB stayed private after a few PDF pages).
 ComPtr<ID2D1Bitmap> ToD2D(IWICBitmapSource* src) {
     ComPtr<IWICFormatConverter> conv;
+    ComPtr<IWICBitmap> pixels;
+    ComPtr<IWICBitmapLock> lock;
     ComPtr<ID2D1Bitmap> bmp;
+    UINT w, h;
     if (SUCCEEDED(g_wic->CreateFormatConverter(&conv)) &&
         SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                                   WICBitmapPaletteTypeCustom)))
-        g_rt->CreateBitmapFromWicBitmap(
-            conv.Get(),
-            D2D1::BitmapProperties(D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
-                                   (float)g_dpi, (float)g_dpi),
-            &bmp);
+                                   WICBitmapPaletteTypeCustom)) &&
+        SUCCEEDED(g_wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &pixels)) &&
+        SUCCEEDED(pixels->GetSize(&w, &h))) {
+        WICRect all{0, 0, (INT)w, (INT)h};
+        if (SUCCEEDED(pixels->Lock(&all, WICBitmapLockRead, &lock))) {
+            D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), (float)g_dpi, (float)g_dpi);
+            g_rt->CreateSharedBitmap(__uuidof(IWICBitmapLock), lock.Get(), &props, &bmp);
+        }
+    }
     return bmp;
 }
 
@@ -221,32 +247,25 @@ bool LoadImage(const std::wstring& path) {
     return true;
 }
 
-bool IsImageExt(const std::wstring& path) {
-    std::wstring ext = PathFindExtensionW(path.c_str());
-    for (auto& c : ext) c = towlower(c);
-    return !ext.empty() && wcsstr(L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif "
-                                  L".avif .jxr .wdp .dds ",
-                                  (L" " + ext + L" ").c_str());
-}
-
 std::string ToUtf8(const wchar_t* w, int n) {
     std::string s(WideCharToMultiByte(CP_UTF8, 0, w, n, nullptr, 0, nullptr, nullptr), '\0');
     WideCharToMultiByte(CP_UTF8, 0, w, n, s.data(), (int)s.size(), nullptr, nullptr);
     return s;
 }
 
-bool LoadText(const std::wstring& path) {
+// Reads up to kMaxText bytes as UTF-8 (from UTF-8, UTF-16 or the ANSI code page); false for binary files.
+bool ReadText(const std::wstring& path, std::string& buf, bool& truncated) {
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
     GetFileSizeEx(f, &size);
-    std::string buf((size_t)std::min<LONGLONG>(size.QuadPart, kMaxText), '\0');
+    buf.assign((size_t)std::min<LONGLONG>(size.QuadPart, kMaxText), '\0');
     DWORD read = 0;
     ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr);
     CloseHandle(f);
     buf.resize(read);
-    bool truncated = (LONGLONG)read < size.QuadPart;
+    truncated = (LONGLONG)read < size.QuadPart;
 
     auto bom = [&](const char* b, size_t n) { return buf.size() >= n && !memcmp(buf.data(), b, n); };
     if (bom("\xFF\xFE", 2) || bom("\xFE\xFF", 2)) {  // UTF-16
@@ -269,7 +288,13 @@ bool LoadText(const std::wstring& path) {
             buf = ToUtf8(w.data(), (int)w.size());
         }
     }
+    return true;
+}
 
+bool LoadText(const std::wstring& path) {
+    std::string buf;
+    bool truncated;
+    if (!ReadText(path, buf, truncated)) return false;
     g_lang = LangForFile(path);
     Sci(SCI_SETILEXER, 0, (sptr_t)(g_lang ? CreateLexer(g_lang->lexer) : nullptr));
     if (g_lang) {
@@ -285,6 +310,108 @@ bool LoadText(const std::wstring& path) {
     Sci(SCI_SETMARGINWIDTHN, 0, Sci(SCI_TEXTWIDTH, STYLE_LINENUMBER, (sptr_t)digits.c_str()) + 8);
     g_sub = std::to_wstring(lines) + (lines == 1 ? L" line" : L" lines") + (truncated ? L" · first " + std::to_wstring(kMaxText >> 20) + L" MB" : L"");
     return true;
+}
+
+bool HasExt(const std::wstring& path, const wchar_t* list) {
+    std::wstring ext = PathFindExtensionW(path.c_str());
+    for (auto& c : ext) c = towlower(c);
+    return !ext.empty() && wcsstr(list, (L" " + ext + L" ").c_str());
+}
+
+bool LoadMarkdown(const std::wstring& path) {
+    std::string buf;
+    bool truncated;
+    if (!ReadText(path, buf, truncated)) return false;
+    std::wstring w(MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), w.data(), (int)w.size());
+    MdLoad(w);
+    if (truncated) g_sub = L"first " + std::to_wstring(kMaxText >> 20) + L" MB";
+    return true;
+}
+
+void LoadPdf(const std::wstring& path, LONGLONG t0) {
+    g_pdfT0 = t0;
+    g_pdfFailed = false;
+    g_pdfIdle = false;
+    PdfOpen(path, ++g_pdfGen);
+}
+
+float PageWidth() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    return Dip(rc.right) - 2 * kPad;
+}
+
+// Next page the PDF worker should render, in WM_FLICK_PDF reply format: the first page in or just
+// below the view that hasn't been rendered at the current width.
+LRESULT NextPdfPage() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float w = PageWidth(), viewH = Dip(rc.bottom) - kTitleH, y = kPad / 2;
+    UINT px = (UINT)std::lround(w * g_dpi / 96);
+    for (size_t i = 0; i < g_pages.size() && y < g_scroll + 2 * viewH; i++) {
+        float h = std::round(w * g_pages[i].second / g_pages[i].first);
+        if (y + h > g_scroll && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
+            return ((LRESULT)px << 32) | (i + 1);
+        y += h + kPageGap;
+    }
+    return 0;
+}
+
+LRESULT OnPdf(PdfMsg& m) {
+    if (m.gen != g_pdfGen || g_kind != K_Pdf) return g_pdfIdle = true, 0;
+    if (m.page == -1 || !m.sizes.empty()) {  // sizes come in two steps: the first few, then all
+        g_pages = m.sizes;
+        g_pageBmp.resize(g_pages.size());
+        g_pageW.resize(g_pages.size());
+        g_pdfFailed = g_pages.empty();
+        if (m.page == -1)
+            g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
+                                : std::to_wstring(m.pageCount) + (m.pageCount == 1 ? L" page" : L" pages");
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+    if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
+        g_pageW[m.page] = (UINT)std::lround(PageWidth() * g_dpi / 96);
+        if (m.bmp) g_pageBmp[m.page] = ToD2D(m.bmp.Get());
+        if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+    LRESULT next = NextPdfPage();
+    g_pdfIdle = !next;
+    return next;
+}
+
+// Waits (bounded) for the first page, so the first frame shows it instead of a blank page.
+void WaitForFirstPage() {
+    for (LONGLONG start = Now();;) {
+        MSG m;
+        PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);  // runs the worker's pending SendMessage
+        double left = 120 - MsSince(start);  // slow pages (e.g. big scans) show the placeholder, then fill in
+        if (g_kind != K_Pdf || g_pdfFailed || (!g_pageW.empty() && g_pageW[0]) || left <= 0) break;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)left + 1, QS_SENDMESSAGE);
+    }
+}
+
+// Pages stacked at the content width. Pages far from the view drop their bitmaps.
+float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
+    float w = PageWidth(), y = top + kPad / 2 - g_scroll, viewH = bottom - top;
+    // Until the worker reports the real sizes, show one blank Letter-shaped page.
+    const std::vector<std::pair<float, float>> placeholder{{612.f, 792.f}};
+    const auto& pages = g_pages.empty() && !g_pdfFailed ? placeholder : g_pages;
+    fill->SetColor(C(0xFFFFFF));
+    for (size_t i = 0; i < pages.size(); i++) {
+        float h = std::round(w * pages[i].second / pages[i].first);
+        D2D1_RECT_F r{kPad, y, kPad + w, y + h};
+        if (r.bottom > top && r.top < bottom) {
+            g_rt->FillRectangle(r, fill);
+            if (i < g_pageBmp.size() && g_pageBmp[i])
+                g_rt->DrawBitmap(g_pageBmp[i].Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        } else if (i < g_pageBmp.size() && (r.bottom < top - 2 * viewH || r.top > bottom + 2 * viewH)) {
+            g_pageBmp[i].Reset(), g_pageW[i] = 0;
+        }
+        y += h + kPageGap;
+    }
+    return y + g_scroll - top - kPageGap + kPad / 2;
 }
 
 std::wstring FormatTime(const FILETIME& ft) {
@@ -371,17 +498,32 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LON
     g_info.push_back(L"Modified " + FormatTime(fa.ftLastWriteTime));
 }
 
-void LoadContent(const std::wstring& path, LONGLONG t0) {
+// Releases everything the current preview holds (memory is given back whenever the preview closes).
+void ClearContent() {
     g_bmp.Reset();
     g_info.clear();
+    MdClear();
+    if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
+    g_pages.clear(), g_pageBmp.clear(), g_pageW.clear();
+    g_scroll = 0;
+    g_kind = K_None;
+}
+
+void LoadContent(const std::wstring& path, LONGLONG t0) {
+    ClearContent();
     g_sub.clear();
     g_path = path;
     g_title = PathFindFileNameW(path.c_str());
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa);
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
-    if (!dir && IsImageExt(path) && LoadImage(path)) g_kind = K_Image;
-    else if (!dir && LoadText(path)) g_kind = K_Text;
+    if (dir) g_kind = K_Info, LoadInfo(path, fa, t0);
+    else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
+    else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn ") && LoadMarkdown(path)) g_kind = K_Md;
+    else if (HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
+                                  L".wdp .dds ") &&
+             LoadImage(path)) g_kind = K_Image;
+    else if (LoadText(path)) g_kind = K_Text;
     else g_kind = K_Info, LoadInfo(path, fa, t0);
 
     g_open = L"Open";
@@ -500,14 +642,37 @@ void Paint() {
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
     if (g_kind == K_Image && g_bmp) DrawImage(area);
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
+    if (g_kind == K_Md || g_kind == K_Pdf) {
+        g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
+        g_docH = g_kind == K_Md ? MdPaint(g_rt.Get(), {kPad, kTitleH, sz.width - kPad, sz.height}, g_scroll,
+                                          {p.text, p.sub, p.link, p.codeBg, p.rule})
+                                : DrawPdf(kTitleH, sz.height, fill.Get());
+        g_rt->PopAxisAlignedClip();
+        float viewH = sz.height - kTitleH;
+        if (g_docH > viewH) {  // overlay scrollbar thumb
+            float th = std::max(24.f, viewH * viewH / g_docH), ty = kTitleH + (viewH - th) * g_scroll / (g_docH - viewH);
+            fill->SetColor(p.sub);
+            g_rt->FillRoundedRectangle({{sz.width - 6, ty + 2, sz.width - 3, ty + th - 2}, 1.5f, 1.5f}, fill.Get());
+        }
+    }
 
     HRESULT hrEnd = g_rt->EndDraw();
+    if (g_kind == K_Pdf && g_pdfIdle && NextPdfPage()) g_pdfIdle = false, PdfWake();
     if (hrEnd == D2DERR_RECREATE_TARGET) {  // device lost: rebuild and reload bitmaps
         g_rt.Reset();
         CreateTarget();
         if (g_kind != K_Text) LoadContent(g_path, Now());
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
+}
+
+bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf; }
+
+void ScrollBy(float d) {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float s = std::clamp(g_scroll + d, 0.f, std::max(0.f, g_docH - (Dip(rc.bottom) - kTitleH)));
+    if (s != g_scroll) g_scroll = s, InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 Hot HitButton(LPARAM l) {
@@ -592,8 +757,20 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        case WM_ENTERSIZEMOVE:
+            g_sizing = true;
+            return 0;
         case WM_EXITSIZEMOVE:
-            if (g_kind == K_Image && g_imgReduced) LoadContent(g_path, Now()), InvalidateRect(h, nullptr, FALSE);
+            g_sizing = false;
+            if (g_kind == K_Image && g_imgReduced) LoadContent(g_path, Now());
+            InvalidateRect(h, nullptr, FALSE);  // PDF: re-render pages at the final width
+            return 0;
+        case WM_MOUSEWHEEL:
+            if (Scrollable()) {
+                UINT lines = 3;
+                SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
+                ScrollBy(-GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * std::min(lines, 10u) * 36);
+            }
             return 0;
         case WM_MOUSEMOVE: {
             Hot hot = HitButton(l);
@@ -633,6 +810,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_FLICK_HIDE:
             PreviewHide(false);
             return 0;
+        case WM_FLICK_PDF:
+            return OnPdf(*reinterpret_cast<PdfMsg*>(l));
         case WM_FLICK_INFO:
             OnInfo(reinterpret_cast<InfoJob*>(l));
             return 0;
@@ -687,6 +866,7 @@ bool PreviewInit(HINSTANCE inst) {
     g_fmtName = Format(ui, 20, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fmtInfo = Format(ui, 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_codeFont = HasFont(L"Cascadia Mono") ? "Cascadia Mono" : "Consolas";
+    MdInit(g_dw.Get(), ui, g_codeFont == "Consolas" ? L"Consolas" : L"Cascadia Mono");
 
     DWORD v, sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Width", RRF_RT_REG_DWORD, nullptr, &v, &sz))
@@ -757,6 +937,23 @@ bool PreviewInit(HINSTANCE inst) {
     Sci(SCI_SETTEXT, 0, (sptr_t)"int main() { return 0; } // warm-up");
     Layout();
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    g_kind = K_Md;  // loads the fonts and faces Markdown uses (~30 ms cold)
+    MdLoad(LR"(# H
+## H
+### H
+**b** *i* ***bi*** `c` [l](u) ~~s~~
+
+```
+x
+```
+
+| a |
+|---|
+| b |
+)");
+    Layout();
+    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    PdfOpen({}, 0);  // starts the PDF worker and loads the PDF engine
     // The first uncloak makes DWM build the window's visuals and Mica backdrop (~130 ms); do it off-screen.
     RECT r;
     GetWindowRect(g_hwnd, &r);
@@ -793,6 +990,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     }
     LoadContent(path, t0);
     t.load = MsSince(start);
+    WaitForFirstPage();
     Layout();
     if (!g_visible)
         SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -802,7 +1000,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     t.ready = MsSince(t0);
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
-    t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : L"info";
+    t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf" : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
     return t;
@@ -816,9 +1014,7 @@ void PreviewHide(bool restoreFocus) {
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
     g_hot = H_None;
-    // Release content memory while idle.
-    g_bmp.Reset();
-    g_info.clear();
+    ClearContent();  // release content memory while idle
     Sci(SCI_SETREADONLY, 0);
     Sci(SCI_CLEARALL);
     ShowWindow(g_sci, SW_HIDE);  // a hidden Scintilla loads text ~3x faster (no scrollbar/layout updates)
@@ -829,6 +1025,18 @@ bool PreviewKey(const MSG& m) {
     if (m.message != WM_KEYDOWN || !g_visible) return false;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
+    else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN && m.wParam != VK_LEFT &&
+             m.wParam != VK_RIGHT) {
+        RECT rc;
+        GetClientRect(g_hwnd, &rc);
+        float page = (Dip(rc.bottom) - kTitleH) * 0.9f;
+        ScrollBy(m.wParam == VK_UP     ? -40.f
+                 : m.wParam == VK_DOWN ? 40.f
+                 : m.wParam == VK_PRIOR ? -page
+                 : m.wParam == VK_NEXT  ? page
+                 : m.wParam == VK_HOME  ? -1e9f
+                                        : 1e9f);
+    }
     else return false;
     return true;
 }

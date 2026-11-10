@@ -130,6 +130,9 @@ int Bench(int argc, wchar_t** argv) {
             ready.push_back(t.ready);
             composed.push_back(t.composed);
             Pump();
+            // PDF pages arrive from the worker: give it time so "page 1 ready" gets logged.
+            for (LONGLONG s = Now(); !wcscmp(t.kind, L"pdf") && MsSince(s) < 300;)
+                MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT), Pump();
             PreviewHide(false);
             Pump();
         }
@@ -225,6 +228,27 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                   !strcmp(lexer(L"CMakeLists.txt"), "cmake") && !strcmp(lexer(L"Makefile"), "makefile") &&
                   !strcmp(lexer(L"a.json"), "json") && !strcmp(lexer(L"notes.txt"), "") &&
                   !strcmp(lexer(L"a.c.bak"), "") && !strcmp(lexer(L"x.h"), "cpp") && !strcmp(lexer(L"noext"), "");
+        MdLoad(LR"(# Title
+Para &amp; *x* <b>y</b>
+
+- a
+  - [x] b
+1. one
+
+> q
+
+```
+c
+```
+---
+| a |
+|---|
+| 1 |
+<div>html</div>
+)");
+        std::wstring want = L"H1:Title|P:Para & x y|P•:a|P☑" + std::wstring(1, (wchar_t)0xFE0E) +
+                            L":b|P1.:one|P:q>|C:c|R:|T:|";
+        if (MdOutline() != want) ok = false, Log(L"selftest: markdown outline %s", MdOutline().c_str());
         return ok ? 0 : 1;
     }
     if (argc > 1 && !wcscmp(argv[1], L"--exit")) {
