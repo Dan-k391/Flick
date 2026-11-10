@@ -81,6 +81,11 @@ void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
+// ---- font.cpp: font specimen (ttf, otf, ttc, woff, woff2)
+bool FontLoad(IDWriteFactory*, const std::wstring& path, std::wstring& sub);
+void FontClear();
+float FontPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> height
+
 // ---- main.cpp
 std::wstring ExplorerSelection(HWND explorer);  // first selected item's file-system path, or ""
 LONGLONG Now();

@@ -32,7 +32,7 @@ namespace {
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
-enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid };
+enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font };
 enum Hot { H_None, H_Open, H_Close };
 
 struct Palette {
@@ -561,6 +561,7 @@ void ClearContent() {
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear();
     GridSet(nullptr);
+    FontClear();
     g_gridGen++, g_gridPending = false;
     g_scroll[0] = g_scroll[1] = g_doc[0] = g_doc[1] = 0;
     g_kind = K_None;
@@ -587,6 +588,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn ") && LoadMarkdown(path)) g_kind = K_Md;
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
+    else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
                           L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "
                           L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadArchive(path);
@@ -721,6 +723,7 @@ void Paint() {
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
+        if (g_kind == K_Font) g_doc[1] = FontPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Grid && GridGet()) {
             D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
             g_doc[0] = size.width, g_doc[1] = size.height;
@@ -746,7 +749,7 @@ void Paint() {
     }
 }
 
-bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid; }
+bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid || g_kind == K_Font; }
 
 // Visible extent of the document along an axis, in DIPs.
 float View(int axis) {
@@ -1146,7 +1149,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
-             : g_kind == K_Grid ? L"table" : L"info";
+             : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
     return t;
