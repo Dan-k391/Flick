@@ -139,6 +139,10 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
   breadth-first within 60 ms / 10k items so the result lands inside the 120 ms first-frame wait.
 - Tree sorting: `CompareStringEx(…SORT_DIGITSASNUMBERS)` on string views; `StrCmpLogicalW` needed a
   copy of both names per comparison.
+- **Fit-to-content windows** (photos, SVG, video, PDF) must cost one resize: pictures decode for the
+  remembered area (`BoxArea`), the window is only moved when shown, then `FitWindow` sizes it once
+  (two resizes per open cost ~4 ms). The remembered size changes only when the user resizes.
+- PDF shows one page per view (`PageRect`: each page fitted into a view-high slot); wheel/keys step pages.
 - `GetVideoAspectRatio` is the *picture* aspect (16:9), not the pixel aspect: width = height × ax/ay.
 - lunasvg rejects a UTF-8 BOM; strip it. D2D's own SVG renderer can't draw `<text>`, hence lunasvg.
 - Markdown images: read only the size at layout (headers), decode pixels when first drawn — else an
