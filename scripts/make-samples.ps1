@@ -103,6 +103,34 @@ if (-not (Test-Path "$dir\data.csv")) {
 $lexilla = (Resolve-Path "$PSScriptRoot\..\third_party\lexilla").Path
 if (-not (Test-Path "$dir\archive.zip")) { Compress-Archive -Path $lexilla -DestinationPath "$dir\archive.zip" }
 if (-not (Test-Path "$dir\archive.tar.gz")) { tar.exe -czf "$dir\archive.tar.gz" -C (Split-Path $lexilla) lexilla }
+if (-not (Test-Path "$dir\drawing.svg")) {
+    Set-Content -Encoding utf8 "$dir\drawing.svg" @'
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#1e3c72"/><stop offset="1" stop-color="#2a5298"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff6b0"/><stop offset="1" stop-color="#ffb300"/>
+    </radialGradient>
+  </defs>
+  <rect width="800" height="500" rx="24" fill="url(#sky)"/>
+  <circle cx="620" cy="130" r="70" fill="url(#sun)"/>
+  <path d="M0 380 Q 200 280 400 360 T 800 330 V 500 H 0 Z" fill="#2e7d32"/>
+  <path d="M0 420 Q 250 360 500 420 T 800 410 V 500 H 0 Z" fill="#1b5e20" opacity="0.9"/>
+  <g stroke="#fff" stroke-width="3" fill="none" stroke-linecap="round">
+    <path d="M120 120 l20 -10 l20 10"/><path d="M180 90 l15 -8 l15 8"/>
+  </g>
+  <text x="60" y="250" font-family="Segoe UI, sans-serif" font-size="56" font-weight="bold" fill="#fff">Flick SVG preview</text>
+  <text x="62" y="295" font-family="Georgia, serif" font-size="24" font-style="italic" fill="#cfe3ff">gradients, paths, opacity and text</text>
+</svg>
+'@
+    $in = [IO.File]::ReadAllBytes("$dir\drawing.svg")
+    $out = [IO.File]::Create("$dir\drawing.svgz")
+    $gz = New-Object IO.Compression.GZipStream $out, ([IO.Compression.CompressionMode]::Compress)
+    $gz.Write($in, 0, $in.Length); $gz.Dispose(); $out.Dispose()
+}
+Copy-Item "$env:WINDIR\Fonts\segoeui.ttf" "$dir\font.ttf" -Force
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null
 1..50 | ForEach-Object { Set-Content "$dir\folder\file$_.txt" "hello $_" }
 Write-Output $dir

@@ -320,6 +320,19 @@ bool LoadText(const std::wstring& path) {
     return true;
 }
 
+bool LoadSvg(const std::wstring& path) {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    UINT w, h;
+    auto bmp = SvgRender(path, std::max(64.f, rc.right - 2 * kPad * g_dpi / 96),
+                         std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96), g_wic.Get(), w, h);
+    if (!bmp || !(g_bmp = ToD2D(bmp.Get()))) return false;
+    g_orient = 1;
+    g_imgReduced = true;  // vector: render again at the new size after a resize
+    g_sub = std::to_wstring(w) + L" × " + std::to_wstring(h);
+    return true;
+}
+
 bool HasExt(const std::wstring& path, const wchar_t* list) {
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
@@ -588,6 +601,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn ") && LoadMarkdown(path)) g_kind = K_Md;
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
+    else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
                           L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "

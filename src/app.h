@@ -77,6 +77,7 @@ struct GridData {
 void GridInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* iconFont);
 std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep);  // sep 0: guess
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path);           // slow: worker thread
+bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
@@ -85,6 +86,10 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX
 bool FontLoad(IDWriteFactory*, const std::wstring& path, std::wstring& sub);
 void FontClear();
 float FontPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> height
+
+// ---- svg.cpp: SVG/SVGZ rendered to a bitmap fitting maxW x maxH pixels; w, h = intrinsic size
+Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, IWICImagingFactory*,
+                                             UINT& w, UINT& h);
 
 // ---- main.cpp
 std::wstring ExplorerSelection(HWND explorer);  // first selected item's file-system path, or ""

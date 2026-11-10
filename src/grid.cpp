@@ -79,6 +79,8 @@ struct Archive {
     time_t (*mtime)(void*);
     unsigned (*filetype)(void*);
     int (*is_encrypted)(void*);
+    int (*support_format_raw)(void*);
+    long long (*read_data)(void*, void*, size_t);
     bool Load() {
         HMODULE m = LoadLibraryExW(L"archiveint.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!m) return false;
@@ -89,9 +91,16 @@ struct Archive {
                get(free, "archive_read_free") && get(pathname_w, "archive_entry_pathname_w") &&
                get(size, "archive_entry_size") && get(size_is_set, "archive_entry_size_is_set") &&
                get(mtime, "archive_entry_mtime") && get(filetype, "archive_entry_filetype") &&
-               get(is_encrypted, "archive_entry_is_encrypted");
+               get(is_encrypted, "archive_entry_is_encrypted") &&
+               get(support_format_raw, "archive_read_support_format_raw") && get(read_data, "archive_read_data");
     }
 };
+
+Archive* Api() {
+    static Archive api;
+    static bool ok = api.Load();
+    return ok ? &api : nullptr;
+}
 
 struct Entry {
     std::wstring path;
@@ -228,9 +237,9 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
 
 // Worker thread: lists an archive. nullptr when libarchive is missing or can't read the file.
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path) {
-    static Archive api;
-    static bool ok = api.Load();
-    if (!ok) return nullptr;
+    Archive* pa = Api();
+    if (!pa) return nullptr;
+    Archive& api = *pa;
     void* a = api.read_new();
     api.support_filter_all(a);
     api.support_format_all(a);
@@ -366,4 +375,19 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
         rt->PopAxisAlignedClip();
     }
     return {total, top - area.top + body * kRowH + 8};
+}
+
+// Decompresses a single compressed file (gzip, xz, bzip2, ...), e.g. .svgz.
+bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap) {
+    Archive* api = Api();
+    if (!api) return false;
+    void* a = api->read_new();
+    api->support_filter_all(a);
+    api->support_format_raw(a);
+    void* e;
+    bool ok = api->open_filename_w(a, path.c_str(), 1 << 16) == 0 && api->next_header(a, &e) == 0;
+    char buf[1 << 16];
+    for (long long n; ok && out.size() < cap && (n = api->read_data(a, buf, sizeof buf)) > 0;) out.append(buf, (size_t)n);
+    api->free(a);
+    return ok && !out.empty();
 }

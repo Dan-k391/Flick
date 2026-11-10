@@ -22,7 +22,17 @@ add_library(md4c STATIC third_party/md4c/md4c.c)
 target_include_directories(md4c PUBLIC third_party/md4c)
 target_compile_definitions(md4c PUBLIC MD4C_USE_UTF16)  # parse wchar_t text directly
 
-add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/font.cpp src/flick.manifest)
+file(GLOB PLUTOVG_SRC third_party/lunasvg/plutovg/source/*.c)
+add_library(plutovg STATIC ${PLUTOVG_SRC})
+target_include_directories(plutovg PUBLIC third_party/lunasvg/plutovg/include)
+target_compile_definitions(plutovg PUBLIC PLUTOVG_BUILD_STATIC PRIVATE PLUTOVG_BUILD PLUTOVG_DISABLE_FONT_FACE_CACHE_LOAD)
+file(GLOB LUNASVG_SRC third_party/lunasvg/source/*.cpp)
+add_library(lunasvg STATIC ${LUNASVG_SRC})
+target_include_directories(lunasvg PUBLIC third_party/lunasvg/include)
+target_compile_definitions(lunasvg PUBLIC LUNASVG_BUILD_STATIC PRIVATE LUNASVG_BUILD LUNASVG_DISABLE_LOAD_SYSTEM_FONTS)
+target_link_libraries(lunasvg PRIVATE plutovg)
+
+add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/font.cpp src/svg.cpp src/flick.manifest)
 target_compile_definitions(Flick PRIVATE UNICODE _UNICODE NOMINMAX)
-target_link_libraries(Flick PRIVATE lexilla scintilla md4c windowsapp windows.data.pdf d3d11
+target_link_libraries(Flick PRIVATE lexilla scintilla md4c lunasvg windowsapp windows.data.pdf d3d11
   d2d1 dwrite windowscodecs dwmapi shlwapi uxtheme shcore imm32 msimg32 ole32 oleaut32 uuid psapi)
