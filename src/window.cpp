@@ -74,7 +74,7 @@ std::string g_codeFont;
 UINT g_dpi = 96;
 bool g_dark, g_placing;
 std::atomic<bool> g_visible;
-float g_natW, g_natH;   // natural size of a picture/SVG in pixels (sizes the window)
+float g_natW, g_natH;   // size a picture is shown at, in DIPs: 1 image pixel = 1 DIP, like QuickLook
 bool g_decodeForClient;  // re-decoding after a manual resize: fit the current window, not the screen
 void PlaceWindow();
 
@@ -219,12 +219,12 @@ void PictureArea(double& w, double& h) {
     RECT rc;
     if (g_decodeForClient) {
         GetClientRect(g_hwnd, &rc);
-        w = rc.right - 2 * kPad * g_dpi / 96, h = rc.bottom - (kTitleH + kPad) * g_dpi / 96;
+        w = rc.right, h = rc.bottom - kTitleH * g_dpi / 96;
     } else {
         MONITORINFO mi{sizeof mi};
         GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
         rc = mi.rcWork;
-        w = (rc.right - rc.left) * 0.8 - 2 * kPad * g_dpi / 96, h = (rc.bottom - rc.top) * 0.8 - (kTitleH + kPad) * g_dpi / 96;
+        w = (rc.right - rc.left) * 0.8, h = (rc.bottom - rc.top) * 0.8 - kTitleH * g_dpi / 96;
     }
     w = std::max(64.0, w), h = std::max(64.0, h);
 }
@@ -377,7 +377,7 @@ bool LoadSvg(const std::wstring& path) {
     g_imgReduced = true;  // vector: render again at the new size after a resize
     UINT bw, bh;
     bmp->GetSize(&bw, &bh);
-    g_natW = (float)bw, g_natH = (float)bh;  // the rendered size is the size to show
+    g_natW = bw * 96.f / g_dpi, g_natH = bh * 96.f / g_dpi;  // rendered at its intrinsic CSS size
     g_sub = std::to_wstring(w) + L" × " + std::to_wstring(h);
     return true;
 }
@@ -591,14 +591,15 @@ void PlaceWindow() {
     // Content size the kind asks for (DIPs); `ratio` > 0: own size, fitted into that share of the screen.
     float cw = 800, ch = 600 - chromeH, ratio = 0;
     switch (g_kind) {
-        case K_Image:
-            if (g_natW > 0) cw = g_natW / px, ch = g_natH / px, ratio = 0.8f;
+        case K_Image:  // edge to edge below the title bar
+            if (g_natW > 0) cw = g_natW, ch = g_natH, ratio = 0.8f, chromeW = 0, chromeH = kTitleH;
             break;
         case K_Media:
             if (g_mediaVideo) {
                 MediaState ms = MediaGet();
                 UINT vw = ms.videoW ? ms.videoW : g_posterW, vh = ms.videoW ? ms.videoH : g_posterH;
-                cw = std::max(100.f, (vw ? vw : 1366) / px), ch = std::max(100.f, (vh ? vh : 768) / px), ratio = 0.8f;
+                cw = std::max(100.f, (float)(vw ? vw : 1366)), ch = std::max(100.f, (float)(vh ? vh : 768)), ratio = 0.8f;
+                chromeW = 0, chromeH = kTitleH;  // edge to edge below the title bar
             } else {
                 cw = 560 - chromeW, ch = 560 - chromeH;
             }
@@ -806,9 +807,9 @@ D2D1_RECT_F VideoRect(const MediaState& s) {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     float vw = (float)(s.videoW ? s.videoW : g_posterW), vh = (float)(s.videoW ? s.videoH : g_posterH);
-    float aw = Dip(rc.right) - 2 * kPad, ah = Dip(rc.bottom) - kTitleH - kPad;
+    float aw = Dip(rc.right), ah = Dip(rc.bottom) - kTitleH;  // edge to edge below the title bar
     float k = std::min(aw / vw, ah / vh), w = std::round(vw * k), h = std::round(vh * k);
-    float x = std::round(kPad + (aw - w) / 2), y = std::round(kTitleH + (ah - h) / 2);
+    float x = std::round((aw - w) / 2), y = std::round(kTitleH + (ah - h) / 2);
     return {x, y, x + w, y + h};
 }
 
@@ -990,8 +991,10 @@ void Layout() {
 void DrawImage(const D2D1_RECT_F& area) {
     D2D1_SIZE_F s = g_bmp->GetSize();
     bool swap = g_orient >= 5;
-    float dw = swap ? s.height : s.width, dh = swap ? s.width : s.height;
-    float k = std::min({1.f, (area.right - area.left) / dw, (area.bottom - area.top) / dh});
+    // Shown at 1 image pixel = 1 DIP (so scaled up with the display scaling), shrunk to fit the area.
+    float dw = g_natW > 0 ? g_natW : swap ? s.height : s.width, dh = g_natH > 0 ? g_natH : swap ? s.width : s.height;
+    float fit = std::min({1.f, (area.right - area.left) / dw, (area.bottom - area.top) / dh});
+    float k = dw * fit / (swap ? s.height : s.width);  // bitmap DIPs -> shown DIPs
     D2D1::Matrix3x2F m = D2D1::Matrix3x2F::Identity();
     switch (g_orient) {
         case 2: m = D2D1::Matrix3x2F::Scale(-1, 1); break;
@@ -1149,7 +1152,7 @@ void Paint() {
     g_rt->DrawTextLayout({kPad, 0}, tl.Get(), text.Get());
 
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
-    if (g_kind == K_Image && g_bmp) DrawImage(area);
+    if (g_kind == K_Image && g_bmp) DrawImage({0, kTitleH, sz.width, sz.height});
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
     if (g_kind == K_Media) {
         MediaState ms = MediaGet();
