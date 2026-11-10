@@ -1407,10 +1407,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_SETTINGCHANGE:
             if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) ApplyTheme();
             break;
-        case WM_FLICK_TOGGLE:
-            if (g_visible) PreviewHide(false);
-            else if (auto path = ExplorerSelection((HWND)w); !path.empty()) PreviewShow(path, (HWND)w, (LONGLONG)l);
+        case WM_FLICK_TOGGLE: {  // Space: open; on the file already shown, close; on another file, show that
+            std::wstring path = ExplorerSelection((HWND)w);
+            if (!path.empty() && (!g_visible || path != g_path)) PreviewShow(path, (HWND)w, (LONGLONG)l);
+            else PreviewHide(false);
             return 0;
+        }
         case WM_FLICK_FOLLOW:
             if (auto path = ExplorerSelection((HWND)w); g_visible && !path.empty() && path != g_path)
                 PreviewShow(path, (HWND)w, (LONGLONG)l);
