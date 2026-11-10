@@ -14,8 +14,12 @@ All preview code is in `src/window.cpp`.
      `WM_FLICK_INFO` pattern: start a worker thread, post the result back, ignore stale results via a
      generation counter, show a placeholder immediately.
    - Never decode more than the window shows (see `LoadImage`).
+   - A long-lived worker producing pieces on demand (e.g. pages): copy the PDF pattern (`pdf.cpp` +
+     `OnPdf`): the worker `SendMessage`s each result, the reply says what to do next.
+   - Bitmaps always via `ToD2D` (shares WIC memory; bitmaps owned by D2D keep their memory forever).
 3. Dispatch it in `LoadContent` (order matters: images, then text sniffing, then info card).
-4. Draw it in `Paint()` (Direct2D, DIP coordinates, `area` = content rect) or, for a child HWND
+4. Draw it in `Paint()` (Direct2D, DIP coordinates, `area` = content rect); long content scrolls with
+   `g_scroll`/`g_docH` + `Scrollable()` (wheel; keys when focused) like Markdown/PDF. Or, for a child HWND
    control, show/size it in `Layout()` like Scintilla and hide it when idle (`PreviewHide`).
 5. Free its memory in `PreviewHide` (content is released whenever the preview closes).
 6. Add a sample to `scripts/make-samples.ps1` and its name to `bench.ps1` and `e2e.ps1`.
