@@ -239,6 +239,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     LONGLONG t0 = Now();
     if (!PreviewInit(inst)) return 1;
+    ExplorerSelection(GetShellWindow());  // warm up the Explorer COM proxies (desktop path)
     Log(L"started in %.1f ms (init + warm-up)", MsSince(t0));
     PrintMemory(L"idle");
     if (bench) return Bench(argc, argv);

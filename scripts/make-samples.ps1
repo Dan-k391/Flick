@@ -22,13 +22,14 @@ function New-Image($path, $w, $h, $format) {
 }
 
 New-Image "$dir\photo-1920.jpg" 1920 1080 ([System.Drawing.Imaging.ImageFormat]::Jpeg)
+New-Image "$dir\photo-12mp.jpg" 4000 3000 ([System.Drawing.Imaging.ImageFormat]::Jpeg)
 New-Image "$dir\photo-24mp.jpg" 6000 4000 ([System.Drawing.Imaging.ImageFormat]::Jpeg)
 New-Image "$dir\icon-512.png" 512 512 ([System.Drawing.Imaging.ImageFormat]::Png)
 
 Copy-Item "$PSScriptRoot\..\src\window.cpp" "$dir\code.cpp" -Force
 if (-not (Test-Path "$dir\big.log")) {
     $line = '2026-11-10 12:00:00.000 INFO  [worker-7] request handled in 12 ms path=/api/v1/items?id=42'
-    [IO.File]::WriteAllText("$dir\big.log", (($line + "`n") * 60000))  # ~5.6 MB, exceeds the 4 MB cap
+    [IO.File]::WriteAllText("$dir\big.log", (($line + "`n") * 60000))  # ~5.6 MB, exceeds the 2 MB text cap
 }
 if (-not (Test-Path "$dir\data.bin")) { [IO.File]::WriteAllBytes("$dir\data.bin", [byte[]]::new(100000)) }
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null

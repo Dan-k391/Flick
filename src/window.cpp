@@ -29,7 +29,7 @@ HWND g_hwnd;
 namespace {
 
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
-constexpr size_t kMaxText = 4 << 20;  // larger files show their first 4 MB
+constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
 enum Kind { K_None, K_Text, K_Image, K_Info };
 enum Hot { H_None, H_Open, H_Close };
@@ -76,8 +76,12 @@ std::wstring g_path, g_title, g_sub, g_open;
 std::vector<std::wstring> g_info;
 ComPtr<ID2D1Bitmap> g_bmp;
 UINT g_orient = 1;  // EXIF orientation
+bool g_imgReduced;  // image decoded below full size to fit the window
 Hot g_hot;
 D2D1_RECT_F g_openRc, g_closeRc;
+
+bool g_warming = true;
+void Cloak(BOOL on) { DwmSetWindowAttribute(g_hwnd, DWMWA_CLOAK, &on, sizeof on); }
 
 const Palette& Pal() { return g_dark ? kDark : kLight; }
 sptr_t Sci(UINT m, uptr_t w = 0, sptr_t l = 0) { return g_sciFn(g_sciPtr, m, w, l); }
@@ -165,18 +169,49 @@ bool LoadImage(const std::wstring& path) {
         g_orient = pv.uiVal;
     PropVariantClear(&pv);
 
-    // Never decode more pixels than the monitor can show.
-    MONITORINFO mi{sizeof mi};
-    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
-    double maxW = mi.rcWork.right - mi.rcWork.left, maxH = mi.rcWork.bottom - mi.rcWork.top;
+    // Decode no more pixels than the window shows; WM_EXITSIZEMOVE re-decodes after a resize.
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    double maxW = std::max(64.f, rc.right - 2 * kPad * g_dpi / 96);
+    double maxH = std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96);
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = std::min({1.0, maxW / w, maxH / h});
+    g_imgReduced = s < 1;
     ComPtr<IWICBitmapSource> src = frame;
     if (s < 1) {
-        ComPtr<IWICBitmapScaler> scaler;
         UINT sw = std::max(1u, (UINT)(w * s)), sh = std::max(1u, (UINT)(h * s));
-        if (SUCCEEDED(g_wic->CreateBitmapScaler(&scaler)) &&
-            SUCCEEDED(scaler->Initialize(frame.Get(), sw, sh, WICBitmapInterpolationModeFant)))
+        // JPEG (and some other codecs) can decode straight to 1/2, 1/4, 1/8 size: far cheaper than a
+        // full decode followed by resampling. Use the smallest native size that is still >= target.
+        ComPtr<IWICBitmapSourceTransform> xf;
+        if (SUCCEEDED(frame.As(&xf))) {
+            UINT cw = w, ch = h;
+            for (UINT d = 2; d <= 8; d *= 2) {
+                UINT tw = (w + d - 1) / d, th = (h + d - 1) / d;
+                if (tw < sw || th < sh) break;
+                UINT qw = tw, qh = th;
+                if (SUCCEEDED(xf->GetClosestSize(&qw, &qh)) && qw == tw && qh == th) cw = tw, ch = th;
+            }
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+            ComPtr<IWICBitmap> reduced;
+            ComPtr<IWICBitmapLock> lock;
+            UINT stride = 0, size = 0;
+            BYTE* px = nullptr;
+            WICRect all{0, 0, (INT)cw, (INT)ch};
+            if (cw < w && SUCCEEDED(xf->GetClosestPixelFormat(&fmt)) &&
+                SUCCEEDED(g_wic->CreateBitmap(cw, ch, fmt, WICBitmapCacheOnLoad, &reduced)) &&
+                SUCCEEDED(reduced->Lock(&all, WICBitmapLockWrite, &lock)) && SUCCEEDED(lock->GetStride(&stride)) &&
+                SUCCEEDED(lock->GetDataPointer(&size, &px)) &&
+                SUCCEEDED(xf->CopyPixels(nullptr, cw, ch, &fmt, WICBitmapTransformRotate0, stride, size, px))) {
+                lock.Reset();
+                src = reduced;
+            }
+        }
+        // Under 2x left to go, Direct2D's bilinear filter at draw time looks fine and costs less.
+        UINT rw, rh;
+        src->GetSize(&rw, &rh);
+        ComPtr<IWICBitmapScaler> scaler;
+        if (rw > 2 * sw && SUCCEEDED(g_wic->CreateBitmapScaler(&scaler)) &&
+            SUCCEEDED(scaler->Initialize(src.Get(), sw, sh, WICBitmapInterpolationModeFant)))
             src = scaler;
     }
     g_bmp = ToD2D(src.Get());
@@ -247,7 +282,7 @@ bool LoadText(const std::wstring& path) {
     sptr_t lines = Sci(SCI_GETLINECOUNT);
     std::string digits = "_" + std::to_string(lines);
     Sci(SCI_SETMARGINWIDTHN, 0, Sci(SCI_TEXTWIDTH, STYLE_LINENUMBER, (sptr_t)digits.c_str()) + 8);
-    g_sub = std::to_wstring(lines) + (lines == 1 ? L" line" : L" lines") + (truncated ? L" · first 4 MB" : L"");
+    g_sub = std::to_wstring(lines) + (lines == 1 ? L" line" : L" lines") + (truncated ? L" · first " + std::to_wstring(kMaxText >> 20) + L" MB" : L"");
     return true;
 }
 
@@ -261,32 +296,71 @@ std::wstring FormatTime(const FILETIME& ft) {
     return std::wstring(d) + L", " + t;
 }
 
-void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa) {
-    ComPtr<IShellItemImageFactory> factory;
-    HBITMAP hbmp = nullptr;
-    int px = (int)(kThumb * g_dpi / 96);
-    if (SUCCEEDED(SHCreateItemFromParsingName(path.c_str(), nullptr, IID_PPV_ARGS(&factory))) &&
-        SUCCEEDED(factory->GetImage({px, px}, SIIGBF_RESIZETOFIT, &hbmp))) {
-        ComPtr<IWICBitmap> wb;
-        if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(hbmp, nullptr, WICBitmapUsePremultipliedAlpha, &wb)))
-            g_bmp = ToD2D(wb.Get());
-        DeleteObject(hbmp);
+// Shell thumbnails (5-60 ms, unbounded for slow handlers) and folder item counts run on a worker
+// thread; the info card is shown immediately and the result is filled in when it arrives.
+struct InfoJob {
+    std::wstring path;
+    int px, gen;
+    LONGLONG t0;
+    HBITMAP bmp = nullptr;
+    int items = -1;  // folders only
+};
+std::atomic<int> g_infoGen;
+
+DWORD WINAPI InfoThread(void* p) {
+    auto* job = static_cast<InfoJob*>(p);
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    {
+        ComPtr<IShellItemImageFactory> factory;
+        if (SUCCEEDED(SHCreateItemFromParsingName(job->path.c_str(), nullptr, IID_PPV_ARGS(&factory))))
+            factory->GetImage({job->px, job->px}, SIIGBF_RESIZETOFIT, &job->bmp);
     }
+    CoUninitialize();
+    if (job->items >= 0) {
+        constexpr int kCap = 100000;  // don't count forever in gigantic folders
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileExW((job->path + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
+                                    nullptr, FIND_FIRST_EX_LARGE_FETCH);
+        if (h != INVALID_HANDLE_VALUE) {
+            do job->items += wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..");
+            while (job->items < kCap && FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+    }
+    if (!PostMessageW(g_hwnd, WM_FLICK_INFO, 0, (LPARAM)job)) {
+        if (job->bmp) DeleteObject(job->bmp);
+        delete job;
+    }
+    return 0;
+}
+
+void OnInfo(InfoJob* job) {
+    if (job->gen == g_infoGen && g_kind == K_Info && g_visible) {
+        if (job->bmp) {
+            ComPtr<IWICBitmap> wb;
+            if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(job->bmp, nullptr, WICBitmapUsePremultipliedAlpha, &wb)))
+                g_bmp = ToD2D(wb.Get());
+        }
+        if (job->items >= 0)
+            g_info[1] = std::to_wstring(job->items) + (job->items >= 100000 ? L"+ items"
+                                                       : job->items == 1 ? L" item" : L" items");
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        Log(L"info  thumbnail/count ready %.2f ms after key press", MsSince(job->t0));
+    }
+    if (job->bmp) DeleteObject(job->bmp);
+    delete job;
+}
+
+void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LONGLONG t0) {
+    bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+    auto* job = new InfoJob{path, (int)(kThumb * g_dpi / 96), ++g_infoGen, t0};
+    job->items = dir ? 0 : -1;
+    CloseHandle(CreateThread(nullptr, 0, InfoThread, job, 0, nullptr));
     SHFILEINFOW sfi{};
     SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_TYPENAME);
     g_info.push_back(sfi.szTypeName);
-    if (fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-        constexpr int kCap = 100000;  // don't stall on gigantic folders
-        int n = 0;
-        WIN32_FIND_DATAW fd;
-        HANDLE h = FindFirstFileExW((path + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
-                                    FIND_FIRST_EX_LARGE_FETCH);
-        if (h != INVALID_HANDLE_VALUE) {
-            do n += wcscmp(fd.cFileName, L".") && wcscmp(fd.cFileName, L"..");
-            while (n < kCap && FindNextFileW(h, &fd));
-            FindClose(h);
-        }
-        g_info.push_back(std::to_wstring(n) + (n >= kCap ? L"+ items" : n == 1 ? L" item" : L" items"));
+    if (dir) {
+        g_info.push_back(L"… items");
     } else {
         wchar_t sz[64];
         StrFormatByteSizeEx(((ULONGLONG)fa.nFileSizeHigh << 32) | fa.nFileSizeLow,
@@ -296,7 +370,7 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa) {
     g_info.push_back(L"Modified " + FormatTime(fa.ftLastWriteTime));
 }
 
-void LoadContent(const std::wstring& path) {
+void LoadContent(const std::wstring& path, LONGLONG t0) {
     g_bmp.Reset();
     g_info.clear();
     g_sub.clear();
@@ -307,7 +381,7 @@ void LoadContent(const std::wstring& path) {
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
     if (!dir && IsImageExt(path) && LoadImage(path)) g_kind = K_Image;
     else if (!dir && LoadText(path)) g_kind = K_Text;
-    else g_kind = K_Info, LoadInfo(path, fa);
+    else g_kind = K_Info, LoadInfo(path, fa, t0);
 
     g_open = L"Open";
     if (!dir) {
@@ -387,7 +461,8 @@ void Paint() {
         g_rt->FillRectangle(g_closeRc, fill.Get());
     }
     if (g_hot == H_Close) text->SetColor(C(0xFFFFFF));
-    g_rt->DrawText(L"", 1, g_fmtIcon.Get(), g_closeRc, text.Get());
+    const wchar_t closeGlyph = 0xE8BB;  // Segoe Fluent Icons "ChromeClose"
+    g_rt->DrawText(&closeGlyph, 1, g_fmtIcon.Get(), g_closeRc, text.Get());
     text->SetColor(p.text);
 
     // "Open with ..." button.
@@ -416,10 +491,11 @@ void Paint() {
     if (g_kind == K_Image && g_bmp) DrawImage(area);
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
 
-    if (g_rt->EndDraw() == D2DERR_RECREATE_TARGET) {  // device lost: rebuild and reload bitmaps
+    HRESULT hrEnd = g_rt->EndDraw();
+    if (hrEnd == D2DERR_RECREATE_TARGET) {  // device lost: rebuild and reload bitmaps
         g_rt.Reset();
         CreateTarget();
-        if (g_kind != K_Text) LoadContent(g_path);
+        if (g_kind != K_Text) LoadContent(g_path, Now());
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
 }
@@ -506,6 +582,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        case WM_EXITSIZEMOVE:
+            if (g_kind == K_Image && g_imgReduced) LoadContent(g_path, Now()), InvalidateRect(h, nullptr, FALSE);
+            return 0;
         case WM_MOUSEMOVE: {
             Hot hot = HitButton(l);
             if (hot != g_hot) g_hot = hot, InvalidateRect(h, nullptr, FALSE);
@@ -543,6 +622,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_HIDE:
             PreviewHide(false);
+            return 0;
+        case WM_FLICK_INFO:
+            OnInfo(reinterpret_cast<InfoJob*>(l));
             return 0;
         case WM_FLICK_QUIT:
             DestroyWindow(h);
@@ -653,10 +735,10 @@ bool PreviewInit(HINSTANCE inst) {
     SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnForeground, 0, 0,
                     WINEVENT_OUTOFCONTEXT);
 
-    // Warm-up: show once while cloaked so DWM, Direct2D, DirectWrite, Scintilla and the shell
-    // pay their first-use costs now instead of on the first Space press.
-    BOOL cloak = TRUE;
-    DwmSetWindowAttribute(g_hwnd, DWMWA_CLOAK, &cloak, sizeof cloak);
+    // Warm-up: show once while cloaked so DWM, Direct2D, Scintilla and the shell pay their first-use
+    // costs now instead of on the first Space press. The window then stays WS_VISIBLE but cloaked:
+    // uncloaking is much cheaper than ShowWindow.
+    Cloak(TRUE);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     PreviewShow(exe, nullptr, Now());  // info view (shell thumbnail)
@@ -667,9 +749,17 @@ bool PreviewInit(HINSTANCE inst) {
     Sci(SCI_SETTEXT, 0, (sptr_t)"int main() { return 0; } // warm-up");
     Layout();
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    // The first uncloak makes DWM build the window's visuals and Mica backdrop (~130 ms); do it off-screen.
+    RECT r;
+    GetWindowRect(g_hwnd, &r);
+    g_placing = true;
+    SetWindowPos(g_hwnd, nullptr, GetSystemMetrics(SM_XVIRTUALSCREEN) - (r.right - r.left) - 64, r.top, 0, 0,
+                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    g_placing = false;
+    Cloak(FALSE);
+    DwmFlush();
     PreviewHide(false);
-    cloak = FALSE;
-    DwmSetWindowAttribute(g_hwnd, DWMWA_CLOAK, &cloak, sizeof cloak);
+    g_warming = false;
     return true;
 }
 
@@ -693,12 +783,14 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
         g_placing = false;
         g_dpi = GetDpiForWindow(g_hwnd);
     }
-    LoadContent(path);
+    LoadContent(path, t0);
     t.load = MsSince(start);
     Layout();
-    if (!g_visible) SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    g_visible = true;
+    if (!g_visible)
+        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
+    g_visible = true;
     t.ready = MsSince(t0);
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
@@ -712,7 +804,8 @@ void PreviewHide(bool restoreFocus) {
     if (!g_visible) return;
     bool wasForeground = GetForegroundWindow() == g_hwnd;
     SaveSize();
-    ShowWindow(g_hwnd, SW_HIDE);
+    Cloak(TRUE);
+    if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
     g_hot = H_None;
     // Release content memory while idle.
@@ -720,6 +813,7 @@ void PreviewHide(bool restoreFocus) {
     g_info.clear();
     Sci(SCI_SETREADONLY, 0);
     Sci(SCI_CLEARALL);
+    ShowWindow(g_sci, SW_HIDE);  // a hidden Scintilla loads text ~3x faster (no scrollbar/layout updates)
     if (restoreFocus && wasForeground && IsWindow(g_source)) SetForegroundWindow(g_source);
 }
 

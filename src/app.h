@@ -9,6 +9,7 @@ enum : UINT {
     WM_FLICK_FOLLOW,               // navigation key released in Explorer while preview open
     WM_FLICK_HIDE,                 // Esc in Explorer while preview open
     WM_FLICK_QUIT,                 // `Flick.exe --exit`
+    WM_FLICK_INFO,                 // worker thread finished a thumbnail (lParam = InfoJob*)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
