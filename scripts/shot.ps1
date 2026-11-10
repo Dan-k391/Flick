@@ -1,8 +1,9 @@
 # Screenshots Flick's own window previewing a file, without Explorer or keyboard input (safe while
 # someone uses the PC): runs `Flick.exe --show <file>`, captures the window with PrintWindow, closes it.
 # Usage: shot.ps1 <file> [-Wait ms] [-Wheel notches] [-Click x,y]  -> build\shots\<file name>.png
-# -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...).
-param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @())
+# -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...). -Keys: virtual-key codes
+# posted to Flick's window after the clicks (e.g. 0x28 = Down).
+param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @())
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path "$PSScriptRoot\..\build\Release\Flick.exe").Path
 $out = Join-Path (New-Item -ItemType Directory -Force "$PSScriptRoot\..\build\shots").FullName ((Split-Path $File -Leaf) + '.png')
@@ -17,6 +18,7 @@ public static class Shot {
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
+  [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
   public static IntPtr Find(uint pid) {
@@ -45,6 +47,8 @@ for ($i = 0; $i + 1 -lt $Click.Count; $i += 2) {
     [void][Shot]::SendMessage($h, 0x201, [IntPtr]1, $lp); [void][Shot]::SendMessage($h, 0x202, [IntPtr]0, $lp)
     Start-Sleep -Milliseconds 100
 }
+foreach ($k in $Keys) { [void][Shot]::PostMessage($h, 0x100, [IntPtr]$k, [IntPtr]1); Start-Sleep -Milliseconds 150 }
+if ($Keys) { Start-Sleep -Milliseconds 400 }
 $r = New-Object Shot+RECT; [void][Shot]::GetWindowRect($h, [ref]$r)
 $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
