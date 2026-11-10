@@ -8,6 +8,7 @@
 #include <mfreadwrite.h>
 #include <dwmapi.h>
 #include <atomic>
+#include <algorithm>
 #include <cmath>
 
 using Microsoft::WRL::ComPtr;
@@ -20,6 +21,8 @@ std::atomic<int> g_pumpGen;  // a pump thread runs while the generation it start
 std::atomic<bool> g_framePending;
 bool g_error;
 bool g_muted;  // --bench / --mute: tests stay silent
+double g_volume = 1;  // the user's volume and mute, kept for the session
+bool g_userMuted;
 
 class Notify : public IMFMediaEngineNotify {
     std::atomic<LONG> ref_{1};
@@ -76,7 +79,8 @@ bool MediaOpen(const std::wstring& path) {
     g_error = false;
     BSTR url = SysAllocString(path.c_str());
     g_engine->SetAutoPlay(TRUE);
-    g_engine->SetMuted(g_muted);
+    g_engine->SetMuted(g_muted || g_userMuted);
+    g_engine->SetVolume(g_volume);
     HRESULT hr = g_engine->SetSource(url);
     SysFreeString(url);
     if (FAILED(hr)) return MediaClose(), false;
@@ -144,6 +148,19 @@ void MediaSeek(double seconds) {
 }
 
 void MediaMute(bool muted) { g_muted = muted; }
+
+void MediaSetVolume(double v) {
+    g_volume = std::clamp(v, 0.0, 1.0);
+    if (g_volume > 0 && g_userMuted) MediaToggleMute();  // turning it up unmutes
+    if (g_engine) g_engine->SetVolume(g_volume);
+}
+
+double MediaVolume() { return g_userMuted ? 0 : g_volume; }
+
+void MediaToggleMute() {
+    g_userMuted = !g_userMuted;
+    if (g_engine) g_engine->SetMuted(g_muted || g_userMuted);
+}
 
 // The first frame straight from a source reader (no playback pipeline, ~75 ms): shown while the media
 // engine is still starting, which takes 200-300 ms. Worker thread.

@@ -134,6 +134,9 @@ void MediaOnEvent(DWORD event);
 void MediaToggle();
 void MediaSeek(double seconds);
 void MediaMute(bool muted);  // for tests
+void MediaSetVolume(double v);  // 0..1, kept for the session
+double MediaVolume();           // 0 while muted
+void MediaToggleMute();
 Microsoft::WRL::ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory*);
 
 // window.cpp helpers for the views

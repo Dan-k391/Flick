@@ -101,14 +101,14 @@ int g_barHot = -1;             // scrollbar under the mouse
 // Audio/video: the frame shown, the control bar's hit areas.
 constexpr wchar_t kVideoExt[] = L" .mp4 .m4v .mov .mkv .avi .wmv .webm .mpg .mpeg .m2ts .mts .ts .3gp .3g2 .asf ";
 constexpr wchar_t kAudioExt[] = L" .mp3 .m4a .m4b .aac .wav .flac .wma .ogg .oga .opus .aiff .aif .amr .ac3 .ec3 .mka .weba ";
-bool g_mediaVideo, g_mouseIn, g_seekDrag;
+bool g_mediaVideo, g_mouseIn, g_seekDrag, g_volDrag;
 LONGLONG g_mediaT0;
 int g_posterGen;
 bool g_posterDone;      // the poster worker answered (with or without a frame)
 UINT g_posterW, g_posterH;  // size of the poster frame, until the engine knows the video size
 ComPtr<IWICBitmap> g_frameWic;
 ComPtr<ID2D1Bitmap> g_frame;
-D2D1_RECT_F g_playRc, g_trackRc;
+D2D1_RECT_F g_playRc, g_trackRc, g_muteRc, g_volRc;
 double g_shownPos = -1;
 ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
@@ -876,12 +876,17 @@ void SeekAt(float x) {
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-// Control bar: play/pause, time, seek track. Always shown for audio; for video while the mouse is over
-// the window or playback is paused.
+void VolumeAt(float x) {
+    if (g_volRc.right > g_volRc.left) MediaSetVolume((x - g_volRc.left - 7) / (g_volRc.right - g_volRc.left - 14));
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Control bar: play/pause, time, seek track, mute, volume. Always shown for audio; for video while the
+// mouse is over the window or playback is paused.
 void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* fill) {
     MediaState s = MediaGet();
-    g_playRc = g_trackRc = {};
-    if (g_mediaVideo && !g_mouseIn && !s.paused && !s.ended && !g_seekDrag) return;
+    g_playRc = g_trackRc = g_muteRc = g_volRc = {};
+    if (g_mediaVideo && !g_mouseIn && !s.paused && !s.ended && !g_seekDrag && !g_volDrag) return;
     const Palette& p = Pal();
     float h = 44, y = sz.height - kPad - h, x0 = kPad + 8, x1 = sz.width - kPad - 8;
     fill->SetColor(g_dark ? C(0x2B2B2B, 0.94f) : C(0xF3F3F3, 0.94f));
@@ -891,7 +896,19 @@ void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBru
     g_rt->DrawText(&glyph, 1, g_fmtGlyph.Get(), g_playRc, text);
     std::wstring time = Clock(s.pos) + L" / " + Clock(s.dur);
     g_rt->DrawText(time.c_str(), (UINT32)time.size(), g_fmtTitle.Get(), {x0 + 48, y, x0 + 160, y + h}, text);
-    g_trackRc = {x0 + 168, y, x1 - 20, y + h};
+    g_trackRc = {x0 + 168, y, x1 - 156, y + h};
+    // Mute button and volume slider at the right end.
+    double vol = MediaVolume();
+    g_muteRc = {x1 - 140, y + 4, x1 - 104, y + 40};
+    const wchar_t speaker = vol <= 0 ? 0xE74F : vol < 0.34 ? 0xE993 : vol < 0.67 ? 0xE994 : 0xE995;  // Mute, Volume1-3
+    g_rt->DrawText(&speaker, 1, g_fmtGlyph.Get(), g_muteRc, text);
+    g_volRc = {x1 - 104, y, x1 - 14, y + h};
+    float vy = y + h / 2, vx = g_volRc.left + 7 + (g_volRc.right - g_volRc.left - 14) * (float)vol;
+    fill->SetColor(p.btnBorder);
+    g_rt->FillRoundedRectangle({{g_volRc.left + 7, vy - 2, g_volRc.right - 7, vy + 2}, 2, 2}, fill);
+    fill->SetColor(p.link);
+    g_rt->FillRoundedRectangle({{g_volRc.left + 7, vy - 2, vx, vy + 2}, 2, 2}, fill);
+    g_rt->FillEllipse({{vx, vy}, 6, 6}, fill);
     float cy = y + h / 2, frac = s.dur > 0 ? (float)std::clamp(s.pos / s.dur, 0.0, 1.0) : 0.f;
     float kx = g_trackRc.left + (g_trackRc.right - g_trackRc.left) * frac;
     fill->SetColor(p.btnBorder);
@@ -1337,6 +1354,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_MOUSEWHEEL:
         case WM_MOUSEHWHEEL:
+            if (g_kind == K_Media && m == WM_MOUSEWHEEL) {  // wheel: volume, 5% a notch
+                MediaSetVolume(MediaVolume() + GET_WHEEL_DELTA_WPARAM(w) / (double)WHEEL_DELTA * 0.05);
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
             if (Scrollable()) {  // Shift+wheel or a tilt wheel scrolls sideways
                 bool sideways = m == WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(w) & MK_SHIFT);
                 UINT lines = 3;
@@ -1351,6 +1373,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_MOUSEMOVE: {
             if (g_dragAxis >= 0) return DragThumb(l), 0;
             if (g_seekDrag) return SeekAt(Dip(GET_X_LPARAM(l))), 0;
+            if (g_volDrag) return VolumeAt(Dip(GET_X_LPARAM(l))), 0;
             if (!g_mouseIn && g_kind == K_Media) g_mouseIn = true, InvalidateRect(h, nullptr, FALSE);
             Hot hot = HitButton(l);
             if (hot != g_hot) g_hot = hot, InvalidateRect(h, nullptr, FALSE);
@@ -1371,6 +1394,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
                 if (in(g_trackRc)) g_seekDrag = true, SetCapture(h), SeekAt(pt.x);
+                else if (in(g_volRc)) g_volDrag = true, SetCapture(h), VolumeAt(pt.x);
+                else if (in(g_muteRc)) MediaToggleMute(), InvalidateRect(h, nullptr, FALSE);
                 else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
@@ -1392,11 +1417,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_CAPTURECHANGED:
-            g_seekDrag = false;
+            g_seekDrag = g_volDrag = false;
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
-            if (g_dragAxis >= 0 || g_seekDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            if (g_dragAxis >= 0 || g_seekDrag || g_volDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
             else if (HitButton(l) == H_Close) PreviewHide(true);
             else if (HitButton(l) == H_Open) OpenFile(false);
             return 0;
@@ -1657,6 +1682,8 @@ bool PreviewKey(const MSG& m) {
     if (m.message != WM_KEYDOWN || !g_visible) return false;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
+    else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_UP || m.wParam == VK_DOWN))
+        MediaSetVolume(MediaVolume() + (m.wParam == VK_UP ? 0.1 : -0.1)), InvalidateRect(g_hwnd, nullptr, FALSE);
     else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_LEFT || m.wParam == VK_RIGHT))
         MediaSeek(MediaGet().pos + (m.wParam == VK_LEFT ? -5 : 5));
     else if (g_sideFocus && SideW() > 0 && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
