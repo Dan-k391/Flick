@@ -22,7 +22,7 @@ add_library(md4c STATIC third_party/md4c/md4c.c)
 target_include_directories(md4c PUBLIC third_party/md4c)
 target_compile_definitions(md4c PUBLIC MD4C_USE_UTF16)  # parse wchar_t text directly
 
-add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/flick.manifest)
+add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/flick.manifest)
 target_compile_definitions(Flick PRIVATE UNICODE _UNICODE NOMINMAX)
 target_link_libraries(Flick PRIVATE lexilla scintilla md4c windowsapp windows.data.pdf d3d11
   d2d1 dwrite windowscodecs dwmapi shlwapi uxtheme shcore imm32 msimg32 ole32 oleaut32 uuid psapi)

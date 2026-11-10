@@ -92,6 +92,17 @@ if (-not (Test-Path "$dir\doc.pdf")) {
     [void]$sb.Append("trailer`n<< /Size $($objs.Count + 1) /Root 1 0 R >>`nstartxref`n$xref`n%%EOF`n")
     [IO.File]::WriteAllText("$dir\doc.pdf", $sb.ToString(), [Text.Encoding]::ASCII)
 }
+if (-not (Test-Path "$dir\data.csv")) {
+    $sb = [Text.StringBuilder]::new("id,name,city,amount,date,notes`n")
+    $cities = 'Berlin', 'Tokyo', "S$([char]0xE3)o Paulo", 'Toronto', 'Nairobi', 'Sydney'
+    for ($i = 1; $i -le 20000; $i++) {
+        [void]$sb.Append("$i,Customer $i,$($cities[$i % 6]),$([math]::Round($i * 1.37, 2)),2026-$('{0:D2}' -f ($i % 12 + 1))-$('{0:D2}' -f ($i % 28 + 1)),`"note, with comma $i`"`n")
+    }
+    [IO.File]::WriteAllText("$dir\data.csv", $sb.ToString())
+}
+$lexilla = (Resolve-Path "$PSScriptRoot\..\third_party\lexilla").Path
+if (-not (Test-Path "$dir\archive.zip")) { Compress-Archive -Path $lexilla -DestinationPath "$dir\archive.zip" }
+if (-not (Test-Path "$dir\archive.tar.gz")) { tar.exe -czf "$dir\archive.tar.gz" -C (Split-Path $lexilla) lexilla }
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null
 1..50 | ForEach-Object { Set-Content "$dir\folder\file$_.txt" "hello $_" }
 Write-Output $dir

@@ -221,6 +221,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     int argc;
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool bench = argc > 1 && !wcscmp(argv[1], L"--bench");
+    bool show = argc > 2 && !wcscmp(argv[1], L"--show");  // `--show file`: preview one file, exit when closed
 
     if (argc > 1 && !wcscmp(argv[1], L"--selftest")) {
         auto lexer = [](const wchar_t* f) { const Lang* l = LangForFile(f); return l ? l->lexer : ""; };
@@ -228,6 +229,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
                   !strcmp(lexer(L"CMakeLists.txt"), "cmake") && !strcmp(lexer(L"Makefile"), "makefile") &&
                   !strcmp(lexer(L"a.json"), "json") && !strcmp(lexer(L"notes.txt"), "") &&
                   !strcmp(lexer(L"a.c.bak"), "") && !strcmp(lexer(L"x.h"), "cpp") && !strcmp(lexer(L"noext"), "");
+        if (auto g = GridParseCsv(L"id,name\n1,\"x, \"\"y\"\"\nz\"\n\n2,b\r\n3", 0)) {
+            auto cell = [&](size_t r, size_t c) {
+                auto [o, n] = g->cells[r * g->cols + c];
+                return g->text.substr(o, n);
+            };
+            if (g->Rows() != 4 || g->cols != 2 || cell(1, 1) != L"x, \"y\" z" || cell(2, 1) != L"b" ||
+                cell(3, 0) != L"3" || cell(3, 1) != L"" || !g->rightAlign[0] || g->rightAlign[1])
+                ok = false, Log(L"selftest: csv");
+        } else {
+            ok = false;
+        }
         MdLoad(LR"(# Title
 Para &amp; *x* <b>y</b>
 
@@ -256,7 +268,7 @@ c
         return 0;
     }
     // One resident instance; benchmarks may run alongside it.
-    if (!bench) {
+    if (!bench && !show) {
         CreateMutexW(nullptr, FALSE, L"Local\\Flick.SingleInstance");
         if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     }
@@ -264,7 +276,7 @@ c
     wchar_t logPath[MAX_PATH];
     ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\Flick", logPath, MAX_PATH);
     CreateDirectoryW(logPath, nullptr);
-    wcscat_s(logPath, bench ? L"\\bench.log" : L"\\flick.log");
+    wcscat_s(logPath, bench || show ?L"\\bench.log" : L"\\flick.log");
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     bool tooBig = GetFileAttributesExW(logPath, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > (1 << 20);
     g_logFile = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
@@ -277,13 +289,17 @@ c
     Log(L"started in %.1f ms (init + warm-up)", MsSince(t0));
     PrintMemory(L"idle");
     if (bench) return Bench(argc, argv);
+    if (show) {
+        wchar_t full[MAX_PATH];
+        GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
+        PreviewShow(full, nullptr, Now());
+    }
 
     CloseHandle(CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr));
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
-        if (PreviewKey(m)) continue;
-        TranslateMessage(&m);
-        DispatchMessageW(&m);
+        if (!PreviewKey(m)) TranslateMessage(&m), DispatchMessageW(&m);
+        if (show && !PreviewVisible()) break;
     }
     return 0;
 }

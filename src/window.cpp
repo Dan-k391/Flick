@@ -32,7 +32,7 @@ namespace {
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
-enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf };
+enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid };
 enum Hot { H_None, H_Open, H_Close };
 
 struct Palette {
@@ -84,12 +84,17 @@ bool g_imgReduced;  // image decoded below full size to fit the window
 Hot g_hot;
 D2D1_RECT_F g_openRc, g_closeRc;
 
-// Scrollable documents (Markdown, PDF), in DIPs.
-float g_scroll, g_docH;
+// Scrollable documents (Markdown, PDF, tables), in DIPs. Index 0 = horizontal, 1 = vertical.
+float g_scroll[2], g_doc[2];  // g_doc[0] = 0: nothing scrolls sideways
 bool g_sizing;  // inside a move/size loop: don't re-render PDF pages for every intermediate width
-constexpr float kBarHit = 14;  // width of the scrollbar's mouse area at the right edge
-float g_dragGrab = -1;         // dragging the scrollbar thumb: mouse offset within the thumb, else -1
-bool g_barHot;
+constexpr float kBarHit = 14;  // thickness of a scrollbar's mouse area along the window edge
+int g_dragAxis = -1;           // scrollbar being dragged
+float g_dragGrab;              // mouse offset within the dragged thumb
+int g_barHot = -1;             // scrollbar under the mouse
+
+// Archives are listed on a worker thread (WM_FLICK_GRID).
+int g_gridGen;
+bool g_gridPending;
 
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
 constexpr float kPageGap = 12;
@@ -352,9 +357,9 @@ LRESULT NextPdfPage() {
     GetClientRect(g_hwnd, &rc);
     float w = PageWidth(), viewH = Dip(rc.bottom) - kTitleH, y = kPad / 2;
     UINT px = (UINT)std::lround(w * g_dpi / 96);
-    for (size_t i = 0; i < g_pages.size() && y < g_scroll + 2 * viewH; i++) {
+    for (size_t i = 0; i < g_pages.size() && y < g_scroll[1] + 2 * viewH; i++) {
         float h = std::round(w * g_pages[i].second / g_pages[i].first);
-        if (y + h > g_scroll && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
+        if (y + h > g_scroll[1] && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
             return ((LRESULT)px << 32) | (i + 1);
         y += h + kPageGap;
     }
@@ -384,20 +389,25 @@ LRESULT OnPdf(PdfMsg& m) {
     return next;
 }
 
-// Waits (bounded) for the first page, so the first frame shows it instead of a blank page.
-void WaitForFirstPage() {
+bool Pending() {
+    return (g_kind == K_Pdf && !g_pdfFailed && (g_pageW.empty() || !g_pageW[0])) || (g_kind == K_Grid && g_gridPending);
+}
+
+// Waits (bounded) for content a worker produces (PDF page 1, archive listing), so the first frame
+// shows it instead of an empty placeholder.
+void WaitForContent() {
     for (LONGLONG start = Now();;) {
         MSG m;
         PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);  // runs the worker's pending SendMessage
-        double left = 120 - MsSince(start);  // slow pages (e.g. big scans) show the placeholder, then fill in
-        if (g_kind != K_Pdf || g_pdfFailed || (!g_pageW.empty() && g_pageW[0]) || left <= 0) break;
+        double left = 120 - MsSince(start);  // slow content shows the placeholder, then fills in
+        if (!Pending() || left <= 0) break;
         MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)left + 1, QS_SENDMESSAGE);
     }
 }
 
 // Pages stacked at the content width. Pages far from the view drop their bitmaps.
 float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
-    float w = PageWidth(), y = top + kPad / 2 - g_scroll, viewH = bottom - top;
+    float w = PageWidth(), y = top + kPad / 2 - g_scroll[1], viewH = bottom - top;
     // Until the worker reports the real sizes, show one blank Letter-shaped page.
     const std::vector<std::pair<float, float>> placeholder{{612.f, 792.f}};
     const auto& pages = g_pages.empty() && !g_pdfFailed ? placeholder : g_pages;
@@ -414,7 +424,49 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
         }
         y += h + kPageGap;
     }
-    return y + g_scroll - top - kPageGap + kPad / 2;
+    return y + g_scroll[1] - top - kPageGap + kPad / 2;
+}
+
+bool LoadCsv(const std::wstring& path) {
+    std::string buf;
+    bool truncated;
+    if (!ReadText(path, buf, truncated)) return false;
+    std::wstring w(MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), w.data(), (int)w.size());
+    auto g = GridParseCsv(w, HasExt(path, L" .tsv .tab ") ? L'\t' : HasExt(path, L" .psv ") ? L'|' : 0);
+    if (!g) return false;
+    g_sub = g->sub + (truncated ? L" · first " + std::to_wstring(kMaxText >> 20) + L" MB" : L"");
+    GridSet(std::move(g));
+    return true;
+}
+
+struct GridJob {
+    std::wstring path;
+    int gen;
+};
+
+DWORD WINAPI GridThread(void* p) {
+    std::unique_ptr<GridJob> job(static_cast<GridJob*>(p));
+    GridData* g = GridReadArchive(job->path).release();
+    if (!SendMessageW(g_hwnd, WM_FLICK_GRID, job->gen, (LPARAM)g)) delete g;  // reply 1: the UI took it
+    return 0;
+}
+
+void LoadArchive(const std::wstring& path) {
+    g_gridPending = true;
+    g_sub = L"reading…";
+    CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen}, 0, nullptr));
+}
+
+void ShowInfo();
+LRESULT OnGrid(int gen, GridData* g) {
+    if (gen != g_gridGen || g_kind != K_Grid) return 0;
+    g_gridPending = false;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    if (!g) return ShowInfo(), 0;  // not readable as an archive
+    g_sub = g->sub;
+    GridSet(std::unique_ptr<GridData>(g));
+    return 1;
 }
 
 std::wstring FormatTime(const FILETIME& ft) {
@@ -508,8 +560,19 @@ void ClearContent() {
     MdClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear();
-    g_scroll = 0;
+    GridSet(nullptr);
+    g_gridGen++, g_gridPending = false;
+    g_scroll[0] = g_scroll[1] = g_doc[0] = g_doc[1] = 0;
     g_kind = K_None;
+}
+
+void ShowInfo() {
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    GetFileAttributesExW(g_path.c_str(), GetFileExInfoStandard, &fa);
+    ClearContent();
+    g_sub.clear();
+    g_kind = K_Info;
+    LoadInfo(g_path, fa, Now());
 }
 
 void LoadContent(const std::wstring& path, LONGLONG t0) {
@@ -523,6 +586,10 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     if (dir) g_kind = K_Info, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn ") && LoadMarkdown(path)) g_kind = K_Md;
+    else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
+    else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
+                          L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "
+                          L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadArchive(path);
     else if (HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
                                   L".wdp .dds ") &&
              LoadImage(path)) g_kind = K_Image;
@@ -598,7 +665,8 @@ void DrawInfo(const D2D1_RECT_F& area, ID2D1SolidColorBrush* text, ID2D1SolidCol
     }
 }
 
-bool Thumb(float& top, float& height);
+bool Scrollable();
+bool Thumb(int axis, float& at, float& len);
 
 void Paint() {
     if (!g_rt) CreateTarget();
@@ -647,19 +715,25 @@ void Paint() {
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
     if (g_kind == K_Image && g_bmp) DrawImage(area);
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
-    if (g_kind == K_Md || g_kind == K_Pdf) {
+    if (Scrollable()) {
+        D2D1_RECT_F doc{kPad, kTitleH, sz.width - kPad, sz.height};
+        MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule};
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
-        g_docH = g_kind == K_Md ? MdPaint(g_rt.Get(), {kPad, kTitleH, sz.width - kPad, sz.height}, g_scroll,
-                                          {p.text, p.sub, p.link, p.codeBg, p.rule})
-                                : DrawPdf(kTitleH, sz.height, fill.Get());
-        g_rt->PopAxisAlignedClip();
-        float viewH = sz.height - kTitleH;
-        if (float ty, th; Thumb(ty, th)) {  // overlay scrollbar: thin, wider under the mouse
-            float bw = g_barHot || g_dragGrab >= 0 ? 6 : 3;
-            fill->SetColor(p.sub);
-            g_rt->FillRoundedRectangle({{sz.width - 3 - bw, ty + 2, sz.width - 3, ty + th - 2}, bw / 2, bw / 2},
-                                       fill.Get());
+        if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
+        if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
+        if (g_kind == K_Grid && GridGet()) {
+            D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
+            g_doc[0] = size.width, g_doc[1] = size.height;
         }
+        g_rt->PopAxisAlignedClip();
+        fill->SetColor(p.sub);
+        for (int axis = 0; axis < 2; axis++)
+            if (float at, len; Thumb(axis, at, len)) {  // overlay scrollbars: thin, wider under the mouse
+                float bw = g_barHot == axis || g_dragAxis == axis ? 6 : 3;
+                D2D1_RECT_F r = axis ? D2D1_RECT_F{sz.width - 3 - bw, at + 2, sz.width - 3, at + len - 2}
+                                     : D2D1_RECT_F{at + 2, sz.height - 3 - bw, at + len - 2, sz.height - 3};
+                g_rt->FillRoundedRectangle({r, bw / 2, bw / 2}, fill.Get());
+            }
     }
 
     HRESULT hrEnd = g_rt->EndDraw();
@@ -672,45 +746,49 @@ void Paint() {
     }
 }
 
-bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf; }
+bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid; }
 
-float ViewH() {
+// Visible extent of the document along an axis, in DIPs.
+float View(int axis) {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    return Dip(rc.bottom) - kTitleH;
+    return axis ? Dip(rc.bottom) - kTitleH : Dip(rc.right) - 2 * kPad;
 }
 
-// Scrollbar thumb position and height in DIPs; false when there is nothing to scroll.
-bool Thumb(float& top, float& height) {
-    float viewH = ViewH();
-    if (!Scrollable() || g_docH <= viewH) return false;
-    height = std::max(24.f, viewH * viewH / g_docH);
-    top = kTitleH + (viewH - height) * g_scroll / (g_docH - viewH);
+// Scrollbar thumb along an axis (position from the window edge, length) in DIPs; false: nothing to scroll.
+bool Thumb(int axis, float& at, float& len) {
+    float view = View(axis);
+    if (!Scrollable() || g_doc[axis] <= view) return false;
+    len = std::max(24.f, view * view / g_doc[axis]);
+    at = (axis ? kTitleH : kPad) + (view - len) * g_scroll[axis] / (g_doc[axis] - view);
     return true;
 }
 
-bool OnBar(LPARAM l) {
+// Scrollbar under the mouse: 1 vertical (right edge), 0 horizontal (bottom edge), -1 none.
+int OnBar(LPARAM l) {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    float top, height;
-    return Thumb(top, height) && Dip(GET_X_LPARAM(l)) >= Dip(rc.right) - kBarHit && Dip(GET_Y_LPARAM(l)) >= kTitleH;
+    float x = Dip(GET_X_LPARAM(l)), y = Dip(GET_Y_LPARAM(l)), at, len;
+    if (Thumb(1, at, len) && x >= Dip(rc.right) - kBarHit && y >= kTitleH) return 1;
+    if (Thumb(0, at, len) && y >= Dip(rc.bottom) - kBarHit && x < Dip(rc.right) - kBarHit) return 0;
+    return -1;
 }
 
-void ScrollTo(float s);
-// Moves the thumb so that its point g_dragGrab is under the mouse.
+void ScrollTo(int axis, float s) {
+    s = std::clamp(s, 0.f, std::max(0.f, g_doc[axis] - View(axis)));
+    if (s != g_scroll[axis]) g_scroll[axis] = s, InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+void ScrollBy(int axis, float d) { ScrollTo(axis, g_scroll[axis] + d); }
+
+// Moves the dragged thumb so that its point g_dragGrab is under the mouse.
 void DragThumb(LPARAM l) {
-    float top, height;
-    if (!Thumb(top, height)) return;
-    float viewH = ViewH();
-    ScrollTo((Dip(GET_Y_LPARAM(l)) - g_dragGrab - kTitleH) / (viewH - height) * (g_docH - viewH));
+    float at, len;
+    int a = g_dragAxis;
+    if (a < 0 || !Thumb(a, at, len)) return;
+    float view = View(a), mouse = a ? Dip(GET_Y_LPARAM(l)) - kTitleH : Dip(GET_X_LPARAM(l)) - kPad;
+    ScrollTo(a, (mouse - g_dragGrab) / (view - len) * (g_doc[a] - view));
 }
-
-void ScrollTo(float s) {
-    s = std::clamp(s, 0.f, std::max(0.f, g_docH - ViewH()));
-    if (s != g_scroll) g_scroll = s, InvalidateRect(g_hwnd, nullptr, FALSE);
-}
-
-void ScrollBy(float d) { ScrollTo(g_scroll + d); }
 
 Hot HitButton(LPARAM l) {
     D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
@@ -810,38 +888,43 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);  // PDF: re-render pages at the final width
             return 0;
         case WM_MOUSEWHEEL:
-            if (Scrollable()) {
+        case WM_MOUSEHWHEEL:
+            if (Scrollable()) {  // Shift+wheel or a tilt wheel scrolls sideways
+                bool sideways = m == WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(w) & MK_SHIFT);
                 UINT lines = 3;
                 SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
-                ScrollBy(-GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * std::min(lines, 10u) * 36);
+                float d = GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * std::min(lines, 10u) * 36;
+                ScrollBy(sideways ? 0 : 1, m == WM_MOUSEHWHEEL ? d : -d);
             }
             return 0;
         case WM_MOUSEMOVE: {
-            if (g_dragGrab >= 0) return DragThumb(l), 0;
+            if (g_dragAxis >= 0) return DragThumb(l), 0;
             Hot hot = HitButton(l);
             if (hot != g_hot) g_hot = hot, InvalidateRect(h, nullptr, FALSE);
-            if (OnBar(l) != g_barHot) g_barHot = !g_barHot, InvalidateRect(h, nullptr, FALSE);
+            if (int bar = OnBar(l); bar != g_barHot) g_barHot = bar, InvalidateRect(h, nullptr, FALSE);
             TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, h};
             TrackMouseEvent(&tme);
             return 0;
         }
         case WM_MOUSELEAVE:
-            g_hot = H_None, g_barHot = false;
+            g_hot = H_None, g_barHot = -1;
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN:
-            if (float top, height; OnBar(l) && Thumb(top, height)) {
-                float y = Dip(GET_Y_LPARAM(l));
-                g_dragGrab = y >= top && y < top + height ? y - top : height / 2;  // track click: jump there
+            if (int a = OnBar(l); a >= 0) {
+                float at, len, mouse = a ? Dip(GET_Y_LPARAM(l)) : Dip(GET_X_LPARAM(l));
+                Thumb(a, at, len);
+                g_dragGrab = mouse >= at && mouse < at + len ? mouse - at : len / 2;  // track click: jump there
+                g_dragAxis = a;
                 SetCapture(h);
                 DragThumb(l);
             }
             return 0;
         case WM_CAPTURECHANGED:
-            if (g_dragGrab >= 0) g_dragGrab = -1, InvalidateRect(h, nullptr, FALSE);
+            if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
-            if (g_dragGrab >= 0) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            if (g_dragAxis >= 0) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
             else if (HitButton(l) == H_Close) PreviewHide(true);
             else if (HitButton(l) == H_Open) OpenFile(false);
             return 0;
@@ -870,6 +953,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_PDF:
             return OnPdf(*reinterpret_cast<PdfMsg*>(l));
+        case WM_FLICK_GRID:
+            return OnGrid((int)w, reinterpret_cast<GridData*>(l));
         case WM_FLICK_INFO:
             OnInfo(reinterpret_cast<InfoJob*>(l));
             return 0;
@@ -925,6 +1010,7 @@ bool PreviewInit(HINSTANCE inst) {
     g_fmtInfo = Format(ui, 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_codeFont = HasFont(L"Cascadia Mono") ? "Cascadia Mono" : "Consolas";
     MdInit(g_dw.Get(), ui, g_codeFont == "Consolas" ? L"Consolas" : L"Cascadia Mono");
+    GridInit(g_dw.Get(), ui, HasFont(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets");
 
     DWORD v, sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Width", RRF_RT_REG_DWORD, nullptr, &v, &sz))
@@ -1048,7 +1134,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     }
     LoadContent(path, t0);
     t.load = MsSince(start);
-    WaitForFirstPage();
+    WaitForContent();
     Layout();
     if (!g_visible)
         // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
@@ -1059,7 +1145,8 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     t.ready = MsSince(t0);
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
-    t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf" : L"info";
+    t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
+             : g_kind == K_Grid ? L"table" : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
     return t;
@@ -1084,17 +1171,18 @@ bool PreviewKey(const MSG& m) {
     if (m.message != WM_KEYDOWN || !g_visible) return false;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
-    else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN && m.wParam != VK_LEFT &&
-             m.wParam != VK_RIGHT) {
-        RECT rc;
-        GetClientRect(g_hwnd, &rc);
-        float page = (Dip(rc.bottom) - kTitleH) * 0.9f;
-        ScrollBy(m.wParam == VK_UP     ? -40.f
-                 : m.wParam == VK_DOWN ? 40.f
-                 : m.wParam == VK_PRIOR ? -page
-                 : m.wParam == VK_NEXT  ? page
-                 : m.wParam == VK_HOME  ? -1e9f
-                                        : 1e9f);
+    else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
+        float page = View(1) * 0.9f;
+        switch (m.wParam) {
+            case VK_LEFT: ScrollBy(0, -40); break;
+            case VK_RIGHT: ScrollBy(0, 40); break;
+            case VK_UP: ScrollBy(1, -40); break;
+            case VK_DOWN: ScrollBy(1, 40); break;
+            case VK_PRIOR: ScrollBy(1, -page); break;
+            case VK_NEXT: ScrollBy(1, page); break;
+            case VK_HOME: ScrollTo(1, 0); break;
+            case VK_END: ScrollTo(1, 1e9f); break;
+        }
     }
     else return false;
     return true;
