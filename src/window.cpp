@@ -87,6 +87,9 @@ D2D1_RECT_F g_openRc, g_closeRc;
 // Scrollable documents (Markdown, PDF), in DIPs.
 float g_scroll, g_docH;
 bool g_sizing;  // inside a move/size loop: don't re-render PDF pages for every intermediate width
+constexpr float kBarHit = 14;  // width of the scrollbar's mouse area at the right edge
+float g_dragGrab = -1;         // dragging the scrollbar thumb: mouse offset within the thumb, else -1
+bool g_barHot;
 
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
 constexpr float kPageGap = 12;
@@ -595,6 +598,8 @@ void DrawInfo(const D2D1_RECT_F& area, ID2D1SolidColorBrush* text, ID2D1SolidCol
     }
 }
 
+bool Thumb(float& top, float& height);
+
 void Paint() {
     if (!g_rt) CreateTarget();
     const Palette& p = Pal();
@@ -649,10 +654,11 @@ void Paint() {
                                 : DrawPdf(kTitleH, sz.height, fill.Get());
         g_rt->PopAxisAlignedClip();
         float viewH = sz.height - kTitleH;
-        if (g_docH > viewH) {  // overlay scrollbar thumb
-            float th = std::max(24.f, viewH * viewH / g_docH), ty = kTitleH + (viewH - th) * g_scroll / (g_docH - viewH);
+        if (float ty, th; Thumb(ty, th)) {  // overlay scrollbar: thin, wider under the mouse
+            float bw = g_barHot || g_dragGrab >= 0 ? 6 : 3;
             fill->SetColor(p.sub);
-            g_rt->FillRoundedRectangle({{sz.width - 6, ty + 2, sz.width - 3, ty + th - 2}, 1.5f, 1.5f}, fill.Get());
+            g_rt->FillRoundedRectangle({{sz.width - 3 - bw, ty + 2, sz.width - 3, ty + th - 2}, bw / 2, bw / 2},
+                                       fill.Get());
         }
     }
 
@@ -668,12 +674,43 @@ void Paint() {
 
 bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf; }
 
-void ScrollBy(float d) {
+float ViewH() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    float s = std::clamp(g_scroll + d, 0.f, std::max(0.f, g_docH - (Dip(rc.bottom) - kTitleH)));
+    return Dip(rc.bottom) - kTitleH;
+}
+
+// Scrollbar thumb position and height in DIPs; false when there is nothing to scroll.
+bool Thumb(float& top, float& height) {
+    float viewH = ViewH();
+    if (!Scrollable() || g_docH <= viewH) return false;
+    height = std::max(24.f, viewH * viewH / g_docH);
+    top = kTitleH + (viewH - height) * g_scroll / (g_docH - viewH);
+    return true;
+}
+
+bool OnBar(LPARAM l) {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float top, height;
+    return Thumb(top, height) && Dip(GET_X_LPARAM(l)) >= Dip(rc.right) - kBarHit && Dip(GET_Y_LPARAM(l)) >= kTitleH;
+}
+
+void ScrollTo(float s);
+// Moves the thumb so that its point g_dragGrab is under the mouse.
+void DragThumb(LPARAM l) {
+    float top, height;
+    if (!Thumb(top, height)) return;
+    float viewH = ViewH();
+    ScrollTo((Dip(GET_Y_LPARAM(l)) - g_dragGrab - kTitleH) / (viewH - height) * (g_docH - viewH));
+}
+
+void ScrollTo(float s) {
+    s = std::clamp(s, 0.f, std::max(0.f, g_docH - ViewH()));
     if (s != g_scroll) g_scroll = s, InvalidateRect(g_hwnd, nullptr, FALSE);
 }
+
+void ScrollBy(float d) { ScrollTo(g_scroll + d); }
 
 Hot HitButton(LPARAM l) {
     D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
@@ -704,12 +741,19 @@ void SaveSize() {
 }
 
 // Hide when the user switches to anything other than the source Explorer window or us.
+// Transient shell UI (the Alt+Tab switcher, Start, search, taskbar) is ignored: the user hasn't
+// switched apps (yet); if they do, the app they pick takes the foreground next.
 void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD) {
     DWORD pid = 0;
     GetWindowThreadProcessId(h, &pid);
     if (g_visible && h && pid != GetCurrentProcessId() && GetAncestor(h, GA_ROOT) != g_source) {
         wchar_t cls[64] = L"";
         GetClassNameW(h, cls, 64);
+        for (const wchar_t* shell : {L"XamlExplorerHostIslandWindow", L"MultitaskingViewFrame", L"TaskSwitcherWnd",
+                                     L"ForegroundStaging", L"Windows.UI.Core.CoreWindow", L"Shell_TrayWnd",
+                                     L"Shell_SecondaryTrayWnd", L"NotifyIconOverflowWindow",
+                                     L"TopLevelWindowForOverflowXamlIsland"})
+            if (!wcscmp(cls, shell)) return;
         Log(L"hide: foreground -> %s %p (source %p)", cls, h, g_source);
         PreviewHide(false);
     }
@@ -773,18 +817,32 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_MOUSEMOVE: {
+            if (g_dragGrab >= 0) return DragThumb(l), 0;
             Hot hot = HitButton(l);
             if (hot != g_hot) g_hot = hot, InvalidateRect(h, nullptr, FALSE);
+            if (OnBar(l) != g_barHot) g_barHot = !g_barHot, InvalidateRect(h, nullptr, FALSE);
             TRACKMOUSEEVENT tme{sizeof tme, TME_LEAVE, h};
             TrackMouseEvent(&tme);
             return 0;
         }
         case WM_MOUSELEAVE:
-            g_hot = H_None;
+            g_hot = H_None, g_barHot = false;
             InvalidateRect(h, nullptr, FALSE);
             return 0;
+        case WM_LBUTTONDOWN:
+            if (float top, height; OnBar(l) && Thumb(top, height)) {
+                float y = Dip(GET_Y_LPARAM(l));
+                g_dragGrab = y >= top && y < top + height ? y - top : height / 2;  // track click: jump there
+                SetCapture(h);
+                DragThumb(l);
+            }
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (g_dragGrab >= 0) g_dragGrab = -1, InvalidateRect(h, nullptr, FALSE);
+            return 0;
         case WM_LBUTTONUP:
-            if (HitButton(l) == H_Close) PreviewHide(true);
+            if (g_dragGrab >= 0) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            else if (HitButton(l) == H_Close) PreviewHide(true);
             else if (HitButton(l) == H_Open) OpenFile(false);
             return 0;
         case WM_RBUTTONUP:
@@ -993,7 +1051,8 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     WaitForFirstPage();
     Layout();
     if (!g_visible)
-        SetWindowPos(g_hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
+        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
     if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
     g_visible = true;

@@ -108,6 +108,9 @@ of PDFs and big images it sits around ~35–55 MB private.
   We don't swallow Space: Explorer ignores it, and swallowing would need slow COM work in the hook.
 - Show with `SWP_NOACTIVATE` so Explorer keeps focus: arrow keys move the selection and the
   preview follows (on key-up). Inactive windows show Mica as a flat colour — expected.
+- **Alt+Tab, Start and search briefly take the foreground** (`XamlExplorerHostIslandWindow`,
+  `Windows.UI.Core.CoreWindow`, …). The hide-on-foreground hook ignores those shell classes; the preview
+  is `HWND_TOPMOST` so Explorer doesn't cover it when re-activated.
 - `WS_SYSMENU` + extended frame makes DWM draw its own tiny close button; don't set it.
 - `small` is a Windows macro (`rpcndr.h`). Don't name variables `small`/`near`/`far`.
 - Don't edit sources with PowerShell `Get-Content`/`Set-Content`: it re-encodes UTF-8 and breaks
@@ -118,7 +121,7 @@ of PDFs and big images it sits around ~35–55 MB private.
 ## Not done yet / ideas
 - More formats: video/audio, archives, Office (via preview handlers?).
 - Markdown: clickable links, syntax-highlighted code blocks, images, raw HTML, a "show source" toggle.
-- PDF: zoom, text selection/copy, password prompt; dragging the overlay scrollbar.
+- PDF: zoom, text selection/copy, password prompt.
 - Progressive images (show cached shell thumbnail, decode full image on a worker) for >10 MP photos.
 - Animated GIF, HEIC/AVIF need the Store codecs; multi-selection; "Open with" dropdown
   (right-click the button opens the system chooser today).
