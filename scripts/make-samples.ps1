@@ -62,14 +62,24 @@ on the next line.
 | PDF | Windows.Data.Pdf | async pages |
 
 ```cpp
+#include <cstdio>
 int main() {
-    return 0;  // a fenced code block
+    printf("%d\n", 42);  // a fenced code block
 }
+```
+
+```python
+def greet(name: str) -> str:
+    return f"Hello, {name}!"  # coloured too
 ```
 
 ---
 
-![an image](logo.png) shows its alt text. <b>Inline HTML</b> shows its text.
+![missing picture](logo.png) shows its alt text. <b>Inline HTML</b> shows its text.
+
+![a drawing](drawing.svg)
+
+![badge](https://img.shields.io/badge/remote-alt%20text-blue)
 '@
 # A 30-page Letter PDF with text and a coloured bar on every page (ASCII, so offsets are char counts).
 if (-not (Test-Path "$dir\doc.pdf")) {

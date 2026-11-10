@@ -240,6 +240,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         } else {
             ok = false;
         }
+        {
+            auto runs = Highlight(L"int x = 1; // c\n", LangForName(L"cpp"));
+            bool kw = false, comment = false;
+            for (auto& r : runs) kw |= r.start == 0 && r.len == 3, comment |= r.role == R_Comment;
+            if (!kw || !comment) ok = false, Log(L"selftest: highlight cpp");
+            Highlight(L"def f(x):\n    return f\"{x}\"  # c\n", LangForName(L"python"));
+        }
         MdLoad(LR"(# Title
 Para &amp; *x* <b>y</b>
 

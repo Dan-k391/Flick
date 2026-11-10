@@ -345,7 +345,8 @@ bool LoadMarkdown(const std::wstring& path) {
     if (!ReadText(path, buf, truncated)) return false;
     std::wstring w(MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), w.data(), (int)w.size());
-    MdLoad(w);
+    std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
+    MdLoad(w, dir);
     if (truncated) g_sub = L"first " + std::to_wstring(kMaxText >> 20) + L" MB";
     return true;
 }
@@ -737,7 +738,7 @@ void Paint() {
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
     if (Scrollable()) {
         D2D1_RECT_F doc{kPad, kTitleH, sz.width - kPad, sz.height};
-        MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule};
+        MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role};
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
@@ -1016,6 +1017,8 @@ bool HasFont(const wchar_t* family) {
 }  // namespace
 
 bool PreviewVisible() { return g_visible; }
+ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource* src) { return ToD2D(src); }
+IWICImagingFactory* WicFactory() { return g_wic.Get(); }
 
 bool PreviewInit(HINSTANCE inst) {
     if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, g_d2d.GetAddressOf())) ||

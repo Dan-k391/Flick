@@ -267,3 +267,23 @@ const Lang* LangForFile(const std::wstring& path) {
         if (InList(m.names, name) || InList(m.names, ext)) return m.lang;
     return nullptr;
 }
+
+// Fenced-code info strings and notebook languages ("python", "c++", "shell", ...) to a language.
+const Lang* LangForName(std::wstring name) {
+    for (auto& c : name) c = towlower(c);
+    static const std::pair<const wchar_t*, const wchar_t*> alias[] = {
+        {L"python", L"py"},     {L"python3", L"py"},   {L"ipython", L"py"},     {L"ipython3", L"py"},
+        {L"javascript", L"js"}, {L"node", L"js"},      {L"typescript", L"ts"},  {L"shell", L"sh"},
+        {L"console", L"sh"},    {L"shellsession", L"sh"}, {L"zsh", L"sh"},      {L"powershell", L"ps1"},
+        {L"pwsh", L"ps1"},      {L"ps", L"ps1"},       {L"csharp", L"cs"},      {L"c#", L"cs"},
+        {L"rust", L"rs"},       {L"golang", L"go"},    {L"kotlin", L"kt"},      {L"objective-c", L"m"},
+        {L"objc", L"m"},        {L"docker", L"sh"},    {L"dockerfile", L"sh"},  {L"batch", L"bat"},
+        {L"make", L"mk"},       {L"makefile", L"mk"},  {L"markdown", L"md"},    {L"ini", L"ini"},
+    };
+    for (auto [n, ext] : alias)
+        if (name == n) {
+            name = ext;
+            break;
+        }
+    return name.empty() ? nullptr : LangForFile(L"x." + name);
+}

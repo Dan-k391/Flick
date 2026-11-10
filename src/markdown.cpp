@@ -1,7 +1,11 @@
 // Markdown preview: md4c parses the text into blocks (paragraphs, headings, code, lists, quotes,
 // tables); DirectWrite lays them out lazily, only as far as the view has scrolled, so opening a long
 // document costs about the same as a short one. Raw HTML is not rendered (text between tags shows).
+// Code blocks are coloured with Lexilla; local and embedded (data:) images are decoded when laid
+// out. Remote images show their alt text: a previewer doesn't go to the network.
 #include "app.h"
+#include <shlwapi.h>
+#include <wincrypt.h>
 #include <algorithm>
 #include <cmath>
 #include "md4c.h"
@@ -19,7 +23,7 @@ struct Text {
     ComPtr<IDWriteTextLayout> layout;
     std::vector<D2D1_RECT_F> codeRects;  // inline-code backgrounds, layout coordinates
 };
-enum BlockKind { B_Para, B_Head, B_Code, B_Rule, B_Table };
+enum BlockKind { B_Para, B_Head, B_Code, B_Rule, B_Table, B_Image };
 struct Block {
     BlockKind kind;
     int level = 0, indent = 0, quote = 0;  // heading level, list depth, quote depth
@@ -28,6 +32,10 @@ struct Block {
     Text text;
     std::vector<std::vector<Text>> rows;  // tables; rows[0] is the header
     std::vector<float> colX, rowY;        // tables: cell edges relative to the block origin
+    std::wstring src;                     // images: path or data: URI; code: language
+    ComPtr<ID2D1Bitmap> bmp;              // images, decoded on first layout
+    bool sized = false, tried = false;
+    float imgW = 0, imgH = 0;             // images: natural size (pixels = DIPs, like a browser)
     float y = 0, h = 0, after = 0;        // laid-out position in the document (DIPs)
 };
 
@@ -37,10 +45,12 @@ IDWriteFactory* g_dw;
 std::wstring g_mono;
 ComPtr<IDWriteTextFormat> g_fmtBody, g_fmtCode, g_fmtBullet, g_fmtHead[6];
 std::vector<Block> g_blocks;
+std::wstring g_base;  // folder of the Markdown file, for relative image paths
+float g_dpi = 96;
 size_t g_laid;  // blocks [0, g_laid) are laid out for g_width
 float g_width = -1, g_laidH, g_prevAfter;
 ID2D1RenderTarget* g_brushRt;
-ComPtr<ID2D1SolidColorBrush> g_link, g_dim;  // drawing effects stored in layouts
+ComPtr<ID2D1SolidColorBrush> g_link, g_dim, g_role[R_Count];  // drawing effects stored in layouts
 
 // ---- parsing
 std::wstring Entity(std::wstring_view e) {
@@ -67,6 +77,8 @@ struct Parser {
     bool open = false, table = false;  // a block (or table cell) is receiving text
     std::wstring bullet;               // marker for the next block started inside a list item
     std::vector<std::pair<UINT32, RunKind>> spans;
+    int image = 0;                     // inside an image block's alt text (nesting depth)
+    bool afterImage = false;           // paragraph text continuing after a picture: drop leading spaces
 
     void End() {
         if (!open || table) return;
@@ -77,13 +89,14 @@ struct Parser {
     }
     void Start(BlockKind k, int level = 0) {
         End();
+        afterImage = false;
         Block& b = g_blocks.emplace_back(Block{k, level, (int)lists.size(), quote});
         b.bullet = std::move(bullet);
         bullet.clear();
         open = true;
     }
     Text& Target() {  // tight list items have no paragraph block: start one on first text
-        if (!open) Start(B_Para), g_blocks.back().tight = true;
+        if (!open) Start(B_Para), g_blocks.back().tight = !lists.empty();
         Block& b = g_blocks.back();
         return table ? b.rows.back().back() : b.text;
     }
@@ -106,7 +119,12 @@ int EnterBlock(MD_BLOCKTYPE type, void* d, void* user) {
         }
         case MD_BLOCK_HR: p.Start(B_Rule), p.open = false; break;
         case MD_BLOCK_H: p.Start(B_Head, static_cast<MD_BLOCK_H_DETAIL*>(d)->level); break;
-        case MD_BLOCK_CODE: p.Start(B_Code); break;
+        case MD_BLOCK_CODE: {
+            p.Start(B_Code);
+            auto& lang = static_cast<MD_BLOCK_CODE_DETAIL*>(d)->lang;
+            g_blocks.back().src.assign(lang.text ? lang.text : L"", lang.size);
+            break;
+        }
         case MD_BLOCK_HTML:
         case MD_BLOCK_P: p.Start(B_Para); break;
         case MD_BLOCK_TABLE: p.Start(B_Table), p.table = true; break;
@@ -135,8 +153,22 @@ int LeaveBlock(MD_BLOCKTYPE type, void*, void* user) {
     return 0;
 }
 
-int EnterSpan(MD_SPANTYPE type, void*, void* user) {
+bool Remote(const std::wstring& src) { return src.find(L"://") != std::wstring::npos || src.starts_with(L"//"); }
+
+int EnterSpan(MD_SPANTYPE type, void* d, void* user) {
     Parser& p = *static_cast<Parser*>(user);
+    if (type == MD_SPAN_IMG && p.image) p.image++;
+    if (type == MD_SPAN_IMG && !p.image && !p.table) {  // a picture we can show: its own block
+        auto& a = static_cast<MD_SPAN_IMG_DETAIL*>(d)->src;
+        std::wstring src(a.text ? a.text : L"", a.size);
+        if (!src.empty() && !Remote(src)) {
+            p.Start(B_Image);
+            g_blocks.back().src = std::move(src);
+            p.image = 1;
+            p.spans.push_back({0, RK_None});
+            return 0;
+        }
+    }
     RunKind k = type == MD_SPAN_STRONG                      ? RK_Strong
                 : type == MD_SPAN_EM || type == MD_SPAN_IMG ? RK_Em  // images show their alt text
                 : type == MD_SPAN_CODE                      ? RK_Code
@@ -147,10 +179,14 @@ int EnterSpan(MD_SPANTYPE type, void*, void* user) {
     return 0;
 }
 
-int LeaveSpan(MD_SPANTYPE, void*, void* user) {
+int LeaveSpan(MD_SPANTYPE type, void*, void* user) {
     Parser& p = *static_cast<Parser*>(user);
     auto [start, k] = p.spans.back();
     p.spans.pop_back();
+    if (type == MD_SPAN_IMG && p.image && --p.image == 0) {  // text after the picture: a new paragraph
+        p.open = false, p.afterImage = true;
+        return 0;
+    }
     Text& t = p.Target();
     if (k != RK_None && t.s.size() > start) t.runs.push_back({start, (UINT32)t.s.size() - start, k});
     return 0;
@@ -158,7 +194,14 @@ int LeaveSpan(MD_SPANTYPE, void*, void* user) {
 
 int OnText(MD_TEXTTYPE type, const MD_CHAR* s, MD_SIZE n, void* user) {
     if (type == MD_TEXT_HTML) return 0;
-    std::wstring& out = static_cast<Parser*>(user)->Target().s;
+    Parser& p = *static_cast<Parser*>(user);
+    if (p.afterImage && p.open) p.afterImage = false;  // the paragraph after the picture has begun
+    if (p.afterImage) {
+        while (n && (*s == L' ' || type == MD_TEXT_SOFTBR)) s++, n--, type = type == MD_TEXT_SOFTBR ? MD_TEXT_NORMAL : type;
+        if (!n) return 0;
+        p.afterImage = false;
+    }
+    std::wstring& out = p.Target().s;
     switch (type) {
         case MD_TEXT_NULLCHAR: out += L'�'; break;
         case MD_TEXT_BR: out += L'\x2028'; break;  // line break within the paragraph
@@ -217,6 +260,60 @@ float LayoutText(Text& t, IDWriteTextFormat* f, float width, bool dim = false) {
     return m.height;
 }
 
+// Reads a Markdown image's natural size (px == 0: cheap, headers only) or decodes it to at most
+// `px` pixels wide.
+void LoadImageBlock(Block& b, UINT px) {
+    IWICImagingFactory* wic = WicFactory();
+    ComPtr<IWICBitmapSource> src;
+    std::string bytes;  // data: URI payload, alive while decoding
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> dec;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    if (b.src.starts_with(L"data:")) {
+        size_t comma = b.src.find(L',');
+        if (comma == std::wstring::npos || b.src.find(L";base64") > comma) return;
+        std::string b64(b.src.begin() + comma + 1, b.src.end());
+        DWORD n = 0;
+        if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr)) return;
+        bytes.resize(n);
+        if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)bytes.data(), &n, nullptr, nullptr) ||
+            FAILED(wic->CreateStream(&stream)) || FAILED(stream->InitializeFromMemory((BYTE*)bytes.data(), n)) ||
+            FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec)))
+            return;
+    } else {
+        std::wstring rel = b.src.substr(0, b.src.find_first_of(L"?#"));
+        wchar_t unescaped[MAX_PATH * 2];
+        DWORD n = MAX_PATH * 2;
+        if (SUCCEEDED(UrlUnescapeW(rel.data(), unescaped, &n, 0))) rel = unescaped;
+        std::replace(rel.begin(), rel.end(), L'/', L'\\');
+        if (rel.starts_with(L"file:\\\\\\")) rel.erase(0, 8);
+        wchar_t full[MAX_PATH * 2];
+        std::wstring joined = PathIsRelativeW(rel.c_str()) ? g_base + L"\\" + rel : rel;
+        if (!PathCanonicalizeW(full, joined.c_str())) return;
+        std::wstring ext = PathFindExtensionW(full);
+        if (!_wcsicmp(ext.c_str(), L".svg") || !_wcsicmp(ext.c_str(), L".svgz")) {
+            UINT w = 0, h = 0;
+            auto svg = SvgRender(full, (float)px, 1e5f, wic, w, h);
+            if (svg) b.bmp = SharedBitmap(svg.Get());
+            if (!px) b.imgW = (float)w, b.imgH = (float)h;
+            return;
+        }
+        if (FAILED(wic->CreateDecoderFromFilename(full, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec))) return;
+    }
+    UINT w, h;
+    if (FAILED(dec->GetFrame(0, &frame)) || FAILED(frame->GetSize(&w, &h)) || !w || !h) return;
+    if (!px) {
+        b.imgW = (float)w, b.imgH = (float)h;
+        return;
+    }
+    src = frame;
+    ComPtr<IWICBitmapScaler> scaler;
+    if (w > px && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
+        SUCCEEDED(scaler->Initialize(frame.Get(), px, std::max(1u, (UINT)((UINT64)h * px / w)), WICBitmapInterpolationModeFant)))
+        src = scaler;
+    b.bmp = SharedBitmap(src.Get());
+}
+
 void LayoutBlock(Block& b, float width) {
     float w = width - b.indent * kIndent - b.quote * kQuote, before = 0;
     bool dim = b.quote > 0;
@@ -227,7 +324,23 @@ void LayoutBlock(Block& b, float width) {
             if (b.level <= 2) b.h += 9;  // room for the rule underneath
             before = b.level <= 2 ? 24 : 18, b.after = 10;
             break;
-        case B_Code: b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + 2 * kCodePad, b.after = 14; break;
+        case B_Code:
+            b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + 2 * kCodePad, b.after = 14;
+            for (auto& r : Highlight(b.text.s, LangForName(b.src)))
+                b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, r.len});
+            break;
+        case B_Image:
+            if (!b.sized) b.sized = true, LoadImageBlock(b, 0);  // pixels are decoded when first drawn
+            if (b.imgW > 0) {
+                float k = std::min(1.f, w / b.imgW);
+                b.h = std::round(b.imgH * k);
+            } else {  // missing or undecodable: show the alt text
+                if (b.text.s.empty()) b.text.s = PathFindFileNameW(b.src.c_str());
+                b.text.runs = {{0, (UINT32)b.text.s.size(), RK_Em}};
+                b.h = LayoutText(b.text, g_fmtBody.Get(), w, true);
+            }
+            b.after = 14;
+            break;
         case B_Rule: b.h = 2, before = 10, b.after = 22; break;
         case B_Table: {
             size_t cols = 0;
@@ -274,7 +387,7 @@ void DrawRich(ID2D1RenderTarget* rt, const Text& t, float x, float y, ID2D1Solid
     rt->DrawTextLayout({x, y}, t.layout.Get(), text);
 }
 
-void DrawBlock(ID2D1RenderTarget* rt, const Block& b, float x0, float y, float width, ID2D1SolidColorBrush* text,
+void DrawBlock(ID2D1RenderTarget* rt, Block& b, float x0, float y, float width, ID2D1SolidColorBrush* text,
                ID2D1SolidColorBrush* fill, const MdColors& c) {
     float x = x0 + b.indent * kIndent + b.quote * kQuote, right = x0 + width;
     fill->SetColor(c.rule);
@@ -297,6 +410,15 @@ void DrawBlock(ID2D1RenderTarget* rt, const Block& b, float x0, float y, float w
             rt->DrawTextLayout({x + kCodePad, y + kCodePad}, b.text.layout.Get(), text);
             break;
         case B_Rule: rt->FillRectangle({x, y, right, y + b.h}, fill); break;
+        case B_Image:
+            if (b.imgW > 0 && !b.tried) b.tried = true, LoadImageBlock(b, (UINT)std::lround((right - x) * g_dpi / 96));
+            if (b.bmp) {
+                float k = std::min(1.f, (right - x) / b.imgW);
+                rt->DrawBitmap(b.bmp.Get(), {x, y, x + std::round(b.imgW * k), y + b.h}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            } else if (b.imgW <= 0) {
+                DrawRich(rt, b.text, x, y, text, fill, c);
+            }
+            break;
         case B_Table: {
             fill->SetColor(c.codeBg);
             rt->FillRectangle({x, y, x + b.colX.back(), y + b.rowY[1]}, fill);
@@ -328,8 +450,9 @@ void MdClear() {
     g_laid = 0, g_width = -1;
 }
 
-void MdLoad(const std::wstring& text) {
+void MdLoad(const std::wstring& text, const std::wstring& baseDir) {
     MdClear();
+    g_base = baseDir;
     Parser p;
     MD_PARSER parser{0, MD_FLAG_TABLES | MD_FLAG_STRIKETHROUGH | MD_FLAG_TASKLISTS | MD_FLAG_PERMISSIVEAUTOLINKS,
                      EnterBlock, LeaveBlock, EnterSpan, LeaveSpan, OnText, nullptr, nullptr};
@@ -340,10 +463,15 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
     if (rt != g_brushRt) {  // layouts hold brushes of one render target
         rt->CreateSolidColorBrush(c.link, g_link.ReleaseAndGetAddressOf());
         rt->CreateSolidColorBrush(c.dim, g_dim.ReleaseAndGetAddressOf());
+        for (auto& b : g_role) rt->CreateSolidColorBrush(c.text, b.ReleaseAndGetAddressOf());
         g_brushRt = rt, g_width = -1;
     }
     g_link->SetColor(c.link);
     g_dim->SetColor(c.dim);
+    for (int i = 0; i < R_Count && c.roles; i++)
+        g_role[i]->SetColor({GetRValue(c.roles[i]) / 255.f, GetGValue(c.roles[i]) / 255.f, GetBValue(c.roles[i]) / 255.f, 1});
+    float dpiY;
+    rt->GetDpi(&g_dpi, &dpiY);
     float width = std::min(kMaxWidth, area.right - area.left), viewH = area.bottom - area.top;
     if (width != g_width) g_width = width, g_laid = 0, g_laidH = 0, g_prevAfter = 8;
     while (g_laid < g_blocks.size() && g_laidH < scroll + viewH + 400) LayoutBlock(g_blocks[g_laid++], width);
@@ -353,7 +481,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
     rt->CreateSolidColorBrush(c.rule, &fill);
     float x0 = std::round(area.left + (area.right - area.left - width) / 2);
     for (size_t i = 0; i < g_laid; i++) {
-        const Block& b = g_blocks[i];
+        Block& b = g_blocks[i];
         float y = area.top + b.y - scroll;
         if (y > area.bottom) break;
         if (y + b.h + b.after >= area.top) DrawBlock(rt, b, x0, y, width, text.Get(), fill.Get(), c);
@@ -365,7 +493,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
 std::wstring MdOutline() {
     std::wstring s;
     for (auto& b : g_blocks) {
-        s += L"PHCRT"[b.kind];
+        s += L"PHCRTI"[b.kind];
         if (b.kind == B_Head) s += (wchar_t)(L'0' + b.level);
         s += b.bullet + L":" + b.text.s + (b.quote ? L">" : L"") + L"|";
     }

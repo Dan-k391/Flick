@@ -77,6 +77,7 @@ ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, I
     float dw = doc->width(), dh = doc->height();
     if (dw <= 0 || dh <= 0) dw = dh = 512;  // no size and no viewBox
     w = (UINT)std::lround(dw), h = (UINT)std::lround(dh);
+    if (maxW <= 0) return nullptr;  // size only
     float s = std::min(maxW / dw, maxH / dh);  // vector: scaled to fit, up or down
     int bw = std::max(1, (int)std::lround(dw * s)), bh = std::max(1, (int)std::lround(dh * s));
     lunasvg::Bitmap bmp = doc->renderToBitmap(bw, bh, 0);

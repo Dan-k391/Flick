@@ -34,6 +34,11 @@ struct Lang {
     size_t styleCount;
 };
 const Lang* LangForFile(const std::wstring& path);  // nullptr = plain text
+const Lang* LangForName(std::wstring name);         // "python", "c++", "sh", ... (code fences, notebooks)
+
+// ---- highlight.cpp: Lexilla styling outside Scintilla, as UTF-16 ranges (R_Default left out)
+struct StyleRun { UINT32 start, len; Role role; };
+std::vector<StyleRun> Highlight(const std::wstring& code, const Lang* lang);
 
 // ---- window.cpp: the preview window
 struct Timing { double sel, load, ready, composed; const wchar_t* kind; };
@@ -55,9 +60,12 @@ void PdfOpen(const std::wstring& path, int gen);  // "" closes the document
 void PdfWake();                                   // worker idle and the UI needs a page
 
 // ---- markdown.cpp: parsed into blocks, laid out lazily with DirectWrite
-struct MdColors { D2D1_COLOR_F text, dim, link, codeBg, rule; };
+struct MdColors {
+    D2D1_COLOR_F text, dim, link, codeBg, rule;
+    const COLORREF* roles = nullptr;  // syntax colours per Role (code blocks)
+};
 void MdInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* monoFont);
-void MdLoad(const std::wstring& text);
+void MdLoad(const std::wstring& text, const std::wstring& baseDir = L"");
 void MdClear();
 float MdPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
 std::wstring MdOutline();  // --selftest: one "<kind><level><bullet>:<text>|" per block
@@ -93,6 +101,10 @@ Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float max
 
 // ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...) and installers (msi)
 std::vector<std::wstring> ProgramInfo(const std::wstring& path);
+
+// window.cpp helpers for the views
+Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory
+IWICImagingFactory* WicFactory();
 
 // ---- main.cpp
 std::wstring ExplorerSelection(HWND explorer);  // first selected item's file-system path, or ""
