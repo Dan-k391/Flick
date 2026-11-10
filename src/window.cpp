@@ -109,7 +109,7 @@ double g_shownPos = -1;
 ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
-int g_gridGen;
+std::atomic<int> g_gridGen;
 bool g_gridPending;
 
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
@@ -492,19 +492,21 @@ bool LoadCsv(const std::wstring& path) {
 struct GridJob {
     std::wstring path;
     int gen;
+    bool folder;
 };
 
 DWORD WINAPI GridThread(void* p) {
     std::unique_ptr<GridJob> job(static_cast<GridJob*>(p));
-    GridData* g = GridReadArchive(job->path).release();
+    GridData* g = (job->folder ? GridReadFolder(job->path, g_gridGen, job->gen) : GridReadArchive(job->path, g_gridGen, job->gen)).release();
     if (!SendMessageW(g_hwnd, WM_FLICK_GRID, job->gen, (LPARAM)g)) delete g;  // reply 1: the UI took it
     return 0;
 }
 
-void LoadArchive(const std::wstring& path) {
+// Archive or folder contents as a tree, listed on a worker thread.
+void LoadTree(const std::wstring& path, bool folder) {
     g_gridPending = true;
     g_sub = L"reading…";
-    CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen}, 0, nullptr));
+    CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen, folder}, 0, nullptr));
 }
 
 void ShowInfo();
@@ -768,7 +770,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa);
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
-    if (dir) g_kind = K_Info, LoadInfo(path, fa, t0);
+    if (dir) g_kind = K_Grid, LoadTree(path, true);  // empty or unreadable: info card (ShowInfo)
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
              LoadMarkdown(path)) g_kind = K_Md;
@@ -782,7 +784,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
                           L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "
-                          L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadArchive(path);
+                          L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadTree(path, false);
     else if (HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
                                   L".wdp .dds ") &&
              LoadImage(path)) g_kind = K_Image;

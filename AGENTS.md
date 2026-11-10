@@ -22,7 +22,7 @@ src/markdown.cpp Markdown: md4c -> blocks -> DirectWrite layouts, laid out lazil
 src/convert.cpp  ipynb (small JSON parser), AsciiDoc, rst -> Markdown text
 src/highlight.cpp Lexilla lexing outside Scintilla (minimal IDocument) -> colour roles
 src/pdf.cpp      PDF worker thread: Windows.Data.Pdf (C++/WinRT) -> IPdfRendererNative -> WIC bitmap
-src/grid.cpp     table view: CSV/TSV parser, archive listing via libarchive in Windows' archiveint.dll
+src/grid.cpp     table view: CSV/TSV parser; archive (libarchive in Windows' archiveint.dll) and folder trees
 src/font.cpp     font specimen (private DirectWrite collection, WOFF unpacked by DirectWrite)
 src/svg.cpp      SVG/SVGZ via lunasvg; Windows fonts memory-mapped for <text>
 src/media.cpp    audio/video: Media Foundation media engine (frame server, CPU) + first-frame reader
@@ -78,6 +78,7 @@ In-process medians (`bench.ps1`, add ~2.5 ms for the Explorer lookup), 2026-11-1
 | type | on screen |
 |---|---|
 | CSV 20k rows · zip · tar.gz listing | ~12.5 · ~8 · ~12 ms |
+| folder tree: 50 files · this repo (780) · C:\Windows (first 10k) | ~9 · ~12 · ~53 ms |
 | font (ttf/ttc) · SVG with text · notebook · AsciiDoc/rst | ~8 · ~12 · ~12 · ~8 ms |
 | audio (tags + art async) | ~12 ms |
 | video (1080p H.264, real first frame) | ~100–135 ms (decoder start-up; engine alone 300 ms) |
@@ -133,6 +134,11 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 - **Media engine first frame takes 200–300 ms** even warm (pipeline + audio endpoint); byte-stream
   sources don't help. A source reader decodes one frame in ~75 ms on a worker → shown first. Media
   Foundation keeps ~33 MB after the first video; `MFShutdown` per preview made it worse.
+- **Workers must stop when a newer preview starts** (they get the current generation and their own):
+  stale folder/archive listings piled up to 20 threads and 224 MB in the bench. Folders list
+  breadth-first within 60 ms / 10k items so the result lands inside the 120 ms first-frame wait.
+- Tree sorting: `CompareStringEx(…SORT_DIGITSASNUMBERS)` on string views; `StrCmpLogicalW` needed a
+  copy of both names per comparison.
 - `GetVideoAspectRatio` is the *picture* aspect (16:9), not the pixel aspect: width = height × ax/ay.
 - lunasvg rejects a UTF-8 BOM; strip it. D2D's own SVG renderer can't draw `<text>`, hence lunasvg.
 - Markdown images: read only the size at layout (headers), decode pixels when first drawn — else an

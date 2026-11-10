@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -87,7 +88,9 @@ struct GridData {
 };
 void GridInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* iconFont);
 std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep);  // sep 0: guess
-std::unique_ptr<GridData> GridReadArchive(const std::wstring& path);           // slow: worker thread
+// Worker threads; they stop early once `gen` moves on from `mine` (a newer preview started).
+std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::atomic<int>& gen, int mine);
+std::unique_ptr<GridData> GridReadFolder(const std::wstring& path, const std::atomic<int>& gen, int mine);
 bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();

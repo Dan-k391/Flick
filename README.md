@@ -14,7 +14,7 @@ move the Explorer selection and the preview follows.
 - **Fonts** (ttf, otf, ttc, woff, woff2) as a specimen
 - **Audio and video** (mp4, mkv, mov, webm, avi, wmv, mp3, flac, m4a, wav, ogg, …) with playback
 - **Programs and installers**: version, publisher, architecture
-- **Folders and other files**: thumbnail, type, size, date
+- **Folders** as a file tree (like archives); **other files**: thumbnail, type, size, date
 
 Native C++ (Win32 + Direct2D), no runtime dependencies, ~25 MB RAM idle, no GPU needed, nothing
 fetched from the network.
