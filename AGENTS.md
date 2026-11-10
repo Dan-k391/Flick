@@ -17,11 +17,20 @@ select a file in Explorer, press **Space**, a preview appears; **Space**/**Esc**
 src/main.cpp     entry, single instance, keyboard hook thread, Explorer selection (COM), --bench
 src/window.cpp   preview window: Mica chrome (Direct2D), text (Scintilla), image (WIC), info (shell),
                  PDF page layout, scrolling
-src/markdown.cpp Markdown: md4c -> blocks -> DirectWrite layouts, laid out lazily as far as scrolled
+src/markdown.cpp Markdown: md4c -> blocks -> DirectWrite layouts, laid out lazily as far as scrolled;
+                 images (local/data:), code blocks coloured via highlight.cpp
+src/convert.cpp  ipynb (small JSON parser), AsciiDoc, rst -> Markdown text
+src/highlight.cpp Lexilla lexing outside Scintilla (minimal IDocument) -> colour roles
 src/pdf.cpp      PDF worker thread: Windows.Data.Pdf (C++/WinRT) -> IPdfRendererNative -> WIC bitmap
-src/lang.cpp     extension -> Lexilla lexer, keywords, style->colour-role table
+src/grid.cpp     table view: CSV/TSV parser, archive listing via libarchive in Windows' archiveint.dll
+src/font.cpp     font specimen (private DirectWrite collection, WOFF unpacked by DirectWrite)
+src/svg.cpp      SVG/SVGZ via lunasvg; Windows fonts memory-mapped for <text>
+src/media.cpp    audio/video: Media Foundation media engine (frame server, CPU) + first-frame reader
+src/fileinfo.cpp info-card lines for exe/dll/sys (version, PE header) and msi (summary info)
+src/lang.cpp     extension -> Lexilla lexer, keywords, style->colour-role table; code-fence names
 src/app.h        shared declarations, WM_FLICK_* messages
-third_party/     vendored Scintilla 5.6.9 + Lexilla 5.5.5 (src/include/win32 only), md4c 0.6.0; unmodified
+third_party/     vendored Scintilla 5.6.9 + Lexilla 5.5.5 (src/include/win32 only), md4c 0.6.0,
+                 lunasvg 3.5.0 + plutovg; all unmodified
 scripts/         make-samples.ps1, bench.ps1 (in-process), e2e.ps1 (real Explorer + screenshots)
 .claude/skills/  repeatable workflows: build, speed-test, add-preview-type, add-language
 ```
@@ -45,7 +54,11 @@ scripts/         make-samples.ps1, bench.ps1 (in-process), e2e.ps1 (real Explore
   Markdown (`readme.md` = this file, `features.md`), a 30-page PDF, binary, folder).
 - e2e drives the real keyboard: **don't run it while someone is using the PC** (Space/Esc land in the
   window in front, and the preview hides when another app takes the foreground). To look at a view
-  without Explorer, run `--bench` on the file and capture Flick's own window with `PrintWindow(h, dc, 2)`.
+  without Explorer: `powershell -File scripts\shot.ps1 <file> [-Wheel n]` runs `Flick.exe --show <file>
+  --mute` and saves `build\shots\<name>.png` via `PrintWindow` (no keyboard input, muted).
+- `Flick.exe --show <file>` previews one file in its own process (exits when closed). `--selftest`
+  checks languages, CSV, Markdown, converters and highlighting; failures are named in `bench.log`.
+- Audio/video samples need ffmpeg (`winget install Gyan.FFmpeg`); `--bench` plays them muted.
 
 ### Latest numbers (2026-11-10, e2e median, 150% DPI, 960×680 DIP window)
 | type | Explorer lookup | load | on screen |
@@ -60,8 +73,18 @@ scripts/         make-samples.ps1, bench.ps1 (in-process), e2e.ps1 (real Explore
 | Markdown (this file, 10 KB) | 2.2 ms | 0.9 ms | ~8–11 ms |
 | PDF, simple 30 pages (page 1 included) | 2.3 ms | 0.7 ms | ~19–22 ms |
 | PDF, real-world text page (in-process) | – | 0.8 ms | ~35 ms (engine ~20 ms/page) |
-First press after startup: ~35 ms. Idle: ~20–25 MB private, ~45–55 MB working set; after a session
-of PDFs and big images it sits around ~35–55 MB private.
+
+In-process medians (`bench.ps1`, add ~2.5 ms for the Explorer lookup), 2026-11-10:
+| type | on screen |
+|---|---|
+| CSV 20k rows · zip · tar.gz listing | ~12.5 · ~8 · ~12 ms |
+| font (ttf/ttc) · SVG with text · notebook · AsciiDoc/rst | ~8 · ~12 · ~12 · ~8 ms |
+| audio (tags + art async) | ~12 ms |
+| video (1080p H.264, real first frame) | ~100–135 ms (decoder start-up; engine alone 300 ms) |
+
+First press after startup: ~35 ms. Idle: ~25 MB private, ~45–55 MB working set; after a session
+of PDFs and big images it sits around ~35–55 MB private; after any video ~58 MB (Media Foundation
+keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 
 ## Conventions
 - C++20, MSVC, `/utf-8`. Win32 + COM via `Microsoft::WRL::ComPtr`. No exceptions thrown by our code.
@@ -102,6 +125,19 @@ of PDFs and big images it sits around ~35–55 MB private.
   (the other order sleeps until the following page arrives, +20 ms).
 - Markdown: md4c is built with `MD4C_USE_UTF16` (parses `wchar_t` directly). Laying out every block of
   a long file costs tens of ms, so blocks are laid out lazily down to the bottom of the view.
+- **Windows 11 ships libarchive as `archiveint.dll`** (Explorer's 7z/rar/tar support): standard
+  `archive_*` exports, loaded with `LoadLibraryEx(…SEARCH_SYSTEM32)`; zip/7z/rar/tar.*/cab/iso
+  listing and gunzip for .svgz at zero added size. Undocumented: missing → info card.
+- **Lexilla outside Scintilla** needs only an `IDocument`. `GetCharacterAndWidth` past the end must
+  return width 1 (like Scintilla); width 0 stalls `StyleContext` forever (100% CPU hang).
+- **Media engine first frame takes 200–300 ms** even warm (pipeline + audio endpoint); byte-stream
+  sources don't help. A source reader decodes one frame in ~75 ms on a worker → shown first. Media
+  Foundation keeps ~33 MB after the first video; `MFShutdown` per preview made it worse.
+- `GetVideoAspectRatio` is the *picture* aspect (16:9), not the pixel aspect: width = height × ax/ay.
+- lunasvg rejects a UTF-8 BOM; strip it. D2D's own SVG renderer can't draw `<text>`, hence lunasvg.
+- Markdown images: read only the size at layout (headers), decode pixels when first drawn — else an
+  image below the fold costs the open (8 → 15 ms).
+- PowerShell 5 reads BOM-less scripts in the ANSI code page: write non-ASCII as `[char]0xE3`.
 - Tool quirks: Python on Windows writes CRLF unless `newline='\n'`; backslash escapes in shell heredocs
   get mangled on the way, so use raw strings, `(wchar_t)0x…` or the editor tools.
 - The keyboard hook runs on its own thread so a busy UI thread never lags system-wide typing.
@@ -119,8 +155,11 @@ of PDFs and big images it sits around ~35–55 MB private.
 - PowerShell is DPI-unaware: window sizes it sets/reads are virtualized (×1.5 at 150%).
 
 ## Not done yet / ideas
-- More formats: video/audio, archives, Office (via preview handlers?).
-- Markdown: clickable links, syntax-highlighted code blocks, images, raw HTML, a "show source" toggle.
+- More formats: Office/eml/msg/CAD via preview handlers (out of process, slow), HTML (WebView2,
+  heavy), PSD/RAW without codecs, EPUB, 3D models.
+- Video in a helper process (gives Media Foundation's ~33 MB back); cached shell thumbnail as an
+  instant poster.
+- Markdown: clickable links, remote images (deliberately off: no network), raw HTML, "show source".
 - PDF: zoom, text selection/copy, password prompt.
 - Progressive images (show cached shell thumbnail, decode full image on a worker) for >10 MP photos.
 - Animated GIF, HEIC/AVIF need the Store codecs; multi-selection; "Open with" dropdown

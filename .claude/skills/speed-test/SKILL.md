@@ -15,7 +15,8 @@ Build first (see the `build` skill). Then, via the PowerShell tool from the repo
    Add `-Shots` to save screenshots to `build\shots\<name>.png` and *look at them* after visual changes.
    Add `-Names code.cpp,folder` to restrict samples. The first line of a fresh process is the cold open.
    Don't touch mouse/keyboard while it runs (it drives Explorer with SendKeys), and don't run it while
-   the user is working: the keys go to whatever window is in front.
+   the user is working: the keys go to whatever window is in front. To *look* at a view safely, use
+   `scripts\shot.ps1 <file> [-Wheel n]` (own process, `PrintWindow`, muted) and read the PNG.
 3. Read log lines: `open <kind> explorer A + load B -> ready C ms, on-screen D ms`.
    `ready` = painted, `on-screen` = after `DwmFlush` (composed). `info thumbnail/count ready` lines
    give the async thumbnail time; `pdf page 1 ready` the PDF engine time (included in on-screen).
