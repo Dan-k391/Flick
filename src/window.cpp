@@ -74,7 +74,9 @@ std::string g_codeFont;
 UINT g_dpi = 96;
 bool g_dark, g_placing;
 std::atomic<bool> g_visible;
-SIZE g_sizeDip{960, 680};
+float g_natW, g_natH;   // natural size of a picture/SVG in pixels (sizes the window)
+bool g_decodeForClient;  // re-decoding after a manual resize: fit the current window, not the screen
+void PlaceWindow();
 
 Kind g_kind;
 const Lang* g_lang;
@@ -211,6 +213,22 @@ ComPtr<ID2D1Bitmap> ToD2D(IWICBitmapSource* src) {
     return bmp;
 }
 
+// Pixels available for content: 80% of the screen's work area (QuickLook's image rule) minus the
+// window chrome, or the current content area when re-decoding after the user resized the window.
+void PictureArea(double& w, double& h) {
+    RECT rc;
+    if (g_decodeForClient) {
+        GetClientRect(g_hwnd, &rc);
+        w = rc.right - 2 * kPad * g_dpi / 96, h = rc.bottom - (kTitleH + kPad) * g_dpi / 96;
+    } else {
+        MONITORINFO mi{sizeof mi};
+        GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        rc = mi.rcWork;
+        w = (rc.right - rc.left) * 0.8 - 2 * kPad * g_dpi / 96, h = (rc.bottom - rc.top) * 0.8 - (kTitleH + kPad) * g_dpi / 96;
+    }
+    w = std::max(64.0, w), h = std::max(64.0, h);
+}
+
 bool LoadImage(const std::wstring& path) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
@@ -228,12 +246,11 @@ bool LoadImage(const std::wstring& path) {
         SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &pv)) && pv.vt == VT_UI2 && pv.uiVal <= 8)
         g_orient = pv.uiVal;
     PropVariantClear(&pv);
+    g_natW = (float)(g_orient >= 5 ? h : w), g_natH = (float)(g_orient >= 5 ? w : h);
 
     // Decode no more pixels than the window shows; WM_EXITSIZEMOVE re-decodes after a resize.
-    RECT rc;
-    GetClientRect(g_hwnd, &rc);
-    double maxW = std::max(64.f, rc.right - 2 * kPad * g_dpi / 96);
-    double maxH = std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96);
+    double maxW, maxH;
+    PictureArea(maxW, maxH);
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = std::min({1.0, maxW / w, maxH / h});
     g_imgReduced = s < 1;
@@ -346,14 +363,21 @@ bool LoadText(const std::wstring& path) {
 }
 
 bool LoadSvg(const std::wstring& path) {
-    RECT rc;
-    GetClientRect(g_hwnd, &rc);
-    UINT w, h;
-    auto bmp = SvgRender(path, std::max(64.f, rc.right - 2 * kPad * g_dpi / 96),
-                         std::max(64.f, rc.bottom - (kTitleH + kPad) * g_dpi / 96), g_wic.Get(), w, h);
+    double maxW, maxH;
+    PictureArea(maxW, maxH);
+    UINT w = 0, h = 0;
+    SvgRender(path, 0, 0, g_wic.Get(), w, h);  // intrinsic size first: shown at it, never scaled up
+    if (!g_decodeForClient && w && h) {
+        double k = std::min({1.0, maxW / (w * g_dpi / 96.0), maxH / (h * g_dpi / 96.0)});
+        maxW = w * g_dpi / 96.0 * k, maxH = h * g_dpi / 96.0 * k;
+    }
+    auto bmp = SvgRender(path, (float)maxW, (float)maxH, g_wic.Get(), w, h);
     if (!bmp || !(g_bmp = ToD2D(bmp.Get()))) return false;
     g_orient = 1;
     g_imgReduced = true;  // vector: render again at the new size after a resize
+    UINT bw, bh;
+    bmp->GetSize(&bw, &bh);
+    g_natW = (float)bw, g_natH = (float)bh;  // the rendered size is the size to show
     g_sub = std::to_wstring(w) + L" × " + std::to_wstring(h);
     return true;
 }
@@ -494,6 +518,7 @@ LRESULT OnPdf(PdfMsg& m) {
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
                                 : std::to_wstring(m.pageCount) + (m.pageCount == 1 ? L" page" : L" pages");
+        if (m.page == -1 && !g_pdfFailed) PlaceWindow();  // before page 1 is requested: rendered at the final width
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
     if (m.page >= 0 && (size_t)m.page < g_pages.size() && g_pdfReqThumb) {
@@ -549,6 +574,69 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
         y += h + kPageGap;
     }
     return y + g_scroll[1] - top - kPageGap + kPad / 2;
+}
+
+// QuickLook-style sizing. Each kind asks for a content size; pictures, videos and PDFs ask for their
+// own size, scaled down (never up) to fit 80% (PDF 90%) of the screen. On first show the window is
+// centred on the screen; while open (arrowing through files) it is resized around its centre, or kept
+// against a screen edge it sits near (10% zones). Sizes are not remembered.
+void PlaceWindow() {
+    MONITORINFO mi{sizeof mi};
+    GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+    RECT wa = mi.rcWork, wr, cr;
+    GetWindowRect(g_hwnd, &wr);
+    GetClientRect(g_hwnd, &cr);
+    float px = g_dpi / 96.f, screenW = (wa.right - wa.left) / px, screenH = (wa.bottom - wa.top) / px;
+    float chromeW = 2 * kPad, chromeH = kTitleH + kPad;  // around the content, in DIPs
+    // Content size the kind asks for (DIPs); `ratio` > 0: own size, fitted into that share of the screen.
+    float cw = 800, ch = 600 - chromeH, ratio = 0;
+    switch (g_kind) {
+        case K_Image:
+            if (g_natW > 0) cw = g_natW / px, ch = g_natH / px, ratio = 0.8f;
+            break;
+        case K_Media:
+            if (g_mediaVideo) {
+                MediaState ms = MediaGet();
+                UINT vw = ms.videoW ? ms.videoW : g_posterW, vh = ms.videoW ? ms.videoH : g_posterH;
+                cw = std::max(100.f, (vw ? vw : 1366) / px), ch = std::max(100.f, (vh ? vh : 768) / px), ratio = 0.8f;
+            } else {
+                cw = 560 - chromeW, ch = 560 - chromeH;
+            }
+            break;
+        case K_Pdf:
+            if (!g_pages.empty()) {  // first page at 100% (points -> DIPs), plus the sidebar
+                cw = g_pages[0].first * 96 / 72, ch = g_pages[0].second * 96 / 72, ratio = 0.9f;
+                chromeH = kTitleH + kPad;
+                if (g_pages.size() > 1) chromeW += kSideW;
+            }
+            break;
+        case K_Md: cw = 1000 - chromeW, ch = 600 - chromeH; break;
+        case K_Grid: cw = (GridGet() && GridGet()->folder.empty() ? 1000 : 800) - chromeW,
+                     ch = (GridGet() && GridGet()->folder.empty() ? 700 : 480) - chromeH; break;
+        case K_Font: cw = 900 - chromeW, ch = 650 - chromeH; break;
+        case K_Info: cw = 560 - chromeW, ch = 520 - chromeH; break;
+        default: break;  // text: 800 x 600
+    }
+    if (ratio > 0) {
+        float k = std::min({1.f, (screenW * ratio - chromeW) / cw, (screenH * ratio - chromeH) / ch});
+        cw *= k, ch *= k;
+    }
+    float frameW = (float)((wr.right - wr.left) - cr.right), frameH = (float)((wr.bottom - wr.top) - cr.bottom);
+    int w = (int)std::lround(std::max(400.f, cw + chromeW) * px + frameW);
+    int h = (int)std::lround(std::max(300.f, ch + chromeH) * px + frameH);
+    w = std::min(w, (int)(wa.right - wa.left)), h = std::min(h, (int)(wa.bottom - wa.top));
+    // Anchor: against the left/right (top/bottom) edge if the window sits within 10% of it, else centred.
+    auto place = [](LONG lo, LONG hi, LONG waLo, LONG waHi, int size) {
+        LONG zone = (waHi - waLo) / 10, pos = (lo + hi - size) / 2;
+        if (lo < waLo + zone && hi < waHi - zone) pos = lo;
+        else if (hi > waHi - zone && lo > waLo + zone) pos = hi - size;
+        return std::clamp(pos, waLo, std::max(waLo, waHi - size));
+    };
+    int x = place(wr.left, wr.right, wa.left, wa.right, w), y = place(wr.top, wr.bottom, wa.top, wa.bottom, h);
+    if (x == wr.left && y == wr.top && w == wr.right - wr.left && h == wr.bottom - wr.top) return;
+    g_placing = true;
+    SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    g_placing = false;
 }
 
 bool LoadCsv(const std::wstring& path) {
@@ -744,6 +832,7 @@ void OnMediaEvent(DWORD event) {
         else g_sub = L"can't play this file";
     } else if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
         g_sub = (s.videoW ? std::to_wstring(s.videoW) + L" × " + std::to_wstring(s.videoH) + L" · " : L"") + Clock(s.dur);
+        if (g_mediaVideo) PlaceWindow();
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -772,6 +861,7 @@ void OnPoster(int gen, IWICBitmap* frame) {
     g_posterDone = true;
     if (frame && !g_frame) {  // the engine's own frames win once they flow
         frame->GetSize(&g_posterW, &g_posterH);
+        PlaceWindow();
         g_frame = ToD2D(frame);
         Log(L"video poster ready %.2f ms after key press", MsSince(g_mediaT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -824,6 +914,7 @@ void ClearContent() {
     g_frame.Reset(), g_frameWic.Reset();
     g_mediaVideo = g_seekDrag = false, g_shownPos = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
+    g_natW = g_natH = 0;
     g_gridGen++, g_gridPending = false;
     for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
     g_kind = K_None;
@@ -1165,15 +1256,6 @@ void OpenFile(bool chooseApp) {
     PreviewHide(false);
 }
 
-void SaveSize() {
-    RECT r;
-    GetWindowRect(g_hwnd, &r);
-    SIZE s{MulDiv(r.right - r.left, 96, g_dpi), MulDiv(r.bottom - r.top, 96, g_dpi)};
-    if (s.cx == g_sizeDip.cx && s.cy == g_sizeDip.cy) return;
-    g_sizeDip = s;
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Width", REG_DWORD, &s.cx, sizeof(DWORD));
-    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Height", REG_DWORD, &s.cy, sizeof(DWORD));
-}
 
 // Hide when the user switches to anything other than the source Explorer window or us.
 // Transient shell UI (the Alt+Tab switcher, Start, search, taskbar) is ignored: the user hasn't
@@ -1241,7 +1323,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_EXITSIZEMOVE:
             g_sizing = false;
-            if (g_kind == K_Image && g_imgReduced) LoadContent(g_path, Now());
+            if (g_kind == K_Image && g_imgReduced) {
+                g_decodeForClient = true;
+                LoadContent(g_path, Now());
+                g_decodeForClient = false;
+            }
             InvalidateRect(h, nullptr, FALSE);  // PDF: re-render pages at the final width
             return 0;
         case WM_MOUSEWHEEL:
@@ -1412,12 +1498,6 @@ bool PreviewInit(HINSTANCE inst) {
     MdInit(g_dw.Get(), ui, g_codeFont == "Consolas" ? L"Consolas" : L"Cascadia Mono");
     GridInit(g_dw.Get(), ui, HasFont(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets");
 
-    DWORD v, sz = sizeof v;
-    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Width", RRF_RT_REG_DWORD, nullptr, &v, &sz))
-        g_sizeDip.cx = std::max(320ul, v);
-    if (!RegGetValueW(HKEY_CURRENT_USER, L"Software\\Flick", L"Height", RRF_RT_REG_DWORD, nullptr, &v, &sz))
-        g_sizeDip.cy = std::max(240ul, v);
-
     WNDCLASSEXW wc{sizeof wc};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = inst;
@@ -1427,7 +1507,7 @@ bool PreviewInit(HINSTANCE inst) {
     // Tool window: no taskbar button flashing in and out on every preview.
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FlickPreview", L"Flick",
                              WS_OVERLAPPED | WS_CAPTION | WS_THICKFRAME | WS_CLIPCHILDREN, 0, 0,
-                             g_sizeDip.cx, g_sizeDip.cy, nullptr, nullptr, inst, nullptr);
+                             800, 600, nullptr, nullptr, inst, nullptr);
     if (!g_hwnd) return false;
     g_dpi = GetDpiForWindow(g_hwnd);
     DWM_SYSTEMBACKDROP_TYPE backdrop = DWMSBT_MAINWINDOW;  // Mica
@@ -1517,24 +1597,23 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     LONGLONG start = Now();
     g_source = source;
     if (!g_visible) {
-        // Centre on the source window's monitor at the remembered size.
+        // Centre on the source window's monitor; PlaceWindow sets the size once the content is known.
         HMONITOR mon = MonitorFromWindow(source ? source : GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
         MONITORINFO mi{sizeof mi};
         GetMonitorInfoW(mon, &mi);
-        UINT dx = 96, dy = 96;
-        GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &dx, &dy);
-        RECT wa = mi.rcWork;
-        int w = std::min(MulDiv(g_sizeDip.cx, dx, 96), (int)(wa.right - wa.left));
-        int h = std::min(MulDiv(g_sizeDip.cy, dx, 96), (int)(wa.bottom - wa.top));
-        g_placing = true;
-        SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, w, h,
-                     SWP_NOZORDER | SWP_NOACTIVATE);
+        RECT wa = mi.rcWork, wr;
+        GetWindowRect(g_hwnd, &wr);
+        int w = wr.right - wr.left, h = wr.bottom - wr.top;
+        g_placing = true;  // a move, not a resize: cheap
+        SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, 0, 0,
+                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         g_placing = false;
         g_dpi = GetDpiForWindow(g_hwnd);
     }
     LoadContent(path, t0);
     t.load = MsSince(start);
     WaitForContent();
+    PlaceWindow();
     Layout();
     if (!g_visible)
         // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
@@ -1555,7 +1634,6 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
 void PreviewHide(bool restoreFocus) {
     if (!g_visible) return;
     bool wasForeground = GetForegroundWindow() == g_hwnd;
-    SaveSize();
     Cloak(TRUE);
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;

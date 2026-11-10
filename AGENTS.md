@@ -42,7 +42,10 @@ scripts/         make-samples.ps1, bench.ps1 (in-process), e2e.ps1 (real Explore
 - Run `build\Release\Flick.exe` (stays resident, no window until Space). `Flick.exe --exit` quits it.
   Autostart: put a shortcut in `shell:startup`.
 - Log: `%LOCALAPPDATA%\Flick\flick.log` (one line per open with timings; truncated at 1 MB).
-- Window size is stored in DIPs at `HKCU\Software\Flick` (`Width`, `Height`).
+- Window size follows QuickLook's rules (`PlaceWindow`): each kind asks for a size (text 800×600,
+  Markdown 1000×600, CSV 1000×700, trees 800×480, …); pictures/videos/PDFs ask for their own size,
+  scaled down (never up) into 80% (PDF 90%) of the screen. Centred on first show; while open it resizes
+  around its centre or stays against a screen edge it sits near. Nothing is remembered.
 
 ## Speed test
 - `powershell -File scripts\bench.ps1` — in-process: opens each sample 20× (no Explorer), prints
@@ -139,6 +142,9 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
   breadth-first within 60 ms / 10k items so the result lands inside the 120 ms first-frame wait.
 - Tree sorting: `CompareStringEx(…SORT_DIGITSASNUMBERS)` on string views; `StrCmpLogicalW` needed a
   copy of both names per comparison.
+- **Sizing the window costs one resize**: when shown, the window is only *moved* to the monitor; pictures
+  decode for 80% of that screen (`PictureArea`), then `PlaceWindow` sizes it once (PDF: in `OnPdf`
+  before page 1 is requested). Two resizes per open cost ~4 ms.
 - `GetVideoAspectRatio` is the *picture* aspect (16:9), not the pixel aspect: width = height × ax/ay.
 - lunasvg rejects a UTF-8 BOM; strip it. D2D's own SVG renderer can't draw `<text>`, hence lunasvg.
 - Markdown images: read only the size at layout (headers), decode pixels when first drawn — else an
