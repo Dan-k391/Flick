@@ -18,7 +18,7 @@ move the Explorer selection and the preview follows.
 
 Native C++ (Win32 + Direct2D), no runtime dependencies, ~25 MB RAM idle, no GPU needed, nothing
 fetched from the network.
-Mica, rounded corners, light/dark theme, "Open with" button, remembers window size.
+Mica, rounded corners, light/dark theme, "Open with" button; the window sizes itself to the content, QuickLook-style.
 
 ## Build and run
 
