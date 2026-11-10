@@ -91,6 +91,9 @@ float FontPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const
 Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, IWICImagingFactory*,
                                              UINT& w, UINT& h);
 
+// ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...) and installers (msi)
+std::vector<std::wstring> ProgramInfo(const std::wstring& path);
+
 // ---- main.cpp
 std::wstring ExplorerSelection(HWND explorer);  // first selected item's file-system path, or ""
 LONGLONG Now();

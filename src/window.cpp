@@ -564,6 +564,10 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LON
         g_info.push_back(sz);
     }
     g_info.push_back(L"Modified " + FormatTime(fa.ftLastWriteTime));
+    if (!dir) {  // programs: description, publisher, version, architecture after the type name
+        auto extra = ProgramInfo(path);
+        g_info.insert(g_info.begin() + 1, extra.begin(), extra.end());
+    }
 }
 
 // Releases everything the current preview holds (memory is given back whenever the preview closes).
