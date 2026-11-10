@@ -6,7 +6,7 @@ param([switch]$Shots, [int]$Repeat = 3, [string[]]$Names)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path "$PSScriptRoot\..\build\Release\Flick.exe").Path
 $dir = & "$PSScriptRoot\make-samples.ps1"
-if (-not $Names) { $Names = 'code.cpp', 'big.log', 'photo-1920.jpg', 'photo-12mp.jpg', 'photo-24mp.jpg', 'icon-512.png', 'readme.md', 'doc.pdf', 'data.csv', 'archive.zip', 'archive.tar.gz', 'drawing.svg', 'font.ttf', 'data.bin', 'folder' }
+if (-not $Names) { $Names = 'code.cpp', 'big.log', 'photo-1920.jpg', 'photo-12mp.jpg', 'photo-24mp.jpg', 'icon-512.png', 'readme.md', 'doc.pdf', 'data.csv', 'archive.zip', 'archive.tar.gz', 'drawing.svg', 'font.ttf', 'notebook.ipynb', 'guide.adoc', 'guide.rst', 'data.bin', 'folder' }
 $shotDir = Join-Path $PSScriptRoot '..\build\shots'
 New-Item -ItemType Directory -Force $shotDir | Out-Null
 

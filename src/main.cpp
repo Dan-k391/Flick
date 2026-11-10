@@ -222,6 +222,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     bool bench = argc > 1 && !wcscmp(argv[1], L"--bench");
     bool show = argc > 2 && !wcscmp(argv[1], L"--show");  // `--show file`: preview one file, exit when closed
+    bool selftest = argc > 1 && !wcscmp(argv[1], L"--selftest");
+    wchar_t logPath[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\Flick", logPath, MAX_PATH);
+    CreateDirectoryW(logPath, nullptr);
+    wcscat_s(logPath, bench || show || selftest ?L"\\bench.log" : L"\\flick.log");
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    bool tooBig = GetFileAttributesExW(logPath, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > (1 << 20);
+    g_logFile = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                            tooBig ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);  // keep it < ~1 MB
 
     if (argc > 1 && !wcscmp(argv[1], L"--selftest")) {
         auto lexer = [](const wchar_t* f) { const Lang* l = LangForFile(f); return l ? l->lexer : ""; };
@@ -246,6 +255,41 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             for (auto& r : runs) kw |= r.start == 0 && r.len == 3, comment |= r.role == R_Comment;
             if (!kw || !comment) ok = false, Log(L"selftest: highlight cpp");
             Highlight(L"def f(x):\n    return f\"{x}\"  # c\n", LangForName(L"python"));
+        }
+        {
+            auto has = [&](const std::wstring& s, const std::wstring& part, const wchar_t* what) {
+                if (s.find(part) == std::wstring::npos) ok = false, Log(L"selftest: %s", what);
+            };
+            std::wstring nb = NotebookToMarkdown(LR"({"metadata": {}, "cells": [
+                {"cell_type": "markdown", "source": ["# Nb\n", "text"]},
+                {"cell_type": "code", "source": "x = 1", "outputs": [{"output_type": "stream", "text": ["1\n"]},
+                 {"output_type": "display_data", "data": {"image/png": "iVBO\nRw=="}}]}]})");
+            has(nb, L"# Nb\ntext", L"notebook markdown");
+            has(nb, L"```python\nx = 1\n```", L"notebook code");
+            has(nb, L"```\n1\n```", L"notebook stream");
+            has(nb, L"(data:image/png;base64,iVBORw==)", L"notebook image");
+            std::wstring adoc = AsciiDocToMarkdown(LR"(= Title
+NOTE: hi *b* see https://x.org[site]
+[source,py]
+----
+x
+----
+)");
+            has(adoc, L"# Title", L"adoc heading");
+            has(adoc, L"> **Note:** hi **b** see [site](https://x.org)", L"adoc inline");
+            has(adoc, L"```py\nx\n```", L"adoc code");
+            std::wstring rst = RstToMarkdown(LR"(Title
+=====
+
+Para ``code`` and `link <http://x>`_.
+
+.. code-block:: python
+
+   y = 2
+)");
+            has(rst, L"# Title", L"rst heading");
+            has(rst, L"Para `code` and [link](http://x).", L"rst inline");
+            has(rst, L"```python\ny = 2\n```", L"rst code");
         }
         MdLoad(LR"(# Title
 Para &amp; *x* <b>y</b>
@@ -279,15 +323,6 @@ c
         CreateMutexW(nullptr, FALSE, L"Local\\Flick.SingleInstance");
         if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
     }
-
-    wchar_t logPath[MAX_PATH];
-    ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\Flick", logPath, MAX_PATH);
-    CreateDirectoryW(logPath, nullptr);
-    wcscat_s(logPath, bench || show ?L"\\bench.log" : L"\\flick.log");
-    WIN32_FILE_ATTRIBUTE_DATA fa{};
-    bool tooBig = GetFileAttributesExW(logPath, GetFileExInfoStandard, &fa) && fa.nFileSizeLow > (1 << 20);
-    g_logFile = CreateFileW(logPath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                            tooBig ? CREATE_ALWAYS : OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);  // keep it < ~1 MB
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     LONGLONG t0 = Now();

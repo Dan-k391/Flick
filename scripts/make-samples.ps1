@@ -141,6 +141,74 @@ if (-not (Test-Path "$dir\drawing.svg")) {
     $gz.Write($in, 0, $in.Length); $gz.Dispose(); $out.Dispose()
 }
 Copy-Item "$env:WINDIR\Fonts\segoeui.ttf" "$dir\font.ttf" -Force
+if (-not (Test-Path "$dir\notebook.ipynb")) {
+    $png = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$dir\icon-512.png"))
+    $nb = @{
+        nbformat = 4; nbformat_minor = 5
+        metadata = @{ kernelspec = @{ language = 'python'; name = 'python3' } }
+        cells = @(
+            @{ cell_type = 'markdown'; metadata = @{}; source = @("# Notebook sample`n", "Cells, **outputs** and an image.") },
+            @{ cell_type = 'code'; metadata = @{}; execution_count = 1; source = @("import math`n", "for i in range(3):`n", "    print(i, math.sqrt(i))  # loop")
+               outputs = @(@{ output_type = 'stream'; name = 'stdout'; text = @("0 0.0`n", "1 1.0`n", "2 1.4142135623730951`n") }) },
+            @{ cell_type = 'code'; metadata = @{}; execution_count = 2; source = @('show_image()')
+               outputs = @(@{ output_type = 'display_data'; metadata = @{}; data = @{ 'image/png' = $png; 'text/plain' = @('<Figure>') } }) }
+        )
+    }
+    [IO.File]::WriteAllText("$dir\notebook.ipynb", ($nb | ConvertTo-Json -Depth 10))
+}
+Set-Content -Encoding utf8 "$dir\guide.adoc" @'
+= AsciiDoc sample
+:toc:
+
+== Section
+
+Some *bold* text, _italic_ text and `code`. See https://asciidoc.org[the AsciiDoc site].
+
+* First item
+** Nested item
+. Numbered
+
+NOTE: Admonitions become quotes.
+
+[source,python]
+----
+def hello():
+    return "world"
+----
+
+|===
+| Name | Value
+| alpha | 1
+| beta | 2
+|===
+'@
+Set-Content -Encoding utf8 "$dir\guide.rst" @'
+==================
+reStructuredText
+==================
+
+Section
+=======
+
+Some **bold**, *italic* and ``literal`` text, and a `link <https://docutils.sourceforge.io>`_.
+
+- Item one
+- Item two
+
+.. note:: Directives become quotes.
+
+.. code-block:: python
+
+   import sys
+   print(sys.version)
+
+Subsection
+----------
+
+A literal block::
+
+   plain text, kept as is
+'@
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null
 1..50 | ForEach-Object { Set-Content "$dir\folder\file$_.txt" "hello $_" }
 Write-Output $dir

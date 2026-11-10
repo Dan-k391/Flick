@@ -102,6 +102,11 @@ Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float max
 // ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...) and installers (msi)
 std::vector<std::wstring> ProgramInfo(const std::wstring& path);
 
+// ---- convert.cpp: other formats as Markdown text ("" if not parseable)
+std::wstring NotebookToMarkdown(const std::wstring& json);
+std::wstring AsciiDocToMarkdown(const std::wstring& text);
+std::wstring RstToMarkdown(const std::wstring& text);
+
 // window.cpp helpers for the views
 Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory
 IWICImagingFactory* WicFactory();

@@ -339,12 +339,29 @@ bool HasExt(const std::wstring& path, const wchar_t* list) {
     return !ext.empty() && wcsstr(list, (L" " + ext + L" ").c_str());
 }
 
+// Markdown, and formats shown through it: notebooks (whole file: outputs embed images), AsciiDoc, rst.
 bool LoadMarkdown(const std::wstring& path) {
     std::string buf;
-    bool truncated;
-    if (!ReadText(path, buf, truncated)) return false;
+    bool truncated = false, notebook = HasExt(path, L" .ipynb ");
+    if (notebook) {
+        HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+                               FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (f == INVALID_HANDLE_VALUE) return false;
+        LARGE_INTEGER size{};
+        GetFileSizeEx(f, &size);
+        buf.resize((size_t)std::min<LONGLONG>(size.QuadPart, 64 << 20));
+        DWORD read = 0;
+        ReadFile(f, buf.data(), (DWORD)buf.size(), &read, nullptr);
+        CloseHandle(f);
+        buf.resize(read);
+    } else if (!ReadText(path, buf, truncated)) {
+        return false;
+    }
     std::wstring w(MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), nullptr, 0), L'\0');
     MultiByteToWideChar(CP_UTF8, 0, buf.data(), (int)buf.size(), w.data(), (int)w.size());
+    if (notebook && (w = NotebookToMarkdown(w)).empty()) return false;
+    if (HasExt(path, L" .adoc .asciidoc ")) w = AsciiDocToMarkdown(w);
+    if (HasExt(path, L" .rst .rest ")) w = RstToMarkdown(w);
     std::wstring dir = path.substr(0, path.find_last_of(L'\\'));
     MdLoad(w, dir);
     if (truncated) g_sub = L"first " + std::to_wstring(kMaxText >> 20) + L" MB";
@@ -604,7 +621,8 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
     if (dir) g_kind = K_Info, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
-    else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn ") && LoadMarkdown(path)) g_kind = K_Md;
+    else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
+             LoadMarkdown(path)) g_kind = K_Md;
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
     else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
