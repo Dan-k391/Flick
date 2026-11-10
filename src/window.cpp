@@ -11,6 +11,8 @@
 #include <uxtheme.h>
 #include <shellscalingapi.h>
 #include <propvarutil.h>
+#include <propkey.h>
+#include <mfmediaengine.h>
 #include <windowsx.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -32,7 +34,7 @@ namespace {
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
-enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font };
+enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font, K_Media };
 enum Hot { H_None, H_Open, H_Close };
 
 struct Palette {
@@ -91,6 +93,20 @@ constexpr float kBarHit = 14;  // thickness of a scrollbar's mouse area along th
 int g_dragAxis = -1;           // scrollbar being dragged
 float g_dragGrab;              // mouse offset within the dragged thumb
 int g_barHot = -1;             // scrollbar under the mouse
+
+// Audio/video: the frame shown, the control bar's hit areas.
+constexpr wchar_t kVideoExt[] = L" .mp4 .m4v .mov .mkv .avi .wmv .webm .mpg .mpeg .m2ts .mts .ts .3gp .3g2 .asf ";
+constexpr wchar_t kAudioExt[] = L" .mp3 .m4a .m4b .aac .wav .flac .wma .ogg .oga .opus .aiff .aif .amr .ac3 .ec3 .mka .weba ";
+bool g_mediaVideo, g_mouseIn, g_seekDrag;
+LONGLONG g_mediaT0;
+int g_posterGen;
+bool g_posterDone;      // the poster worker answered (with or without a frame)
+UINT g_posterW, g_posterH;  // size of the poster frame, until the engine knows the video size
+ComPtr<IWICBitmap> g_frameWic;
+ComPtr<ID2D1Bitmap> g_frame;
+D2D1_RECT_F g_playRc, g_trackRc;
+double g_shownPos = -1;
+ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
 int g_gridGen;
@@ -420,7 +436,9 @@ LRESULT OnPdf(PdfMsg& m) {
     return next;
 }
 
+bool TryFrame();
 bool Pending() {
+    if (g_kind == K_Media && g_mediaVideo && !g_frame && !g_posterDone && !MediaGet().error && !TryFrame()) return true;
     return (g_kind == K_Pdf && !g_pdfFailed && (g_pageW.empty() || !g_pageW[0])) || (g_kind == K_Grid && g_gridPending);
 }
 
@@ -518,6 +536,8 @@ struct InfoJob {
     LONGLONG t0;
     HBITMAP bmp = nullptr;
     int items = -1;  // folders only
+    bool tags = false;
+    std::vector<std::wstring> lines;  // audio: title/artist/album
 };
 std::atomic<int> g_infoGen;
 
@@ -528,6 +548,23 @@ DWORD WINAPI InfoThread(void* p) {
         ComPtr<IShellItemImageFactory> factory;
         if (SUCCEEDED(SHCreateItemFromParsingName(job->path.c_str(), nullptr, IID_PPV_ARGS(&factory))))
             factory->GetImage({job->px, job->px}, SIIGBF_RESIZETOFIT, &job->bmp);
+        ComPtr<IPropertyStore> props;
+        if (job->tags && SUCCEEDED(SHGetPropertyStoreFromParsingName(job->path.c_str(), nullptr, GPS_DEFAULT, IID_PPV_ARGS(&props)))) {
+            auto get = [&](const PROPERTYKEY& key) {
+                PROPVARIANT pv;
+                PropVariantInit(&pv);
+                PWSTR str = nullptr;
+                std::wstring out;
+                if (SUCCEEDED(props->GetValue(key, &pv)) && pv.vt != VT_EMPTY && SUCCEEDED(PropVariantToStringAlloc(pv, &str)))
+                    out = str, CoTaskMemFree(str);
+                PropVariantClear(&pv);
+                return out;
+            };
+            std::wstring title = get(PKEY_Title), artist = get(PKEY_Music_Artist), album = get(PKEY_Music_AlbumTitle);
+            if (!title.empty()) job->lines.push_back(title + (artist.empty() ? L"" : L" — " + artist));
+            else if (!artist.empty()) job->lines.push_back(artist);
+            if (!album.empty()) job->lines.push_back(album);
+        }
     }
     CoUninitialize();
     if (job->items >= 0) {
@@ -549,7 +586,8 @@ DWORD WINAPI InfoThread(void* p) {
 }
 
 void OnInfo(InfoJob* job) {
-    if (job->gen == g_infoGen && g_kind == K_Info && g_visible) {
+    if (job->gen == g_infoGen && (g_kind == K_Info || g_kind == K_Media) && g_visible) {
+        g_info.insert(g_info.begin(), job->lines.begin(), job->lines.end());
         if (job->bmp) {
             ComPtr<IWICBitmap> wb;
             if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(job->bmp, nullptr, WICBitmapUsePremultipliedAlpha, &wb)))
@@ -569,6 +607,7 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LON
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
     auto* job = new InfoJob{path, (int)(kThumb * g_dpi / 96), ++g_infoGen, t0};
     job->items = dir ? 0 : -1;
+    job->tags = HasExt(path, kAudioExt);
     CloseHandle(CreateThread(nullptr, 0, InfoThread, job, 0, nullptr));
     SHFILEINFOW sfi{};
     SHGetFileInfoW(path.c_str(), 0, &sfi, sizeof sfi, SHGFI_TYPENAME);
@@ -588,6 +627,112 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LON
     }
 }
 
+std::wstring Clock(double t) {
+    int s = (int)std::max(0.0, t), h = s / 3600, m = s / 60 % 60;
+    wchar_t buf[32];
+    if (h) swprintf_s(buf, L"%d:%02d:%02d", h, m, s % 60);
+    else swprintf_s(buf, L"%d:%02d", m, s % 60);
+    return buf;
+}
+
+// Where the video goes: fitted (up or down) into the content area. Before the engine knows the
+// video size, the poster frame's size is used.
+D2D1_RECT_F VideoRect(const MediaState& s) {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float vw = (float)(s.videoW ? s.videoW : g_posterW), vh = (float)(s.videoW ? s.videoH : g_posterH);
+    float aw = Dip(rc.right) - 2 * kPad, ah = Dip(rc.bottom) - kTitleH - kPad;
+    float k = std::min(aw / vw, ah / vh), w = std::round(vw * k), h = std::round(vh * k);
+    float x = std::round(kPad + (aw - w) / 2), y = std::round(kTitleH + (ah - h) / 2);
+    return {x, y, x + w, y + h};
+}
+
+// Pulls the next video frame if one is due, at the pixel size it is shown.
+bool TryFrame() {
+    MediaState s = MediaGet();
+    if (!s.videoW) return false;
+    D2D1_RECT_F r = VideoRect(s);
+    UINT w = (UINT)std::lround((r.right - r.left) * g_dpi / 96), h = (UINT)std::lround((r.bottom - r.top) * g_dpi / 96);
+    if (!MediaFrame(w, h, g_wic.Get(), g_frameWic)) return false;
+    g_frame = ToD2D(g_frameWic.Get());
+    return true;
+}
+
+void OnMediaEvent(DWORD event) {
+    if (g_kind != K_Media) return;
+    MediaOnEvent(event);
+    MediaState s = MediaGet();
+    if (s.error) {
+        if (g_mediaVideo) ShowInfo();
+        else g_sub = L"can't play this file";
+    } else if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
+        g_sub = (s.videoW ? std::to_wstring(s.videoW) + L" × " + std::to_wstring(s.videoH) + L" · " : L"") + Clock(s.dur);
+    }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+struct PosterJob {
+    std::wstring path;
+    int gen;
+};
+
+DWORD WINAPI PosterThread(void* p) {
+    std::unique_ptr<PosterJob> job(static_cast<PosterJob*>(p));
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    {
+        ComPtr<IWICImagingFactory> wic;
+        ComPtr<IWICBitmap> frame;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
+            frame = MediaFirstFrame(job->path, wic.Get());
+        SendMessageW(g_hwnd, WM_FLICK_POSTER, job->gen, (LPARAM)frame.Get());
+    }
+    CoUninitialize();
+    return 0;
+}
+
+void OnPoster(int gen, IWICBitmap* frame) {
+    if (gen != g_posterGen || g_kind != K_Media) return;
+    g_posterDone = true;
+    if (frame && !g_frame) {  // the engine's own frames win once they flow
+        frame->GetSize(&g_posterW, &g_posterH);
+        g_frame = ToD2D(frame);
+        Log(L"video poster ready %.2f ms after key press", MsSince(g_mediaT0));
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+}
+
+void SeekAt(float x) {
+    MediaState s = MediaGet();
+    if (s.dur > 0 && g_trackRc.right > g_trackRc.left)
+        MediaSeek(std::clamp((x - g_trackRc.left) / (g_trackRc.right - g_trackRc.left), 0.f, 1.f) * s.dur);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Control bar: play/pause, time, seek track. Always shown for audio; for video while the mouse is over
+// the window or playback is paused.
+void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* fill) {
+    MediaState s = MediaGet();
+    g_playRc = g_trackRc = {};
+    if (g_mediaVideo && !g_mouseIn && !s.paused && !s.ended && !g_seekDrag) return;
+    const Palette& p = Pal();
+    float h = 44, y = sz.height - kPad - h, x0 = kPad + 8, x1 = sz.width - kPad - 8;
+    fill->SetColor(g_dark ? C(0x2B2B2B, 0.94f) : C(0xF3F3F3, 0.94f));
+    g_rt->FillRoundedRectangle({{x0, y, x1, y + h}, h / 2, h / 2}, fill);
+    g_playRc = {x0 + 6, y + 4, x0 + 42, y + 40};
+    const wchar_t glyph = s.paused || s.ended ? 0xE768 : 0xE769;  // Segoe Fluent Icons: Play, Pause
+    g_rt->DrawText(&glyph, 1, g_fmtGlyph.Get(), g_playRc, text);
+    std::wstring time = Clock(s.pos) + L" / " + Clock(s.dur);
+    g_rt->DrawText(time.c_str(), (UINT32)time.size(), g_fmtTitle.Get(), {x0 + 48, y, x0 + 160, y + h}, text);
+    g_trackRc = {x0 + 168, y, x1 - 20, y + h};
+    float cy = y + h / 2, frac = s.dur > 0 ? (float)std::clamp(s.pos / s.dur, 0.0, 1.0) : 0.f;
+    float kx = g_trackRc.left + (g_trackRc.right - g_trackRc.left) * frac;
+    fill->SetColor(p.btnBorder);
+    g_rt->FillRoundedRectangle({{g_trackRc.left, cy - 2, g_trackRc.right, cy + 2}, 2, 2}, fill);
+    fill->SetColor(p.link);
+    g_rt->FillRoundedRectangle({{g_trackRc.left, cy - 2, kx, cy + 2}, 2, 2}, fill);
+    g_rt->FillEllipse({{kx, cy}, 7, 7}, fill);
+}
+
 // Releases everything the current preview holds (memory is given back whenever the preview closes).
 void ClearContent() {
     g_bmp.Reset();
@@ -597,6 +742,10 @@ void ClearContent() {
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear();
     GridSet(nullptr);
     FontClear();
+    MediaClose();
+    g_frame.Reset(), g_frameWic.Reset();
+    g_mediaVideo = g_seekDrag = false, g_shownPos = -1;
+    g_posterGen++, g_posterW = g_posterH = 0;
     g_gridGen++, g_gridPending = false;
     g_scroll[0] = g_scroll[1] = g_doc[0] = g_doc[1] = 0;
     g_kind = K_None;
@@ -623,6 +772,11 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
              LoadMarkdown(path)) g_kind = K_Md;
+    else if (HasExt(path, kVideoExt) && MediaOpen(path)) {
+        g_kind = K_Media, g_mediaVideo = true, g_mediaT0 = t0, g_posterDone = false;
+        CloseHandle(CreateThread(nullptr, 0, PosterThread, new PosterJob{path, ++g_posterGen}, 0, nullptr));
+    }
+    else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
     else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
@@ -754,6 +908,12 @@ void Paint() {
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
     if (g_kind == K_Image && g_bmp) DrawImage(area);
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
+    if (g_kind == K_Media) {
+        MediaState ms = MediaGet();
+        if (!g_mediaVideo) DrawInfo({area.left, area.top, area.right, area.bottom - 52}, text.Get(), sub.Get());
+        else if (g_frame && (ms.videoW || g_posterW)) g_rt->DrawBitmap(g_frame.Get(), VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        DrawControls(sz, text.Get(), fill.Get());
+    }
     if (Scrollable()) {
         D2D1_RECT_F doc{kPad, kTitleH, sz.width - kPad, sz.height};
         MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role};
@@ -939,6 +1099,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_MOUSEMOVE: {
             if (g_dragAxis >= 0) return DragThumb(l), 0;
+            if (g_seekDrag) return SeekAt(Dip(GET_X_LPARAM(l))), 0;
+            if (!g_mouseIn && g_kind == K_Media) g_mouseIn = true, InvalidateRect(h, nullptr, FALSE);
             Hot hot = HitButton(l);
             if (hot != g_hot) g_hot = hot, InvalidateRect(h, nullptr, FALSE);
             if (int bar = OnBar(l); bar != g_barHot) g_barHot = bar, InvalidateRect(h, nullptr, FALSE);
@@ -947,10 +1109,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         }
         case WM_MOUSELEAVE:
-            g_hot = H_None, g_barHot = -1;
+            g_hot = H_None, g_barHot = -1, g_mouseIn = false;
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN:
+            if (g_kind == K_Media) {
+                D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
+                auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
+                if (in(g_trackRc)) g_seekDrag = true, SetCapture(h), SeekAt(pt.x);
+                else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
             if (int a = OnBar(l); a >= 0) {
                 float at, len, mouse = a ? Dip(GET_Y_LPARAM(l)) : Dip(GET_X_LPARAM(l));
                 Thumb(a, at, len);
@@ -961,10 +1130,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_CAPTURECHANGED:
+            g_seekDrag = false;
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
-            if (g_dragAxis >= 0) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            if (g_dragAxis >= 0 || g_seekDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
             else if (HitButton(l) == H_Close) PreviewHide(true);
             else if (HitButton(l) == H_Open) OpenFile(false);
             return 0;
@@ -993,6 +1163,21 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_PDF:
             return OnPdf(*reinterpret_cast<PdfMsg*>(l));
+        case WM_FLICK_MEDIA:
+            OnMediaEvent((DWORD)w);
+            return 0;
+        case WM_FLICK_FRAME: {
+            MediaFrameHandled();
+            if (g_kind != K_Media || !g_visible) return 0;
+            bool repaint = g_mediaVideo && TryFrame();
+            double shown = std::floor(MediaGet().pos * 4);  // progress/time: 4 updates a second
+            if (shown != g_shownPos) g_shownPos = shown, repaint = true;
+            if (repaint) InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        case WM_FLICK_POSTER:
+            OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
+            return 0;
         case WM_FLICK_GRID:
             return OnGrid((int)w, reinterpret_cast<GridData*>(l));
         case WM_FLICK_INFO:
@@ -1048,6 +1233,8 @@ bool PreviewInit(HINSTANCE inst) {
     g_fmtTitle = Format(ui, 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
     g_fmtIcon = Format(HasFont(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets", 10,
                        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+    g_fmtGlyph = Format(HasFont(L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets", 16,
+                        DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fmtName = Format(ui, 20, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_fmtInfo = Format(ui, 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     g_codeFont = HasFont(L"Cascadia Mono") ? "Cascadia Mono" : "Consolas";
@@ -1188,7 +1375,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
-             : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : L"info";
+             : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
     return t;
@@ -1213,6 +1400,8 @@ bool PreviewKey(const MSG& m) {
     if (m.message != WM_KEYDOWN || !g_visible) return false;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
+    else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_LEFT || m.wParam == VK_RIGHT))
+        MediaSeek(MediaGet().pos + (m.wParam == VK_LEFT ? -5 : 5));
     else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
         float page = View(1) * 0.9f;
         switch (m.wParam) {

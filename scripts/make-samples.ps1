@@ -209,6 +209,13 @@ A literal block::
 
    plain text, kept as is
 '@
+# Audio/video samples need ffmpeg (winget install Gyan.FFmpeg); skipped without it.
+if ((Get-Command ffmpeg -ErrorAction SilentlyContinue) -and -not (Test-Path "$dir\video.mp4")) {
+    ffmpeg -v error -y -f lavfi -i testsrc2=size=1920x1080:rate=30 -f lavfi -i sine=frequency=440 -t 10 `
+        -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest "$dir\video.mp4"
+    ffmpeg -v error -y -f lavfi -i sine=frequency=330 -t 20 -metadata title='Sample Tone' -metadata artist='Flick' `
+        -metadata album='Test Sounds' -c:a libmp3lame -b:a 128k "$dir\audio.mp3"
+}
 New-Item -ItemType Directory -Force "$dir\folder" | Out-Null
 1..50 | ForEach-Object { Set-Content "$dir\folder\file$_.txt" "hello $_" }
 Write-Output $dir

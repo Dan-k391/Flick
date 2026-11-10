@@ -131,7 +131,7 @@ int Bench(int argc, wchar_t** argv) {
             composed.push_back(t.composed);
             Pump();
             // PDF pages arrive from the worker: give it time so "page 1 ready" gets logged.
-            for (LONGLONG s = Now(); !wcscmp(t.kind, L"pdf") && MsSince(s) < 300;)
+            for (LONGLONG s = Now(); (!wcscmp(t.kind, L"pdf") || !wcscmp(t.kind, L"video")) && MsSince(s) < 600;)
                 MsgWaitForMultipleObjects(0, nullptr, FALSE, 5, QS_ALLINPUT), Pump();
             PreviewHide(false);
             Pump();
@@ -330,6 +330,7 @@ c
     ExplorerSelection(GetShellWindow());  // warm up the Explorer COM proxies (desktop path)
     Log(L"started in %.1f ms (init + warm-up)", MsSince(t0));
     PrintMemory(L"idle");
+    MediaMute(bench || (show && argc > 3 && !wcscmp(argv[3], L"--mute")));
     if (bench) return Bench(argc, argv);
     if (show) {
         wchar_t full[MAX_PATH];

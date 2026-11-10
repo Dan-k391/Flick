@@ -27,7 +27,7 @@ public static class Shot {
 }
 '@
 [void][Shot]::SetProcessDPIAware()
-$p = Start-Process $exe -ArgumentList '--show', "`"$((Resolve-Path $File).Path)`"" -PassThru
+$p = Start-Process $exe -ArgumentList '--show', "`"$((Resolve-Path $File).Path)`"", '--mute' -PassThru
 Start-Sleep -Milliseconds $Wait
 $h = [Shot]::Find([uint32]$p.Id)
 if ($h -eq [IntPtr]::Zero) { throw 'no Flick window' }

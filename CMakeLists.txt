@@ -32,7 +32,7 @@ target_include_directories(lunasvg PUBLIC third_party/lunasvg/include)
 target_compile_definitions(lunasvg PUBLIC LUNASVG_BUILD_STATIC PRIVATE LUNASVG_BUILD LUNASVG_DISABLE_LOAD_SYSTEM_FONTS)
 target_link_libraries(lunasvg PRIVATE plutovg)
 
-add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/font.cpp src/svg.cpp src/fileinfo.cpp src/highlight.cpp src/convert.cpp src/flick.manifest)
+add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/font.cpp src/svg.cpp src/fileinfo.cpp src/highlight.cpp src/convert.cpp src/media.cpp src/flick.manifest)
 target_compile_definitions(Flick PRIVATE UNICODE _UNICODE NOMINMAX)
-target_link_libraries(Flick PRIVATE lexilla scintilla md4c lunasvg windowsapp windows.data.pdf d3d11 version msi crypt32
+target_link_libraries(Flick PRIVATE lexilla scintilla md4c lunasvg windowsapp windows.data.pdf d3d11 version msi crypt32 mfplat mfuuid mfreadwrite propsys
   d2d1 dwrite windowscodecs dwmapi shlwapi uxtheme shcore imm32 msimg32 ole32 oleaut32 uuid psapi)

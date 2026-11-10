@@ -18,6 +18,9 @@ enum : UINT {
     WM_FLICK_INFO,                 // worker thread finished a thumbnail (lParam = InfoJob*)
     WM_FLICK_PDF,                  // sent by the PDF worker (lParam = PdfMsg*); reply = next page
     WM_FLICK_GRID,                 // sent by the archive worker (wParam = gen, lParam = GridData*)
+    WM_FLICK_MEDIA,                // media engine event (wParam = MF_MEDIA_ENGINE_EVENT)
+    WM_FLICK_FRAME,                // display refreshed while playing: pull a video frame
+    WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -106,6 +109,23 @@ std::vector<std::wstring> ProgramInfo(const std::wstring& path);
 std::wstring NotebookToMarkdown(const std::wstring& json);
 std::wstring AsciiDocToMarkdown(const std::wstring& text);
 std::wstring RstToMarkdown(const std::wstring& text);
+
+// ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
+struct MediaState {
+    bool ready, paused, ended, error;
+    double pos, dur;      // seconds
+    UINT videoW, videoH;  // display size of the video (aspect-corrected); 0 for audio
+};
+bool MediaOpen(const std::wstring& path);  // starts playing; false if Media Foundation is unavailable
+void MediaClose();
+MediaState MediaGet();
+bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWICBitmap>& out);
+void MediaFrameHandled();
+void MediaOnEvent(DWORD event);
+void MediaToggle();
+void MediaSeek(double seconds);
+void MediaMute(bool muted);  // for tests
+Microsoft::WRL::ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory*);
 
 // window.cpp helpers for the views
 Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory
