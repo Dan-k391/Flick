@@ -1281,6 +1281,8 @@ void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWOR
 
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
+        case WM_NCACTIVATE:  // always "active": Mica keeps its tinted look instead of going flat grey
+            return DefWindowProcW(h, m, TRUE, l);
         case WM_NCCALCSIZE:
             if (w) {  // drop the system caption, keep the side/bottom resize borders
                 auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(l);
@@ -1624,6 +1626,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
         // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
         SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+    if (!g_visible) DefWindowProcW(g_hwnd, WM_NCACTIVATE, TRUE, 0);  // shown without focus: active look anyway
     if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
     g_visible = true;
     t.ready = MsSince(t0);
