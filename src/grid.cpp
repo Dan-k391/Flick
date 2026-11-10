@@ -11,13 +11,28 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-constexpr float kRowH = 28, kCellPad = 10, kIndent = 18, kIconW = 22, kMinCol = 56, kMaxCol = 420;
+constexpr float kRowH = 28, kCellPad = 10, kIndent = 18, kIconW = 22, kChevronW = 16, kMinCol = 56, kMaxCol = 420;
 
 IDWriteFactory* g_dw;
-ComPtr<IDWriteTextFormat> g_fmtCell, g_fmtCellR, g_fmtHead, g_fmtHeadR, g_fmtIcon;
+ComPtr<IDWriteTextFormat> g_fmtCell, g_fmtCellR, g_fmtHead, g_fmtHeadR, g_fmtIcon, g_fmtChevron;
 float g_charW = 7;  // average character width of the cell font, for column sizing
 std::unique_ptr<GridData> g_grid;
 std::vector<float> g_colX;  // column edges
+std::vector<bool> g_open;   // trees: per body row, folder expanded (all collapsed at first)
+std::vector<UINT32> g_shown;  // body rows currently visible (children of collapsed folders hidden)
+
+bool HasChildren(const GridData& g, size_t i) { return i + 1 < g.indent.size() && g.indent[i + 1] > g.indent[i]; }
+
+void Rebuild() {
+    const GridData& g = *g_grid;
+    size_t body = g.Rows() - (g.header ? 1 : 0);
+    g_shown.clear();
+    for (size_t i = 0; i < body; i++) {
+        g_shown.push_back((UINT32)i);
+        if (!g.folder.empty() && g.folder[i] && !g_open[i])  // skip the collapsed subtree
+            for (UINT8 depth = g.indent[i]; i + 1 < body && g.indent[i + 1] > depth;) i++;
+    }
+}
 
 ComPtr<IDWriteTextFormat> CellFormat(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight,
                                      DWRITE_TEXT_ALIGNMENT align) {
@@ -157,6 +172,7 @@ void GridInit(IDWriteFactory* dw, const wchar_t* uiFont, const wchar_t* iconFont
     g_fmtHead = CellFormat(uiFont, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
     g_fmtHeadR = CellFormat(uiFont, 13, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING);
     g_fmtIcon = CellFormat(iconFont, 13, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
+    g_fmtChevron = CellFormat(iconFont, 9, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
     const wchar_t sample[] = L"abcdefghijklmnopqrstuvwxyz ABCDEFGHIJKLM 0123456789";
     ComPtr<IDWriteTextLayout> l;
     DWRITE_TEXT_METRICS m{};
@@ -357,10 +373,15 @@ void GridSet(std::unique_ptr<GridData> g) {
     g_grid = std::move(g);
     g_colX.clear();
     if (!g_grid) return;
+    g_open.assign(g_grid->folder.size(), false);
+    // A single top-level folder (typical for archives) starts expanded: nothing to see otherwise.
+    if (!g_open.empty() && g_grid->folder[0] && std::count(g_grid->indent.begin(), g_grid->indent.end(), 0) == 1)
+        g_open[0] = true;
+    Rebuild();
     std::vector<size_t> chars(g_grid->cols, 0);
     for (size_t r = 0, n = std::min<size_t>(g_grid->Rows(), 1000); r < n; r++)
         for (size_t c = 0; c < g_grid->cols; c++) chars[c] = std::max(chars[c], Cell(*g_grid, r, c).size());
-    float extra0 = g_grid->folder.empty() ? 0 : kIconW + kIndent * 3;  // tree indent + icon
+    float extra0 = g_grid->folder.empty() ? 0 : kChevronW + kIconW + kIndent * 3;  // tree indent + chevron + icon
     g_colX.push_back(0);
     for (size_t c = 0; c < g_grid->cols; c++)
         g_colX.push_back(g_colX.back() + std::clamp(std::ceil(chars[c] * g_charW * 1.1f) + 2 * kCellPad + (c ? 0 : extra0),
@@ -368,13 +389,28 @@ void GridSet(std::unique_ptr<GridData> g) {
 }
 
 const GridData* GridGet() { return g_grid.get(); }
+size_t GridShownRows() { return g_shown.size(); }
+
+// A click in the table: expands/collapses the folder row under it. True if the view changed.
+bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt) {
+    if (!g_grid || g_grid->folder.empty()) return false;
+    float top = area.top + (g_grid->header ? kRowH : 0);
+    if (pt.y < top || pt.y >= area.bottom) return false;
+    size_t k = (size_t)((pt.y - top + scrollY) / kRowH);
+    if (k >= g_shown.size()) return false;
+    size_t i = g_shown[k];
+    if (!g_grid->folder[i] || !HasChildren(*g_grid, i)) return false;
+    g_open[i] = !g_open[i];
+    Rebuild();
+    return true;
+}
 
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors& c) {
     const GridData& g = *g_grid;
     ComPtr<ID2D1SolidColorBrush> text, fill;
     rt->CreateSolidColorBrush(c.text, &text);
     rt->CreateSolidColorBrush(c.codeBg, &fill);
-    size_t body = g.Rows() - (g.header ? 1 : 0);
+    size_t body = g_shown.size();
     float top = area.top + (g.header ? kRowH : 0);
     // Stretch the last column to the edge when the table is narrower than the view.
     float lastW = std::max(g_colX.back(), area.right - area.left) - g_colX[g.cols - 1];
@@ -386,9 +422,15 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
             if (x1 < area.left || x0 > area.right) continue;
             std::wstring_view v = Cell(g, r, col);
             float left = x0 + kCellPad;
-            if (col == 0 && !g.folder.empty() && !head) {  // archive tree: indent + folder/file icon
+            if (col == 0 && !g.folder.empty() && !head) {  // tree: indent + chevron + folder/file icon
                 size_t i = r - 1;
                 left += g.indent[i] * kIndent;
+                if (g.folder[i] && HasChildren(g, i)) {
+                    wchar_t chevron = g_open[i] ? 0xE70D : 0xE76C;  // ChevronDown, ChevronRight
+                    text->SetColor(c.dim);
+                    rt->DrawText(&chevron, 1, g_fmtChevron.Get(), {left, y, left + kChevronW, y + kRowH}, text.Get());
+                }
+                left += kChevronW;
                 wchar_t icon = g.folder[i] ? 0xE8B7 : 0xE8A5;  // Segoe Fluent Icons: Folder, Page
                 text->SetColor(g.folder[i] ? c.link : c.dim);
                 rt->DrawText(&icon, 1, g_fmtIcon.Get(), {left, y, left + kIconW, y + kRowH}, text.Get());
@@ -407,7 +449,7 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
         float y = top + i * kRowH - scrollY;
         if (y > area.bottom) break;
         if (i % 2) rt->FillRectangle({area.left - scrollX, y, area.left - scrollX + total, y + kRowH}, fill.Get());
-        drawRow(i + (g.header ? 1 : 0), y, false);
+        drawRow(g_shown[i] + (g.header ? 1 : 0), y, false);
     }
     rt->PopAxisAlignedClip();
     if (g.header) {  // sticky header

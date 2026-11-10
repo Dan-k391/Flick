@@ -94,6 +94,8 @@ std::unique_ptr<GridData> GridReadFolder(const std::wstring& path, const std::at
 bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
+bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt);  // toggles a folder row
+size_t GridShownRows();  // body rows visible (--selftest)
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
 // ---- font.cpp: font specimen (ttf, otf, ttc, woff, woff2)

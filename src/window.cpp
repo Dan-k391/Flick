@@ -926,6 +926,9 @@ void Paint() {
         if (g_kind == K_Grid && GridGet()) {
             D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
             g_doc[0] = size.width, g_doc[1] = size.height;
+            // A folder was collapsed below the end: pull the view back up (repaints once more).
+            if (float max = std::max(0.f, g_doc[1] - (sz.height - kTitleH)); g_scroll[1] > max)
+                g_scroll[1] = max, InvalidateRect(g_hwnd, nullptr, FALSE);
         }
         g_rt->PopAxisAlignedClip();
         fill->SetColor(p.sub);
@@ -1120,6 +1123,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
                 if (in(g_trackRc)) g_seekDrag = true, SetCapture(h), SeekAt(pt.x);
                 else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
+            if (g_kind == K_Grid && OnBar(l) < 0) {  // trees: click a folder to expand/collapse it
+                RECT rc;
+                GetClientRect(h, &rc);
+                if (GridClick({kPad, kTitleH, Dip(rc.right) - kPad, Dip(rc.bottom)}, g_scroll[1],
+                              {Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))}))
+                    InvalidateRect(h, nullptr, FALSE);  // Paint re-measures; ScrollTo clamps on the next scroll
                 return 0;
             }
             if (int a = OnBar(l); a >= 0) {

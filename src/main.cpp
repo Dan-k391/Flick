@@ -291,6 +291,19 @@ Para ``code`` and `link <http://x>`_.
             has(rst, L"Para `code` and [link](http://x).", L"rst inline");
             has(rst, L"```python\ny = 2\n```", L"rst code");
         }
+        {  // tree: a(dir){ b(dir){ c }, d }, e  -> collapsed shows a, e; expanding a shows a, b, d, e
+            auto g = std::make_unique<GridData>();
+            g->cols = 1, g->header = true;
+            for (const wchar_t* n : {L"Name", L"a", L"b", L"c", L"d", L"e"}) g->cells.push_back({0, 0}), (void)n;
+            g->indent = {0, 1, 2, 1, 0};
+            g->folder = {true, true, false, false, false};
+            g->rightAlign = {false};
+            GridSet(std::move(g));
+            size_t collapsed = GridShownRows();
+            GridClick({0, 0, 100, 1000}, 0, {10, 28 + 14});  // first body row
+            if (collapsed != 2 || GridShownRows() != 4) ok = false, Log(L"selftest: tree %zu %zu", collapsed, GridShownRows());
+            GridSet(nullptr);
+        }
         MdLoad(LR"(# Title
 Para &amp; *x* <b>y</b>
 
