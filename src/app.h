@@ -72,7 +72,11 @@ void MdInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* monoFont);
 void MdLoad(const std::wstring& text, const std::wstring& baseDir = L"");
 void MdClear();
 float MdPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
-std::wstring MdOutline();  // --selftest: one "<kind><level><bullet>:<text>|" per block
+std::wstring MdOutline();
+size_t MdHeadingCount();  // H1-H3, for the contents sidebar
+const std::wstring& MdHeadingText(size_t i);
+int MdHeadingLevel(size_t i);
+float MdHeadingY(size_t i, bool layout);  // -1: not laid out yet (and layout == false)  // --selftest: one "<kind><level><bullet>:<text>|" per block
 
 // ---- grid.cpp: table view for CSV/TSV and archive listings
 struct GridData {

@@ -112,6 +112,14 @@ ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 std::atomic<int> g_gridGen;
 bool g_gridPending;
 
+// Sidebar for Markdown (contents) and PDF (page thumbnails), when the window is wide enough.
+constexpr float kSideW = 220, kSideMinWindow = 760, kThumbW = 132, kHeadRowH = 30, kThumbLabel = 24;
+float g_sideScroll;
+int g_sideCurrent = -1;  // item the reading position is in, last time it was drawn
+std::vector<ComPtr<ID2D1Bitmap>> g_thumbBmp;
+std::vector<UINT> g_thumbW;  // pixel width each thumbnail was rendered at (0 = never)
+bool g_pdfReqThumb;          // the page the worker is rendering is a thumbnail
+
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
 constexpr float kPageGap = 12;
 int g_pdfGen;
@@ -391,15 +399,64 @@ void LoadPdf(const std::wstring& path, LONGLONG t0) {
     PdfOpen(path, ++g_pdfGen);
 }
 
+size_t SideCount() { return g_kind == K_Md ? MdHeadingCount() : g_kind == K_Pdf ? g_pages.size() : 0; }
+
+float SideW() {
+    if (SideCount() < 2) return 0;
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    return Dip(rc.right) >= kSideMinWindow ? kSideW : 0;
+}
+
+// Sidebar items: top (unscrolled, relative to the sidebar) and height.
+void SideItems(std::vector<float>& top, std::vector<float>& height) {
+    top.clear(), height.clear();
+    float y = 10;
+    for (size_t i = 0, n = SideCount(); i < n; i++) {
+        float h = g_kind == K_Md ? kHeadRowH : std::round(kThumbW * g_pages[i].second / g_pages[i].first) + kThumbLabel;
+        top.push_back(y), height.push_back(h);
+        y += h + (g_kind == K_Md ? 0 : 12);
+    }
+}
+
 float PageWidth() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    return Dip(rc.right) - 2 * kPad;
+    return Dip(rc.right) - 2 * kPad - SideW();
+}
+
+// Document position of PDF page i (as DrawPdf lays the pages out).
+float PageTop(size_t i) {
+    float w = PageWidth(), y = kPad / 2;
+    for (size_t k = 0; k < i && k < g_pages.size(); k++) y += std::round(w * g_pages[k].second / g_pages[k].first) + kPageGap;
+    return y;
+}
+
+// Item the reading position is in: the heading above the top of the view, or the page a third down.
+int CurrentItem() {
+    if (g_kind == K_Md) {
+        int cur = 0;
+        for (size_t i = 0; i < MdHeadingCount(); i++) {
+            float y = MdHeadingY(i, false);
+            if (y < 0 || y > g_scroll[1] + 30) break;
+            cur = (int)i;
+        }
+        return cur;
+    }
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    float at = g_scroll[1] + (Dip(rc.bottom) - kTitleH) / 3, w = PageWidth(), y = kPad / 2;
+    for (size_t i = 0; i < g_pages.size(); i++) {
+        y += std::round(w * g_pages[i].second / g_pages[i].first) + kPageGap;
+        if (at < y) return (int)i;
+    }
+    return g_pages.empty() ? 0 : (int)g_pages.size() - 1;
 }
 
 // Next page the PDF worker should render, in WM_FLICK_PDF reply format: the first page in or just
 // below the view that hasn't been rendered at the current width.
-LRESULT NextPdfPage() {
+LRESULT NextPdfPage(bool* thumb = nullptr) {
+    if (thumb) *thumb = false;
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     float w = PageWidth(), viewH = Dip(rc.bottom) - kTitleH, y = kPad / 2;
@@ -410,6 +467,17 @@ LRESULT NextPdfPage() {
             return ((LRESULT)px << 32) | (i + 1);
         y += h + kPageGap;
     }
+    // Then the thumbnails in view in the sidebar.
+    if (SideW() > 0 && g_thumbW.size() == g_pages.size()) {
+        std::vector<float> top, height;
+        SideItems(top, height);
+        UINT tpx = (UINT)std::lround(kThumbW * g_dpi / 96);
+        for (size_t i = 0; i < top.size(); i++)
+            if (top[i] + height[i] > g_sideScroll && top[i] < g_sideScroll + viewH && !g_thumbW[i]) {
+                if (thumb) *thumb = true;
+                return ((LRESULT)tpx << 32) | (i + 1);
+            }
+    }
     return 0;
 }
 
@@ -419,19 +487,25 @@ LRESULT OnPdf(PdfMsg& m) {
         g_pages = m.sizes;
         g_pageBmp.resize(g_pages.size());
         g_pageW.resize(g_pages.size());
+        g_thumbBmp.resize(g_pages.size());
+        g_thumbW.resize(g_pages.size());
         g_pdfFailed = g_pages.empty();
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
                                 : std::to_wstring(m.pageCount) + (m.pageCount == 1 ? L" page" : L" pages");
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
-    if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
+    if (m.page >= 0 && (size_t)m.page < g_pages.size() && g_pdfReqThumb) {
+        g_thumbW[m.page] = (UINT)std::lround(kThumbW * g_dpi / 96);
+        if (m.bmp) g_thumbBmp[m.page] = ToD2D(m.bmp.Get());
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    } else if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
         g_pageW[m.page] = (UINT)std::lround(PageWidth() * g_dpi / 96);
         if (m.bmp) g_pageBmp[m.page] = ToD2D(m.bmp.Get());
         if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
-    LRESULT next = NextPdfPage();
+    LRESULT next = NextPdfPage(&g_pdfReqThumb);
     g_pdfIdle = !next;
     return next;
 }
@@ -463,7 +537,7 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
     fill->SetColor(C(0xFFFFFF));
     for (size_t i = 0; i < pages.size(); i++) {
         float h = std::round(w * pages[i].second / pages[i].first);
-        D2D1_RECT_F r{kPad, y, kPad + w, y + h};
+        D2D1_RECT_F r{kPad + SideW(), y, kPad + SideW() + w, y + h};
         if (r.bottom > top && r.top < bottom) {
             g_rt->FillRectangle(r, fill);
             if (i < g_pageBmp.size() && g_pageBmp[i])
@@ -741,7 +815,8 @@ void ClearContent() {
     g_info.clear();
     MdClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
-    g_pages.clear(), g_pageBmp.clear(), g_pageW.clear();
+    g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
+    g_sideScroll = 0, g_sideCurrent = -1;
     GridSet(nullptr);
     FontClear();
     MediaClose();
@@ -863,6 +938,72 @@ void DrawInfo(const D2D1_RECT_F& area, ID2D1SolidColorBrush* text, ID2D1SolidCol
 bool Scrollable();
 bool Thumb(int axis, float& at, float& len);
 
+// Contents (Markdown headings) or page thumbnails (PDF) down the left side; follows the reading position.
+void DrawSidebar(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* sub, ID2D1SolidColorBrush* fill) {
+    const Palette& p = Pal();
+    std::vector<float> top, height;
+    SideItems(top, height);
+    if (top.empty()) return;
+    float viewH = sz.height - kTitleH;
+    int cur = CurrentItem();
+    if (cur != g_sideCurrent) {  // keep the current item in view as the document scrolls
+        g_sideCurrent = cur;
+        if (top[cur] < g_sideScroll) g_sideScroll = top[cur] - 10;
+        else if (top[cur] + height[cur] > g_sideScroll + viewH) g_sideScroll = top[cur] + height[cur] - viewH + 10;
+    }
+    g_sideScroll = std::clamp(g_sideScroll, 0.f, std::max(0.f, top.back() + height.back() + 10 - viewH));
+    fill->SetColor(p.codeBg);
+    g_rt->FillRectangle({0, kTitleH, kSideW, sz.height}, fill);
+    g_rt->PushAxisAlignedClip({0, kTitleH, kSideW, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
+    for (size_t i = 0; i < top.size(); i++) {
+        float y = kTitleH + top[i] - g_sideScroll;
+        bool current = (int)i == cur;
+        if (g_kind == K_Pdf && i < g_thumbBmp.size() && (y + height[i] < kTitleH - 2 * viewH || y > sz.height + 2 * viewH))
+            g_thumbBmp[i].Reset(), g_thumbW[i] = 0;  // far out of view: drop
+        if (y > sz.height || y + height[i] < kTitleH) continue;
+        if (g_kind == K_Md) {
+            float x = 22 + (MdHeadingLevel(i) - 1) * 14.f;
+            if (current) {
+                fill->SetColor(p.link);
+                g_rt->FillRoundedRectangle({{10, y + 8, 13, y + kHeadRowH - 8}, 1.5f, 1.5f}, fill);
+            }
+            const std::wstring& t = MdHeadingText(i);
+            g_rt->DrawText(t.c_str(), (UINT32)t.size(), g_fmtTitle.Get(), {x, y, kSideW - 12, y + kHeadRowH},
+                           current ? text : sub);
+        } else {
+            float x = std::round((kSideW - kThumbW) / 2), h = height[i] - kThumbLabel;
+            D2D1_RECT_F r{x, y, x + kThumbW, y + h};
+            fill->SetColor(C(0xFFFFFF));
+            g_rt->FillRectangle(r, fill);
+            if (i < g_thumbBmp.size() && g_thumbBmp[i])
+                g_rt->DrawBitmap(g_thumbBmp[i].Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            fill->SetColor(current ? p.link : p.btnBorder);
+            g_rt->DrawRectangle({r.left - 1, r.top - 1, r.right + 1, r.bottom + 1}, fill, current ? 2.f : 1.f);
+            std::wstring n = std::to_wstring(i + 1);
+            g_rt->DrawText(n.c_str(), (UINT32)n.size(), g_fmtInfo.Get(), {0, r.bottom, kSideW, r.bottom + kThumbLabel},
+                           current ? text : sub);
+        }
+    }
+    g_rt->PopAxisAlignedClip();
+}
+
+// Sidebar click at y (DIPs): jumps the document to that heading or page.
+void SideClick(float y) {
+    std::vector<float> top, height;
+    SideItems(top, height);
+    for (size_t i = 0; i < top.size(); i++) {
+        float t = kTitleH + top[i] - g_sideScroll;
+        if (y < t || y >= t + height[i]) continue;
+        float target = g_kind == K_Md ? MdHeadingY(i, true) - 8 : PageTop(i) - kPad / 2;
+        RECT rc;
+        GetClientRect(g_hwnd, &rc);
+        g_doc[1] = std::max(g_doc[1], target + Dip(rc.bottom) - kTitleH);  // Markdown's height is an estimate
+        g_scroll[1] = std::max(0.f, target);
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+        return;
+    }
+}
+
 void Paint() {
     if (!g_rt) CreateTarget();
     const Palette& p = Pal();
@@ -900,6 +1041,8 @@ void Paint() {
     g_rt->DrawTextLayout({g_openRc.left + 12, top}, label.Get(), text.Get());
 
     // Title: file name + dimmed details, trimmed with an ellipsis.
+    if (g_kind == K_Pdf && !g_pdfFailed && g_pages.size() > 1)  // reading position: "3 / 94"
+        g_sub = std::to_wstring(CurrentItem() + 1) + L" / " + std::to_wstring(g_pages.size());
     std::wstring title = g_title + (g_sub.empty() ? L"" : L"    " + g_sub);
     ComPtr<IDWriteTextLayout> tl;
     g_dw->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_fmtTitle.Get(),
@@ -917,7 +1060,7 @@ void Paint() {
         DrawControls(sz, text.Get(), fill.Get());
     }
     if (Scrollable()) {
-        D2D1_RECT_F doc{kPad, kTitleH, sz.width - kPad, sz.height};
+        D2D1_RECT_F doc{kPad + SideW(), kTitleH, sz.width - kPad, sz.height};
         MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role};
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
@@ -931,6 +1074,7 @@ void Paint() {
                 g_scroll[1] = max, InvalidateRect(g_hwnd, nullptr, FALSE);
         }
         g_rt->PopAxisAlignedClip();
+        if (SideW() > 0) DrawSidebar(sz, text.Get(), sub.Get(), fill.Get());
         fill->SetColor(p.sub);
         for (int axis = 0; axis < 2; axis++)
             if (float at, len; Thumb(axis, at, len)) {  // overlay scrollbars: thin, wider under the mouse
@@ -1099,6 +1243,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 UINT lines = 3;
                 SystemParametersInfoW(SPI_GETWHEELSCROLLLINES, 0, &lines, 0);
                 float d = GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA * std::min(lines, 10u) * 36;
+                POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};  // wheel positions are in screen coordinates
+                ScreenToClient(h, &pt);
+                if (m == WM_MOUSEWHEEL && Dip(pt.x) < SideW()) {  // over the sidebar: scroll the sidebar
+                    g_sideScroll -= d;
+                    InvalidateRect(h, nullptr, FALSE);
+                    return 0;
+                }
                 ScrollBy(sideways ? 0 : 1, m == WM_MOUSEHWHEEL ? d : -d);
             }
             return 0;
@@ -1118,6 +1269,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONDOWN:
+            if (Dip(GET_X_LPARAM(l)) < SideW() && Dip(GET_Y_LPARAM(l)) > kTitleH) return SideClick(Dip(GET_Y_LPARAM(l))), 0;
             if (g_kind == K_Media) {
                 D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };

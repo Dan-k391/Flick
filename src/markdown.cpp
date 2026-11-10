@@ -45,6 +45,7 @@ IDWriteFactory* g_dw;
 std::wstring g_mono;
 ComPtr<IDWriteTextFormat> g_fmtBody, g_fmtCode, g_fmtBullet, g_fmtHead[6];
 std::vector<Block> g_blocks;
+std::vector<size_t> g_heads;  // blocks that are H1-H3: the contents sidebar
 std::wstring g_base;  // folder of the Markdown file, for relative image paths
 float g_dpi = 96;
 size_t g_laid;  // blocks [0, g_laid) are laid out for g_width
@@ -447,6 +448,7 @@ void MdInit(IDWriteFactory* dw, const wchar_t* uiFont, const wchar_t* monoFont) 
 
 void MdClear() {
     std::vector<Block>().swap(g_blocks);
+    g_heads.clear();
     g_laid = 0, g_width = -1;
 }
 
@@ -457,6 +459,22 @@ void MdLoad(const std::wstring& text, const std::wstring& baseDir) {
     MD_PARSER parser{0, MD_FLAG_TABLES | MD_FLAG_STRIKETHROUGH | MD_FLAG_TASKLISTS | MD_FLAG_PERMISSIVEAUTOLINKS,
                      EnterBlock, LeaveBlock, EnterSpan, LeaveSpan, OnText, nullptr, nullptr};
     md_parse(text.data(), (MD_SIZE)text.size(), &parser, &p);
+    for (size_t i = 0; i < g_blocks.size(); i++)
+        if (g_blocks[i].kind == B_Head && g_blocks[i].level <= 3 && !g_blocks[i].text.s.empty()) g_heads.push_back(i);
+}
+
+size_t MdHeadingCount() { return g_heads.size(); }
+const std::wstring& MdHeadingText(size_t i) { return g_blocks[g_heads[i]].text.s; }
+int MdHeadingLevel(size_t i) { return g_blocks[g_heads[i]].level; }
+
+// Document position of heading i; lays out the blocks before it if `layout` (a jump far ahead).
+float MdHeadingY(size_t i, bool layout) {
+    size_t b = g_heads[i];
+    if (b >= g_laid) {
+        if (!layout || g_width < 0) return -1;
+        while (g_laid <= b) LayoutBlock(g_blocks[g_laid++], g_width);
+    }
+    return g_blocks[b].y;
 }
 
 float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, const MdColors& c) {

@@ -167,6 +167,7 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
   instant poster.
 - Markdown: clickable links, remote images (deliberately off: no network), raw HTML, "show source".
 - PDF: zoom, text selection/copy, password prompt.
+- Sidebar (Markdown contents, PDF thumbnails) is fixed-width and auto-hides below 760 DIP; no toggle yet.
 - Progressive images (show cached shell thumbnail, decode full image on a worker) for >10 MP photos.
 - Animated GIF, HEIC/AVIF need the Store codecs; multi-selection; "Open with" dropdown
   (right-click the button opens the system chooser today).
