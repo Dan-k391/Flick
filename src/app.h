@@ -21,6 +21,7 @@ enum : UINT {
     WM_FLICK_GRID,                 // sent by the archive worker (wParam = gen, lParam = GridData*)
     WM_FLICK_MEDIA,                // media engine event (wParam = MF_MEDIA_ENGINE_EVENT)
     WM_FLICK_FRAME,                // display refreshed while playing: pull a video frame
+    WM_FLICK_SIZE,                 // sent by the folder-size worker (lParam = SizeMsg*)
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
 };
 
@@ -87,6 +88,7 @@ struct GridData {
     std::vector<bool> rightAlign;                  // per column
     std::vector<UINT8> indent;                     // archives, per body row: tree depth
     std::vector<bool> folder;                      // archives, per body row
+    std::vector<std::wstring> paths;               // trees, per body row: path under the root, '/'-separated
     std::wstring sub;                              // title-bar details
     size_t Rows() const { return cols ? cells.size() / cols : 0; }
 };
@@ -98,6 +100,7 @@ std::unique_ptr<GridData> GridReadFolder(const std::wstring& path, const std::at
 bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
+void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);
 bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt);  // toggles a folder row
 size_t GridShownRows();  // body rows visible (--selftest)
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);

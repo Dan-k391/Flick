@@ -17,6 +17,8 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
+#include <unordered_map>
+#include <unordered_set>
 #include <cmath>
 #include <vector>
 #include <Scintilla.h>
@@ -114,6 +116,8 @@ ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
 std::atomic<int> g_gridGen;
+std::atomic<int> g_sizeGen;  // folder-size worker
+bool g_gridFolder;           // the tree being listed is a folder (its size gets counted)
 bool g_gridPending;
 
 // Sidebar for Markdown (contents) and PDF (page thumbnails), when the window is wide enough.
@@ -669,17 +673,102 @@ DWORD WINAPI GridThread(void* p) {
 // Archive or folder contents as a tree, listed on a worker thread.
 void LoadTree(const std::wstring& path, bool folder) {
     g_gridPending = true;
+    g_gridFolder = folder;
     g_sub = L"reading…";
     CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen, folder}, 0, nullptr));
 }
 
 void ShowInfo();
+// Folder size: every file below the folder (hidden ones too, links not followed), counted on a worker.
+// The title counts up every 100 ms; at the end each folder row in the tree gets its own total.
+struct SizeMsg {
+    int gen;
+    bool done = false;
+    ULONGLONG bytes = 0, files = 0, dirs = 0;
+    std::unordered_map<std::wstring, ULONGLONG> dirSizes;  // folder rows of the tree only
+};
+
+struct SizeJob {
+    int gen;
+    std::unordered_set<std::wstring> wanted;  // folder paths shown in the tree
+    LONGLONG lastReport;
+    SizeMsg msg;
+};
+
+ULONGLONG ScanDir(SizeJob& j, const std::wstring& dir, const std::wstring& rel) {
+    ULONGLONG sum = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileExW((dir + L"\\*").c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch, nullptr,
+                                FIND_FIRST_EX_LARGE_FETCH);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        if (g_sizeGen != j.gen) break;  // a newer preview: stop
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;  // junctions could loop
+            std::wstring r = rel.empty() ? fd.cFileName : rel + L"/" + fd.cFileName;
+            ULONGLONG s = ScanDir(j, dir + L"\\" + fd.cFileName, r);
+            j.msg.dirs++, sum += s;
+            if (j.wanted.count(r)) j.msg.dirSizes[r] = s;
+        } else {
+            ULONGLONG s = ((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+            sum += s, j.msg.bytes += s, j.msg.files++;
+        }
+        if (MsSince(j.lastReport) > 100) {
+            j.lastReport = Now();
+            SizeMsg partial{j.gen, false, j.msg.bytes, j.msg.files, j.msg.dirs};
+            SendMessageW(g_hwnd, WM_FLICK_SIZE, 0, (LPARAM)&partial);
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return sum;
+}
+
+DWORD WINAPI SizeThread(void* p) {
+    std::unique_ptr<std::pair<std::wstring, SizeJob>> job(static_cast<std::pair<std::wstring, SizeJob>*>(p));
+    std::wstring root = job->first;  // \\?\ so paths longer than MAX_PATH still count
+    root = root.starts_with(L"\\\\") ? L"\\\\?\\UNC\\" + root.substr(2) : L"\\\\?\\" + root;
+    SizeJob& j = job->second;
+    j.msg.gen = j.gen;
+    j.lastReport = Now();
+    ScanDir(j, root, L"");
+    if (g_sizeGen == j.gen) {
+        j.msg.done = true;
+        SendMessageW(g_hwnd, WM_FLICK_SIZE, 0, (LPARAM)&j.msg);
+    }
+    return 0;
+}
+
+std::wstring ByteSize(ULONGLONG n) {
+    wchar_t s[64];
+    StrFormatByteSizeEx(n, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, s, 64);
+    return s;
+}
+
+void OnFolderSize(const SizeMsg& m) {
+    const GridData* g = GridGet();
+    if (m.gen != g_sizeGen || g_kind != K_Grid || !g) return;
+    g_sub = std::to_wstring(m.dirs) + (m.dirs == 1 ? L" folder, " : L" folders, ") + std::to_wstring(m.files) +
+            (m.files == 1 ? L" file · " : L" files · ") + ByteSize(m.bytes) + (m.done ? L"" : L"…");
+    if (m.done)
+        for (size_t i = 0; i < g->paths.size(); i++)
+            if (g->folder[i])
+                if (auto it = m.dirSizes.find(g->paths[i]); it != m.dirSizes.end()) GridSetCell(i, 1, ByteSize(it->second));
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 LRESULT OnGrid(int gen, GridData* g) {
     if (gen != g_gridGen || g_kind != K_Grid) return 0;
     g_gridPending = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
     if (!g) return ShowInfo(), 0;  // not readable as an archive
     g_sub = g->sub;
+    if (g_gridFolder) {  // count the whole folder's size in the background
+        auto* job = new std::pair<std::wstring, SizeJob>{g_path, SizeJob{++g_sizeGen}};
+        for (size_t i = 0; i < g->paths.size(); i++)
+            if (g->folder[i]) job->second.wanted.insert(g->paths[i]);
+        CloseHandle(CreateThread(nullptr, 0, SizeThread, job, 0, nullptr));
+    }
     GridSet(std::unique_ptr<GridData>(g));
     return 1;
 }
@@ -933,7 +1022,7 @@ void ClearContent() {
     g_mediaVideo = g_seekDrag = false, g_shownPos = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
     g_natW = g_natH = 0;
-    g_gridGen++, g_gridPending = false;
+    g_gridGen++, g_gridPending = false, g_sizeGen++;
     for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
     g_kind = K_None;
 }
@@ -1464,6 +1553,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (repaint) InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
+        case WM_FLICK_SIZE:
+            OnFolderSize(*reinterpret_cast<SizeMsg*>(l));
+            return 0;
         case WM_FLICK_POSTER:
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
             return 0;

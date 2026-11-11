@@ -355,6 +355,7 @@ std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bo
         AddCell(*g, e.size >= 0 ? Bytes(e.size) : L"");
         AddCell(*g, FormatDate(e.mtime));
         g->indent.push_back((UINT8)std::min<size_t>(std::count(e.path.begin(), e.path.end(), L'/'), 255));
+        g->paths.push_back(e.path);
         g->folder.push_back(e.dir);
         if (e.dir) folders++;
         else files++, total += std::max(0LL, e.size);
@@ -389,6 +390,14 @@ void GridSet(std::unique_ptr<GridData> g) {
 }
 
 const GridData* GridGet() { return g_grid.get(); }
+
+void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value) {
+    if (!g_grid || col >= g_grid->cols) return;
+    size_t i = (bodyRow + (g_grid->header ? 1 : 0)) * g_grid->cols + col;
+    if (i >= g_grid->cells.size()) return;
+    g_grid->cells[i] = {(UINT32)g_grid->text.size(), (UINT32)value.size()};
+    g_grid->text += value;
+}
 size_t GridShownRows() { return g_shown.size(); }
 
 // A click in the table: expands/collapses the folder row under it. True if the view changed.
