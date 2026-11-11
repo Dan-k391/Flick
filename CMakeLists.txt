@@ -33,6 +33,7 @@ target_compile_definitions(lunasvg PUBLIC LUNASVG_BUILD_STATIC PRIVATE LUNASVG_B
 target_link_libraries(lunasvg PRIVATE plutovg)
 
 add_executable(Flick WIN32 src/main.cpp src/window.cpp src/lang.cpp src/markdown.cpp src/pdf.cpp src/grid.cpp src/font.cpp src/svg.cpp src/fileinfo.cpp src/highlight.cpp src/convert.cpp src/media.cpp src/flick.manifest src/flick.rc)
+set_source_files_properties(src/flick.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/flick.ico)  # rebuild when the icon changes
 target_compile_definitions(Flick PRIVATE UNICODE _UNICODE NOMINMAX)
 target_link_libraries(Flick PRIVATE lexilla scintilla md4c lunasvg windowsapp windows.data.pdf d3d11 version msi crypt32 mfplat mfuuid mfreadwrite propsys
   d2d1 dwrite windowscodecs dwmapi shlwapi uxtheme shcore imm32 msimg32 ole32 oleaut32 uuid psapi)
