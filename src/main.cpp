@@ -147,6 +147,65 @@ int Bench(int argc, wchar_t** argv) {
     return 0;
 }
 
+// Notification-area icon: right- or left-click opens a menu with "Start at sign-in" and "Quit".
+// Sign-in start is the HKCU Run value "Flick", pointing at this exe.
+constexpr UINT WM_TRAY = WM_APP + 100;
+const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+NOTIFYICONDATAW g_tray{sizeof g_tray};
+
+bool StartsAtSignIn() {
+    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, L"Flick", RRF_RT_REG_SZ, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
+}
+
+void SetStartAtSignIn(bool on) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_SET_VALUE, &k)) return;
+    if (on) {
+        wchar_t exe[MAX_PATH];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";
+        RegSetValueExW(k, L"Flick", 0, REG_SZ, (const BYTE*)cmd.c_str(), DWORD((cmd.size() + 1) * sizeof(wchar_t)));
+    } else {
+        RegDeleteValueW(k, L"Flick");
+    }
+    RegCloseKey(k);
+}
+
+LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    static UINT taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    if (m == taskbarCreated) Shell_NotifyIconW(NIM_ADD, &g_tray);  // Explorer restarted
+    if (m == WM_TRAY && (l == WM_RBUTTONUP || l == WM_LBUTTONUP)) {
+        HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING | (StartsAtSignIn() ? MF_CHECKED : 0), 1, L"Start at sign-in");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, 2, L"Quit Flick");
+        POINT pt;
+        GetCursorPos(&pt);
+        SetForegroundWindow(h);  // else the menu doesn't close when clicking elsewhere
+        int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+        DestroyMenu(menu);
+        if (cmd == 1) SetStartAtSignIn(!StartsAtSignIn());
+        if (cmd == 2) PostMessageW(g_hwnd, WM_FLICK_QUIT, 0, 0);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+void TrayAdd(HINSTANCE inst) {
+    WNDCLASSW wc{};
+    wc.lpfnWndProc = TrayProc;
+    wc.hInstance = inst;
+    wc.lpszClassName = L"FlickTray";
+    RegisterClassW(&wc);
+    g_tray.hWnd = CreateWindowW(L"FlickTray", L"", 0, 0, 0, 0, 0, nullptr, nullptr, inst, nullptr);  // hidden
+    g_tray.uFlags = NIF_ICON | NIF_TIP | NIF_MESSAGE;
+    g_tray.uCallbackMessage = WM_TRAY;
+    g_tray.hIcon = (HICON)LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                     GetSystemMetrics(SM_CYSMICON), 0);
+    wcscpy_s(g_tray.szTip, L"Flick: select a file in Explorer and press Space");
+    Shell_NotifyIconW(NIM_ADD, &g_tray);
+}
+
 }  // namespace
 
 LONGLONG Now() {
@@ -349,6 +408,8 @@ c
         wchar_t full[MAX_PATH];
         GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
         PreviewShow(full, nullptr, Now());
+    } else {
+        TrayAdd(inst);
     }
 
     CloseHandle(CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr));
@@ -357,5 +418,6 @@ c
         if (!PreviewKey(m)) TranslateMessage(&m), DispatchMessageW(&m);
         if (show && !PreviewVisible()) break;
     }
+    if (g_tray.hWnd) Shell_NotifyIconW(NIM_DELETE, &g_tray);
     return 0;
 }

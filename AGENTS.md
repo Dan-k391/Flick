@@ -40,7 +40,7 @@ scripts/         make-samples.ps1, bench.ps1 (in-process), e2e.ps1 (real Explore
 - `build.cmd` (Release) or `build.cmd Debug` → `build\<cfg>\Flick.exe`. It kills a running Flick first
   (the linker can't overwrite a running exe). From bash use PowerShell: `cmd /c .\build.cmd`.
 - Run `build\Release\Flick.exe` (stays resident, no window until Space). `Flick.exe --exit` quits it.
-  Autostart: put a shortcut in `shell:startup`.
+  It sits in the notification area: its menu has "Start at sign-in" (HKCU `Run` value `Flick`) and "Quit".
 - Log: `%LOCALAPPDATA%\Flick\flick.log` (one line per open with timings; truncated at 1 MB).
 - Window size follows QuickLook's rules (`PlaceWindow`): each kind asks for a size (text 800×600,
   Markdown 1000×600, CSV 1000×700, trees 800×480, …); pictures/videos/PDFs ask for their own size,
