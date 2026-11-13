@@ -113,7 +113,8 @@ ComPtr<ID2D1Bitmap> g_frame;
 D2D1_RECT_F g_playRc, g_trackRc, g_muteRc, g_volRc;
 double g_shownPos = -1;
 float g_seekFrac = -1;  // while dragging the seek bar: where the knob is (0..1)
-bool g_seekSent = true;  // that position has been sent to the engine
+bool g_seekResume;      // playback was paused for the drag: resume it after
+int g_scrubGen;
 ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
@@ -960,29 +961,39 @@ void OnPoster(int gen, IWICBitmap* frame) {
     }
 }
 
-void SendSeek(bool fast);
+// Dragging the seek bar: the knob follows the mouse, playback pauses, and a source reader on a worker
+// shows the key frame under the knob (the media engine needs 250-750 ms per seek and, while playing,
+// shows almost no frames during a stream of seeks). Releasing seeks the engine exactly, once.
+void BeginSeek() {
+    MediaState s = MediaGet();
+    g_seekResume = !s.paused && !s.ended;
+    if (g_seekResume) MediaToggle();
+    if (g_mediaVideo && s.videoW) {
+        D2D1_RECT_F r = VideoRect(s);
+        g_scrubGen = MediaScrubStart(g_path, (UINT)std::lround((r.right - r.left) * g_dpi / 96),
+                                     (UINT)std::lround((r.bottom - r.top) * g_dpi / 96));
+    }
+}
 
-// Dragging: the knob follows the mouse at once; the engine gets a fast (key frame) seek whenever it has
-// finished the previous one, so seeks never queue up. Releasing seeks exactly (EndSeek).
 void SeekAt(float x) {
-    if (g_trackRc.right <= g_trackRc.left) return;
+    MediaState s = MediaGet();
+    if (g_trackRc.right <= g_trackRc.left || s.dur <= 0) return;
     g_seekFrac = std::clamp((x - g_trackRc.left) / (g_trackRc.right - g_trackRc.left), 0.f, 1.f);
-    g_seekSent = false;
-    SendSeek(true);
+    MediaScrubTo(g_seekFrac * s.dur);
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
-void SendSeek(bool fast) {
-    MediaState s = MediaGet();
-    if (g_seekFrac < 0 || g_seekSent || s.dur <= 0 || (fast && MediaSeeking())) return;
-    MediaSeek(g_seekFrac * s.dur, fast);
-    g_seekSent = fast;  // an exact seek is final
+void EndSeek() {
+    MediaScrubStop();
+    if (g_seekFrac >= 0) MediaSeek(g_seekFrac * MediaGet().dur);
+    g_seekFrac = -1;
+    if (g_seekResume) MediaToggle(), g_seekResume = false;
 }
 
-void EndSeek() {
-    g_seekSent = false;
-    SendSeek(false);
-    g_seekFrac = -1;
+void OnScrub(int gen, IWICBitmap* frame) {
+    if (gen != g_scrubGen || !g_seekDrag || g_kind != K_Media) return;
+    g_frame = ToD2D(frame);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 void VolumeAt(float x) {
@@ -1039,8 +1050,9 @@ void ClearContent() {
     GridSet(nullptr);
     FontClear();
     MediaClose();
+    MediaScrubStop();
     g_frame.Reset(), g_frameWic.Reset();
-    g_mediaVideo = g_seekDrag = false, g_shownPos = -1, g_seekFrac = -1;
+    g_mediaVideo = g_seekDrag = g_seekResume = false, g_shownPos = -1, g_seekFrac = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
     g_natW = g_natH = 0;
     g_gridGen++, g_gridPending = false, g_sizeGen++;
@@ -1503,7 +1515,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (g_kind == K_Media) {
                 D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
-                if (in(g_trackRc)) g_seekDrag = true, SetCapture(h), SeekAt(pt.x);
+                if (in(g_trackRc)) g_seekDrag = true, SetCapture(h), BeginSeek(), SeekAt(pt.x);
                 else if (in(g_volRc)) g_volDrag = true, SetCapture(h), VolumeAt(pt.x);
                 else if (in(g_muteRc)) MediaToggleMute(), InvalidateRect(h, nullptr, FALSE);
                 else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
@@ -1570,7 +1582,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             MediaFrameHandled();
             if (g_kind != K_Media || !g_visible) return 0;
             bool repaint = g_mediaVideo && TryFrame();
-            if (g_seekDrag) SendSeek(true);  // the last drag position, once the engine is free
             // Progress: repaint whenever the knob moves a pixel (or the clock a second), not on a fixed tick.
             MediaState s = MediaGet();
             double frac = g_seekFrac >= 0 ? g_seekFrac : s.dur > 0 ? s.pos / s.dur : 0;
@@ -1581,6 +1592,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         case WM_FLICK_SIZE:
             OnFolderSize(*reinterpret_cast<SizeMsg*>(l));
+            return 0;
+        case WM_FLICK_SCRUB:
+            OnScrub((int)w, reinterpret_cast<IWICBitmap*>(l));
             return 0;
         case WM_FLICK_POSTER:
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));

@@ -84,7 +84,7 @@ In-process medians (`bench.ps1`, add ~2.5 ms for the Explorer lookup), 2026-11-1
 | folder tree: 50 files · this repo (780) · C:\Windows (first 10k) | ~9 · ~12 · ~53 ms |
 | font (ttf/ttc) · SVG with text · notebook · AsciiDoc/rst | ~8 · ~12 · ~12 · ~8 ms |
 | audio (tags + art async) | ~12 ms |
-| video (1080p H.264, real first frame) | ~100–135 ms (decoder start-up; engine alone 300 ms) |
+| video (1080p H.264, real first frame) | ~50 ms (low-latency source reader; engine alone 300 ms) |
 
 First press after startup: ~35 ms. Idle: ~25 MB private, ~45–55 MB working set; after a session
 of PDFs and big images it sits around ~35–55 MB private; after any video ~58 MB (Media Foundation
@@ -135,7 +135,7 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 - **Lexilla outside Scintilla** needs only an `IDocument`. `GetCharacterAndWidth` past the end must
   return width 1 (like Scintilla); width 0 stalls `StyleContext` forever (100% CPU hang).
 - **Media engine first frame takes 200–300 ms** even warm (pipeline + audio endpoint); byte-stream
-  sources don't help. A source reader decodes one frame in ~75 ms on a worker → shown first. Media
+  sources don't help. A source reader (`MF_LOW_LATENCY`) decodes one frame in ~40 ms on a worker → shown first. Media
   Foundation keeps ~33 MB after the first video; `MFShutdown` per preview made it worse.
 - **Workers must stop when a newer preview starts** (they get the current generation and their own):
   stale folder/archive listings piled up to 20 threads and 224 MB in the bench. Folders list
@@ -145,6 +145,10 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 - **Sizing the window costs one resize**: when shown, the window is only *moved* to the monitor; pictures
   decode for 80% of that screen (`PictureArea`), then `PlaceWindow` sizes it once (PDF: in `OnPdf`
   before page 1 is requested). Two resizes per open cost ~4 ms.
+- **Seek-bar dragging**: a playing media engine shows almost no frames during a stream of seeks (5 frames
+  for 25 seeks) and needs 250–750 ms per seek even approximate. So the drag pauses playback and a source
+  reader on a worker decodes the key frame under the knob (`MediaScrub*`, ~28 ms 1080p, ~110 ms 4K); the
+  engine seeks exactly once on release. `MF_LOW_LATENCY` on the reader halves that (decoder stops buffering).
 - `GetVideoAspectRatio` is the *picture* aspect (16:9), not the pixel aspect: width = height × ax/ay.
 - lunasvg rejects a UTF-8 BOM; strip it. D2D's own SVG renderer can't draw `<text>`, hence lunasvg.
 - Markdown images: read only the size at layout (headers), decode pixels when first drawn — else an

@@ -22,6 +22,7 @@ enum : UINT {
     WM_FLICK_MEDIA,                // media engine event (wParam = MF_MEDIA_ENGINE_EVENT)
     WM_FLICK_FRAME,                // display refreshed while playing: pull a video frame
     WM_FLICK_SIZE,                 // sent by the folder-size worker (lParam = SizeMsg*)
+    WM_FLICK_SCRUB,                // sent by the scrub worker (wParam = gen, lParam = IWICBitmap* frame)
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
 };
 
@@ -135,13 +136,15 @@ bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWIC
 void MediaFrameHandled();
 void MediaOnEvent(DWORD event);
 void MediaToggle();
-void MediaSeek(double seconds, bool fast = false);  // fast: nearest key frame (while dragging)
-bool MediaSeeking();
+void MediaSeek(double seconds);
 void MediaMute(bool muted);  // for tests
 void MediaSetVolume(double v);  // 0..1, kept for the session
 double MediaVolume();           // 0 while muted
 void MediaToggleMute();
 Microsoft::WRL::ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory*);
+int MediaScrubStart(const std::wstring& path, UINT w, UINT h);  // frames while the seek bar is dragged; returns gen
+void MediaScrubTo(double seconds);
+void MediaScrubStop();
 
 // window.cpp helpers for the views
 Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory

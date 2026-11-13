@@ -141,14 +141,11 @@ void MediaToggle() {
     else g_engine->Pause();
 }
 
-void MediaSeek(double seconds, bool fast) {
+void MediaSeek(double seconds) {
     if (!g_engine) return;
-    if (g_engineEx)
-        g_engineEx->SetCurrentTimeEx(seconds, fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+    if (g_engineEx) g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
     else g_engine->SetCurrentTime(seconds);
 }
-
-bool MediaSeeking() { return g_engine && g_engine->IsSeeking(); }
 
 void MediaMute(bool muted) { g_muted = muted; }
 
@@ -165,37 +162,51 @@ void MediaToggleMute() {
     if (g_engine) g_engine->SetMuted(g_muted || g_userMuted);
 }
 
-// The first frame straight from a source reader (no playback pipeline, ~75 ms): shown while the media
-// engine is still starting, which takes 200-300 ms. Worker thread.
-ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory* wic) {
+// Frames straight from a source reader (no playback pipeline): the poster shown while the media engine
+// starts (200-300 ms), and the frames shown while the seek bar is dragged. Worker threads.
+namespace {
+
+struct Reader {
+    ComPtr<IMFSourceReader> reader;
+    UINT32 w = 0, h = 0;
+    LONG stride = 0;
+};
+
+bool OpenReader(const std::wstring& path, Reader& r) {
     static bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     ComPtr<IMFAttributes> attrs;
-    ComPtr<IMFSourceReader> reader;
     ComPtr<IMFMediaType> type, actual;
+    if (!started || FAILED(MFCreateAttributes(&attrs, 2)) ||
+        FAILED(attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE)) ||
+        FAILED(attrs->SetUINT32(MF_LOW_LATENCY, TRUE)) ||  // decoder hands out a frame at once instead of buffering
+        FAILED(MFCreateSourceReaderFromURL(path.c_str(), attrs.Get(), &r.reader)) ||
+        FAILED(r.reader->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE)) ||
+        FAILED(r.reader->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE)) || FAILED(MFCreateMediaType(&type)) ||
+        FAILED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) || FAILED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32)) ||
+        FAILED(r.reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, type.Get())) ||
+        FAILED(r.reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &actual)))
+        return false;
+    MFGetAttributeSize(actual.Get(), MF_MT_FRAME_SIZE, &r.w, &r.h);
+    r.stride = (LONG)MFGetAttributeUINT32(actual.Get(), MF_MT_DEFAULT_STRIDE, r.w * 4);
+    return r.w && r.h;
+}
+
+// The next decoded frame; after SetCurrentPosition that is the key frame at or before the position.
+ComPtr<IWICBitmap> ReadFrame(Reader& r, IWICImagingFactory* wic) {
     ComPtr<IMFSample> sample;
     ComPtr<IMFMediaBuffer> buffer;
     DWORD stream, flags = 0;
     LONGLONG ts;
-    if (!started || FAILED(MFCreateAttributes(&attrs, 1)) ||
-        FAILED(attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE)) ||
-        FAILED(MFCreateSourceReaderFromURL(path.c_str(), attrs.Get(), &reader)) ||
-        FAILED(reader->SetStreamSelection((DWORD)MF_SOURCE_READER_ALL_STREAMS, FALSE)) ||
-        FAILED(reader->SetStreamSelection((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE)) || FAILED(MFCreateMediaType(&type)) ||
-        FAILED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) || FAILED(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32)) ||
-        FAILED(reader->SetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, nullptr, type.Get())) ||
-        FAILED(reader->GetCurrentMediaType((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, &actual)))
-        return nullptr;
     for (int i = 0; i < 8 && !sample; i++)  // decoders may need a few reads before the first frame
-        if (FAILED(reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &ts, &sample)) ||
+        if (FAILED(r.reader->ReadSample((DWORD)MF_SOURCE_READER_FIRST_VIDEO_STREAM, 0, &stream, &flags, &ts, &sample)) ||
             (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM)))
             return nullptr;
-    UINT32 w = 0, h = 0;
-    MFGetAttributeSize(actual.Get(), MF_MT_FRAME_SIZE, &w, &h);
-    LONG stride = (LONG)MFGetAttributeUINT32(actual.Get(), MF_MT_DEFAULT_STRIDE, w * 4);
     BYTE* data = nullptr;
     DWORD len = 0;
     ComPtr<IWICBitmap> bmp;
-    if (!w || !h || FAILED(sample->ConvertToContiguousBuffer(&buffer)) || FAILED(buffer->Lock(&data, nullptr, &len))) return nullptr;
+    UINT w = r.w, h = r.h;
+    LONG stride = r.stride;
+    if (!sample || FAILED(sample->ConvertToContiguousBuffer(&buffer)) || FAILED(buffer->Lock(&data, nullptr, &len))) return nullptr;
     if ((DWORD)std::abs(stride) * h <= len && SUCCEEDED(wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppBGR, WICBitmapCacheOnLoad, &bmp))) {
         WICRect all{0, 0, (INT)w, (INT)h};
         ComPtr<IWICBitmapLock> lock;
@@ -208,4 +219,73 @@ ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory*
     }
     buffer->Unlock();
     return bmp;
+}
+
+std::atomic<int> g_scrubGen;
+std::atomic<double> g_scrubTo{-1};
+HANDLE g_scrubWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+
+struct ScrubJob {
+    std::wstring path;
+    UINT w, h;
+    int gen;
+};
+
+// Decodes the key frame for the latest g_scrubTo whenever it changes; positions passed while a frame
+// decodes are skipped, so the picture never falls behind the mouse.
+DWORD WINAPI ScrubThread(void* p) {
+    std::unique_ptr<ScrubJob> job(static_cast<ScrubJob*>(p));
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    {
+        ComPtr<IWICImagingFactory> wic;
+        Reader r;
+        double done = -1;
+        if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+            OpenReader(job->path, r))
+            while (g_scrubGen == job->gen) {
+                double to = g_scrubTo;
+                if (to < 0 || to == done) {
+                    WaitForSingleObject(g_scrubWake, 200);
+                    continue;
+                }
+                done = to;
+                PROPVARIANT pos{};
+                pos.vt = VT_I8;
+                pos.hVal.QuadPart = (LONGLONG)(to * 1e7);
+                if (FAILED(r.reader->SetCurrentPosition(GUID_NULL, pos))) continue;
+                ComPtr<IWICBitmap> frame = ReadFrame(r, wic.Get()), scaled;
+                ComPtr<IWICBitmapScaler> scaler;  // to the size shown: less to hand over and to draw
+                if (frame && job->w && job->h && job->w < r.w && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
+                    SUCCEEDED(scaler->Initialize(frame.Get(), job->w, job->h, WICBitmapInterpolationModeLinear)) &&
+                    SUCCEEDED(wic->CreateBitmapFromSource(scaler.Get(), WICBitmapCacheOnLoad, &scaled)))
+                    frame = scaled;
+                if (frame && g_scrubGen == job->gen) SendMessageW(g_hwnd, WM_FLICK_SCRUB, job->gen, (LPARAM)frame.Get());
+            }
+    }
+    CoUninitialize();
+    return 0;
+}
+
+}  // namespace
+
+ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory* wic) {
+    Reader r;
+    return OpenReader(path, r) ? ReadFrame(r, wic) : nullptr;
+}
+
+int MediaScrubStart(const std::wstring& path, UINT w, UINT h) {
+    g_scrubTo = -1;
+    auto* job = new ScrubJob{path, w, h, ++g_scrubGen};
+    CloseHandle(CreateThread(nullptr, 0, ScrubThread, job, 0, nullptr));
+    return job->gen;
+}
+
+void MediaScrubTo(double seconds) {
+    g_scrubTo = seconds;
+    SetEvent(g_scrubWake);
+}
+
+void MediaScrubStop() {
+    g_scrubGen++;
+    SetEvent(g_scrubWake);
 }
