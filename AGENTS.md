@@ -145,6 +145,11 @@ about half the opens took ~140 ms).
 - **The media engine starting up slows a source reader on the same file**: the poster took 240–320 ms
   instead of 40 in about half the opens (missing the 120 ms first-frame wait). So the engine is created
   without a source and `MediaStart` runs when the poster arrives; playback begins ~30 ms later (~335 ms).
+- **Where the engine's ~300 ms go** (1080p H.264 + AAC, from `SetSource`): ~200 ms until
+  `LOADEDMETADATA` (135 ms without an audio track), playing at ~225 ms, first frame pulled at ~285 ms.
+  `MF_MEDIA_ENGINE_REAL_TIME_MODE` changes nothing. Measured for a possible bridge: the poster's reader
+  keeps decoding at ~13 ms per 1080p frame while the engine starts, and `SetCurrentTime(0.4)` before
+  `SetSource` makes the engine start there at no extra cost (its sound then starts 0.4 s in).
 - **`AssocQueryString(…FRIENDLYAPPNAME)` costs 0.5–2.5 ms on every call**, warm (.csv/.log ~2 ms). The
   "Open with …" label is remembered per extension and asked again after the frame is on screen.
 - **Link-time code generation (`/GL`) gained nothing measurable** and grew the exe 3%: the open path's
