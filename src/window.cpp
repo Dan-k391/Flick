@@ -954,6 +954,9 @@ DWORD WINAPI PosterThread(void* p) {
 void OnPoster(int gen, IWICBitmap* frame) {
     if (gen != g_posterGen || g_kind != K_Media) return;
     g_posterDone = true;
+    // The engine starts only now: starting up alongside the poster's source reader, it made the
+    // reader take 240-320 ms instead of 40 in about half the opens.
+    if (!MediaStart()) return ShowInfo();
     if (frame && !g_frame) {  // the engine's own frames win once they flow
         frame->GetSize(&g_posterW, &g_posterH);
         PlaceWindow();
@@ -1093,7 +1096,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
              LoadMarkdown(path)) g_kind = K_Md;
-    else if (HasExt(path, kVideoExt) && MediaOpen(path)) {
+    else if (HasExt(path, kVideoExt) && MediaOpen(path, false)) {  // started by OnPoster
         g_kind = K_Media, g_mediaVideo = true, g_mediaT0 = t0, g_posterDone = false;
         CloseHandle(CreateThread(nullptr, 0, PosterThread, new PosterJob{path, ++g_posterGen}, 0, nullptr));
     }

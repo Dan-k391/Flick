@@ -20,6 +20,7 @@ ComPtr<IMFMediaEngineEx> g_engineEx;
 std::atomic<int> g_pumpGen;  // a pump thread runs while the generation it started with is current
 std::atomic<bool> g_framePending;
 bool g_error;
+std::wstring g_url;  // source of g_engine
 bool g_muted;  // --bench / --mute: tests stay silent
 double g_volume = 1;  // the user's volume and mute, kept for the session
 bool g_userMuted;
@@ -60,7 +61,7 @@ DWORD WINAPI PumpThread(void* gen) {
 
 }  // namespace
 
-bool MediaOpen(const std::wstring& path) {
+bool MediaOpen(const std::wstring& path, bool start) {
     MediaClose();
     static bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     static ComPtr<IMFMediaEngineClassFactory> factory;
@@ -77,10 +78,16 @@ bool MediaOpen(const std::wstring& path) {
     if (FAILED(factory->CreateInstance(0, attrs.Get(), &g_engine))) return false;
     g_engine.As(&g_engineEx);
     g_error = false;
-    BSTR url = SysAllocString(path.c_str());
     g_engine->SetAutoPlay(TRUE);
     g_engine->SetMuted(g_muted || g_userMuted);
     g_engine->SetVolume(g_volume);
+    g_url = path;
+    return !start || MediaStart();
+}
+
+bool MediaStart() {
+    if (!g_engine) return false;
+    BSTR url = SysAllocString(g_url.c_str());
     HRESULT hr = g_engine->SetSource(url);
     SysFreeString(url);
     if (FAILED(hr)) return MediaClose(), false;

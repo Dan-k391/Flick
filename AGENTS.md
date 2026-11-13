@@ -90,6 +90,11 @@ First press after startup: ~35 ms. Idle: ~25 MB private, ~45–55 MB working set
 of PDFs and big images it sits around ~35–55 MB private; after any video ~58 MB (Media Foundation
 keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 
+2026-11-13 (`bench.ps1` only; the tables above were not re-measured): remembering the "Open with"
+label took 0.9–2.4 ms off every warm open (median `ready`: code 7.2 → 5.5, CSV 11.0 → 8.7, 5.6 MB log
+10.6 → 8.2, PNG 4.6 → 3.2, Markdown 4.6 → 3.6 ms); video first frame ~43 ms on every open (before,
+about half the opens took ~140 ms).
+
 ## Conventions
 - C++20, MSVC, `/utf-8`. Win32 + COM via `Microsoft::WRL::ComPtr`. No exceptions thrown by our code.
 - Keep the open path synchronous and short; anything unbounded (shell thumbnails, folder counts)
@@ -137,6 +142,13 @@ keeps ~33 MB of decoder/audio state; only a helper process would give it back).
 - **Media engine first frame takes 200–300 ms** even warm (pipeline + audio endpoint); byte-stream
   sources don't help. A source reader (`MF_LOW_LATENCY`) decodes one frame in ~40 ms on a worker → shown first. Media
   Foundation keeps ~33 MB after the first video; `MFShutdown` per preview made it worse.
+- **The media engine starting up slows a source reader on the same file**: the poster took 240–320 ms
+  instead of 40 in about half the opens (missing the 120 ms first-frame wait). So the engine is created
+  without a source and `MediaStart` runs when the poster arrives; playback begins ~30 ms later (~335 ms).
+- **`AssocQueryString(…FRIENDLYAPPNAME)` costs 0.5–2.5 ms on every call**, warm (.csv/.log ~2 ms). The
+  "Open with …" label is remembered per extension and asked again after the frame is on screen.
+- **Link-time code generation (`/GL`) gained nothing measurable** and grew the exe 3%: the open path's
+  time is in WIC, GDI, DWM and the PDF engine, not in our code.
 - **Workers must stop when a newer preview starts** (they get the current generation and their own):
   stale folder/archive listings piled up to 20 threads and 224 MB in the bench. Folders list
   breadth-first within 60 ms / 10k items so the result lands inside the 120 ms first-frame wait.
