@@ -83,6 +83,8 @@ void PlaceWindow();
 Kind g_kind;
 const Lang* g_lang;
 std::wstring g_path, g_title, g_sub, g_open;
+std::unordered_map<std::wstring, std::wstring> g_openLabels;  // "Open with <app>" per extension
+bool g_openStale;  // g_open came from g_openLabels: PreviewShow asks the shell again after the frame
 std::vector<std::wstring> g_info;
 ComPtr<ID2D1Bitmap> g_bmp;
 UINT g_orient = 1;  // EXIF orientation
@@ -1069,6 +1071,16 @@ void ShowInfo() {
     LoadInfo(g_path, fa, Now());
 }
 
+// Button label for a file: 0.5-2.5 ms of registry lookups, so the open path uses the remembered one.
+std::wstring OpenLabel(const std::wstring& path) {
+    wchar_t app[128];
+    DWORD n = 128;
+    if (SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME,
+                                    PathFindExtensionW(path.c_str()), nullptr, app, &n)) && *app)
+        return std::wstring(L"Open with ") + app;
+    return L"Open";
+}
+
 void LoadContent(const std::wstring& path, LONGLONG t0) {
     ClearContent();
     g_sub.clear();
@@ -1100,11 +1112,9 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
 
     g_open = L"Open";
     if (!dir) {
-        wchar_t app[128];
-        DWORD n = 128;
-        if (SUCCEEDED(AssocQueryStringW(ASSOCF_INIT_IGNOREUNKNOWN, ASSOCSTR_FRIENDLYAPPNAME,
-                                        PathFindExtensionW(path.c_str()), nullptr, app, &n)) && *app)
-            g_open = std::wstring(L"Open with ") + app;
+        auto [it, isNew] = g_openLabels.try_emplace(PathFindExtensionW(path.c_str()));
+        if (isNew) it->second = OpenLabel(path);
+        g_open = it->second, g_openStale = !isNew;
     }
 }
 
@@ -1793,6 +1803,13 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
              : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
+    if (g_openStale) {  // the default app may have changed since the label was remembered
+        g_openStale = false;
+        if (std::wstring now = OpenLabel(g_path); now != g_open) {
+            g_openLabels[PathFindExtensionW(g_path.c_str())] = g_open = now;
+            InvalidateRect(g_hwnd, nullptr, FALSE);
+        }
+    }
     return t;
 }
 
