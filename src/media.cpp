@@ -141,11 +141,14 @@ void MediaToggle() {
     else g_engine->Pause();
 }
 
-void MediaSeek(double seconds) {
+void MediaSeek(double seconds, bool fast) {
     if (!g_engine) return;
-    if (g_engineEx) g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
+    if (g_engineEx)
+        g_engineEx->SetCurrentTimeEx(seconds, fast ? MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE : MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
     else g_engine->SetCurrentTime(seconds);
 }
+
+bool MediaSeeking() { return g_engine && g_engine->IsSeeking(); }
 
 void MediaMute(bool muted) { g_muted = muted; }
 

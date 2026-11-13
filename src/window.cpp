@@ -112,6 +112,8 @@ ComPtr<IWICBitmap> g_frameWic;
 ComPtr<ID2D1Bitmap> g_frame;
 D2D1_RECT_F g_playRc, g_trackRc, g_muteRc, g_volRc;
 double g_shownPos = -1;
+float g_seekFrac = -1;  // while dragging the seek bar: where the knob is (0..1)
+bool g_seekSent = true;  // that position has been sent to the engine
 ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
@@ -958,11 +960,29 @@ void OnPoster(int gen, IWICBitmap* frame) {
     }
 }
 
+void SendSeek(bool fast);
+
+// Dragging: the knob follows the mouse at once; the engine gets a fast (key frame) seek whenever it has
+// finished the previous one, so seeks never queue up. Releasing seeks exactly (EndSeek).
 void SeekAt(float x) {
-    MediaState s = MediaGet();
-    if (s.dur > 0 && g_trackRc.right > g_trackRc.left)
-        MediaSeek(std::clamp((x - g_trackRc.left) / (g_trackRc.right - g_trackRc.left), 0.f, 1.f) * s.dur);
+    if (g_trackRc.right <= g_trackRc.left) return;
+    g_seekFrac = std::clamp((x - g_trackRc.left) / (g_trackRc.right - g_trackRc.left), 0.f, 1.f);
+    g_seekSent = false;
+    SendSeek(true);
     InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+void SendSeek(bool fast) {
+    MediaState s = MediaGet();
+    if (g_seekFrac < 0 || g_seekSent || s.dur <= 0 || (fast && MediaSeeking())) return;
+    MediaSeek(g_seekFrac * s.dur, fast);
+    g_seekSent = fast;  // an exact seek is final
+}
+
+void EndSeek() {
+    g_seekSent = false;
+    SendSeek(false);
+    g_seekFrac = -1;
 }
 
 void VolumeAt(float x) {
@@ -983,6 +1003,7 @@ void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBru
     g_playRc = {x0 + 6, y + 4, x0 + 42, y + 40};
     const wchar_t glyph = s.paused || s.ended ? 0xE768 : 0xE769;  // Segoe Fluent Icons: Play, Pause
     g_rt->DrawText(&glyph, 1, g_fmtGlyph.Get(), g_playRc, text);
+    if (g_seekFrac >= 0) s.pos = g_seekFrac * s.dur;  // dragging: show where the knob is
     std::wstring time = Clock(s.pos) + L" / " + Clock(s.dur);
     g_rt->DrawText(time.c_str(), (UINT32)time.size(), g_fmtTitle.Get(), {x0 + 48, y, x0 + 160, y + h}, text);
     g_trackRc = {x0 + 168, y, x1 - 156, y + h};
@@ -1019,7 +1040,7 @@ void ClearContent() {
     FontClear();
     MediaClose();
     g_frame.Reset(), g_frameWic.Reset();
-    g_mediaVideo = g_seekDrag = false, g_shownPos = -1;
+    g_mediaVideo = g_seekDrag = false, g_shownPos = -1, g_seekFrac = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
     g_natW = g_natH = 0;
     g_gridGen++, g_gridPending = false, g_sizeGen++;
@@ -1506,6 +1527,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_CAPTURECHANGED:
+            if (g_seekDrag) EndSeek();
             g_seekDrag = g_volDrag = false;
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -1548,7 +1570,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             MediaFrameHandled();
             if (g_kind != K_Media || !g_visible) return 0;
             bool repaint = g_mediaVideo && TryFrame();
-            double shown = std::floor(MediaGet().pos * 4);  // progress/time: 4 updates a second
+            if (g_seekDrag) SendSeek(true);  // the last drag position, once the engine is free
+            // Progress: repaint whenever the knob moves a pixel (or the clock a second), not on a fixed tick.
+            MediaState s = MediaGet();
+            double frac = g_seekFrac >= 0 ? g_seekFrac : s.dur > 0 ? s.pos / s.dur : 0;
+            double shown = std::floor(frac * (g_trackRc.right - g_trackRc.left) * g_dpi / 96) * 1e6 + std::floor(s.pos);
             if (shown != g_shownPos) g_shownPos = shown, repaint = true;
             if (repaint) InvalidateRect(h, nullptr, FALSE);
             return 0;

@@ -135,7 +135,8 @@ bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWIC
 void MediaFrameHandled();
 void MediaOnEvent(DWORD event);
 void MediaToggle();
-void MediaSeek(double seconds);
+void MediaSeek(double seconds, bool fast = false);  // fast: nearest key frame (while dragging)
+bool MediaSeeking();
 void MediaMute(bool muted);  // for tests
 void MediaSetVolume(double v);  // 0..1, kept for the session
 double MediaVolume();           // 0 while muted
