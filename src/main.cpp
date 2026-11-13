@@ -20,6 +20,7 @@ namespace {
 LONGLONG g_freq;
 HANDLE g_logFile = INVALID_HANDLE_VALUE;
 bool g_spaceDown;
+std::atomic<bool> g_disabled;  // tray menu "Disable": Space does nothing until enabled again
 
 bool ClassIs(HWND h, const wchar_t* name) {
     wchar_t cls[64];
@@ -46,7 +47,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
         bool down = wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN;
         if (k->vkCode == VK_SPACE) {
             // Ignore auto-repeat: act only on the first key-down.
-            if (down && !g_spaceDown && !Down(VK_CONTROL) && !Down(VK_SHIFT) && !Down(VK_MENU) &&
+            if (down && !g_spaceDown && !g_disabled && !Down(VK_CONTROL) && !Down(VK_SHIFT) && !Down(VK_MENU) &&
                 !Down(VK_LWIN) && !Down(VK_RWIN))
                 if (HWND ex = ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_TOGGLE, (WPARAM)ex, Now());
             g_spaceDown = down;
@@ -147,7 +148,7 @@ int Bench(int argc, wchar_t** argv) {
     return 0;
 }
 
-// Notification-area icon: right- or left-click opens a menu with "Start at sign-in" and "Quit".
+// Notification-area icon: right- or left-click opens a menu with "Disable", "Start at sign-in" and "Quit".
 // Sign-in start is the HKCU Run value "Flick", pointing at this exe.
 constexpr UINT WM_TRAY = WM_APP + 100;
 const wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -176,6 +177,7 @@ LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     if (m == taskbarCreated) Shell_NotifyIconW(NIM_ADD, &g_tray);  // Explorer restarted
     if (m == WM_TRAY && (l == WM_RBUTTONUP || l == WM_LBUTTONUP)) {
         HMENU menu = CreatePopupMenu();
+        AppendMenuW(menu, MF_STRING | (g_disabled ? MF_CHECKED : 0), 3, L"Disable");
         AppendMenuW(menu, MF_STRING | (StartsAtSignIn() ? MF_CHECKED : 0), 1, L"Start at sign-in");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, 2, L"Quit Flick");
@@ -186,6 +188,11 @@ LRESULT CALLBACK TrayProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         DestroyMenu(menu);
         if (cmd == 1) SetStartAtSignIn(!StartsAtSignIn());
         if (cmd == 2) PostMessageW(g_hwnd, WM_FLICK_QUIT, 0, 0);
+        if (cmd == 3) {
+            g_disabled = !g_disabled;
+            wcscpy_s(g_tray.szTip, g_disabled ? L"Flick (disabled)" : L"Flick: select a file in Explorer and press Space");
+            Shell_NotifyIconW(NIM_MODIFY, &g_tray);
+        }
         return 0;
     }
     return DefWindowProcW(h, m, w, l);
