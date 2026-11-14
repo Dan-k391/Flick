@@ -116,6 +116,8 @@ about half the opens took ~140 ms).
 - **Finding the Explorer tab via `IShellWindows` is slow** (10–60 ms, worse while Explorer is busy).
   Cache the `IShellBrowser` of the focused tab; validate with `IsChild(tab, focus)`.
 - **A visible Scintilla makes `SCI_SETTEXT` ~3 ms** (scrollbar/layout updates); hidden: 0.1 ms.
+  But a hidden Scintilla skips scrollbar updates entirely: `Layout` sends it `WM_SIZE` after showing it, and
+  `SCI_SETSCROLLWIDTH 1` per file (width tracking only grows), else bars are left over from the previous file.
 - **JPEG decode is dominated by entropy decoding**: DCT scaling (`IWICBitmapSourceTransform`) helps
   only ~30%. Decode to window size, not monitor size; re-decode on `WM_EXITSIZEMOVE`.
 - Shell thumbnails are 5–60 ms and unbounded for slow handlers → async.
