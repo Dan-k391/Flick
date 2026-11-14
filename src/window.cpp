@@ -362,6 +362,7 @@ bool LoadText(const std::wstring& path) {
     }
     StyleSci();
     Sci(SCI_SETREADONLY, 0);
+    Sci(SCI_SETSCROLLWIDTH, 1);  // width tracking only grows: start again from this file's lines
     Sci(SCI_SETTEXT, 0, (sptr_t)buf.c_str());
     Sci(SCI_SETREADONLY, 1);
     sptr_t lines = Sci(SCI_GETLINECOUNT);
@@ -1134,8 +1135,10 @@ void Layout() {
         DwmExtendFrameIntoClientArea(g_hwnd, &m);
         glassTop = want;
     }
-    if (g_kind == K_Text)
+    if (g_kind == K_Text) {
         SetWindowPos(g_sci, nullptr, 0, top, rc.right, rc.bottom - top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        SendMessageW(g_sci, WM_SIZE, 0, 0);  // Scintilla skips scrollbar updates while hidden (text loads hidden)
+    }
     else
         ShowWindow(g_sci, SW_HIDE);
 }
