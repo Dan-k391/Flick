@@ -24,6 +24,7 @@ enum : UINT {
     WM_FLICK_SIZE,                 // sent by the folder-size worker (lParam = SizeMsg*)
     WM_FLICK_SCRUB,                // sent by the scrub worker (wParam = gen, lParam = IWICBitmap* frame)
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
+    WM_FLICK_FIND,                 // Ctrl+F in Explorer while a text preview is open
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -52,6 +53,7 @@ bool PreviewInit(HINSTANCE);
 Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0);
 void PreviewHide(bool restoreFocus);
 bool PreviewVisible();
+bool PreviewCanFind();  // a text preview is showing (Ctrl+F opens its search field)
 bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;
 

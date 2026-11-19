@@ -52,6 +52,10 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
                 if (HWND ex = ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_TOGGLE, (WPARAM)ex, Now());
             g_spaceDown = down;
         } else if (PreviewVisible()) {
+            if (k->vkCode == 'F' && down && Down(VK_CONTROL) && PreviewCanFind() && ExplorerWithItemFocus()) {
+                PostMessageW(g_hwnd, WM_FLICK_FIND, 0, 0);
+                return 1;  // not Explorer's search box
+            }
             if (k->vkCode == VK_ESCAPE && down) {
                 if (ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_HIDE, 0, 0);
             } else if (!down && ((k->vkCode >= VK_PRIOR && k->vkCode <= VK_DOWN) || k->vkCode == VK_TAB)) {

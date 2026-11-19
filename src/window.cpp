@@ -37,7 +37,7 @@ constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
 enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font, K_Media };
-enum Hot { H_None, H_Open, H_Close };
+enum Hot { H_None, H_Open, H_Close, H_Find, H_FindPrev, H_FindNext };
 
 struct Palette {
     COLORREF role[R_Count];
@@ -141,6 +141,32 @@ std::vector<std::pair<float, float>> g_pages;  // points
 std::vector<ComPtr<ID2D1Bitmap>> g_pageBmp;
 std::vector<UINT> g_pageW;  // pixel width each page was last rendered at (0 = never)
 
+// Find in text (Ctrl+F): a search field in the title bar. Every match gets one indicator, the current
+// match a stronger one. Searching runs on every keystroke (Scintilla search, at most kMaxHits matches).
+constexpr int kHitIndic = 8, kCurIndic = 9, kMaxHits = 10000;
+bool g_findOn, g_findTookFocus;
+std::wstring g_query;
+std::vector<std::pair<sptr_t, sptr_t>> g_hits;
+int g_hit = -1;
+D2D1_RECT_F g_findRc, g_findPrevRc, g_findNextRc;
+std::atomic<bool> g_canFind;  // read by the keyboard hook: a text preview is showing
+
+// Pictures: the wheel zooms around the mouse (1 = fitted to the window), dragging pans. Zooming past the
+// decoded size re-decodes the pixels needed once the wheel rests (kZoomTimer).
+constexpr UINT_PTR kGifTimer = 1, kZoomTimer = 2;
+float g_zoom = 1, g_panX, g_panY;  // pan: offset of the picture's centre from the area's centre, DIPs
+bool g_panDrag;
+POINT g_panAt;
+double g_decodeScale;  // > 0: LoadImage decodes at this fraction of full size (zoomed in)
+
+// Animated GIF: frames are composed onto a canvas (GIF disposal rules) on a timer.
+struct Gif {
+    ComPtr<IWICBitmapDecoder> dec;
+    UINT frames = 0, index = 0, w = 0, h = 0, prevDisposal = 0;
+    WICRect prevRc{};
+    std::vector<BYTE> canvas, saved;  // 32bpp PBGRA
+} g_gif;
+
 bool g_warming = true;
 void Cloak(BOOL on) { DwmSetWindowAttribute(g_hwnd, DWMWA_CLOAK, &on, sizeof on); }
 
@@ -176,6 +202,13 @@ void StyleSci() {
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_BACK, p.sel | 0xFF000000);
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_SELECTION_INACTIVE_BACK, p.sel | 0xFF000000);
     Sci(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET, p.role[R_Default] | 0xFF000000);
+    for (int i : {kHitIndic, kCurIndic}) {  // find: orange boxes under the text
+        Sci(SCI_INDICSETSTYLE, i, INDIC_ROUNDBOX);
+        Sci(SCI_INDICSETFORE, i, Hex(0xEA5C00));
+        Sci(SCI_INDICSETUNDER, i, 1);
+        Sci(SCI_INDICSETALPHA, i, i == kCurIndic ? 200 : g_dark ? 80 : 60);
+        Sci(SCI_INDICSETOUTLINEALPHA, i, i == kCurIndic ? 255 : 0);
+    }
 }
 
 void ApplyTheme() {
@@ -238,13 +271,84 @@ void PictureArea(double& w, double& h) {
     w = std::max(64.0, w), h = std::max(64.0, h);
 }
 
+UINT MetaUInt(IWICMetadataQueryReader* q, const wchar_t* name) {
+    PROPVARIANT pv;
+    PropVariantInit(&pv);
+    UINT v = 0;
+    if (q && SUCCEEDED(q->GetMetadataByName(name, &pv)))
+        v = pv.vt == VT_UI1 ? pv.bVal : pv.vt == VT_UI2 ? pv.uiVal : pv.vt == VT_UI4 ? pv.ulVal : 0;
+    PropVariantClear(&pv);
+    return v;
+}
+
+// Composes GIF frame g_gif.index onto the canvas and shows it; returns its delay in ms (0: failed).
+UINT GifFrame() {
+    Gif& g = g_gif;
+    auto clear = [&](const WICRect& r) {
+        for (INT y = std::max(0, r.Y); y < std::min((INT)g.h, r.Y + r.Height); y++)
+            for (INT x = std::max(0, r.X); x < std::min((INT)g.w, r.X + r.Width); x++)
+                memset(&g.canvas[((size_t)y * g.w + x) * 4], 0, 4);
+    };
+    if (g.index == 0) std::fill(g.canvas.begin(), g.canvas.end(), BYTE(0));  // (re)start: empty canvas
+    else if (g.prevDisposal == 2) clear(g.prevRc);                          // 2: back to background
+    else if (g.prevDisposal == 3 && !g.saved.empty()) g.canvas = g.saved;   // 3: back to what was under it
+    ComPtr<IWICBitmapFrameDecode> f;
+    ComPtr<IWICMetadataQueryReader> q;
+    ComPtr<IWICFormatConverter> conv;
+    UINT fw, fh;
+    if (FAILED(g.dec->GetFrame(g.index, &f)) || FAILED(f->GetSize(&fw, &fh))) return 0;
+    f->GetMetadataQueryReader(&q);
+    WICRect r{(INT)MetaUInt(q.Get(), L"/imgdesc/Left"), (INT)MetaUInt(q.Get(), L"/imgdesc/Top"), (INT)fw, (INT)fh};
+    UINT disposal = MetaUInt(q.Get(), L"/grctlext/Disposal"), delay = MetaUInt(q.Get(), L"/grctlext/Delay");
+    if (disposal == 3) g.saved = g.canvas;
+    std::vector<BYTE> px((size_t)fw * fh * 4);
+    if (FAILED(g_wic->CreateFormatConverter(&conv)) ||
+        FAILED(conv->Initialize(f.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                WICBitmapPaletteTypeCustom)) ||
+        FAILED(conv->CopyPixels(nullptr, fw * 4, (UINT)px.size(), px.data())))
+        return 0;
+    for (UINT y = 0; y < fh; y++)  // GIF transparency is all or nothing: copy the opaque pixels
+        for (UINT x = 0; x < fw; x++)
+            if (UINT cx = r.X + x, cy = r.Y + y; cx < g.w && cy < g.h && px[((size_t)y * fw + x) * 4 + 3])
+                memcpy(&g.canvas[((size_t)cy * g.w + cx) * 4], &px[((size_t)y * fw + x) * 4], 4);
+    g.prevRc = r, g.prevDisposal = disposal;
+    ComPtr<IWICBitmap> bmp;
+    if (FAILED(g_wic->CreateBitmapFromMemory(g.w, g.h, GUID_WICPixelFormat32bppPBGRA, g.w * 4, (UINT)g.canvas.size(),
+                                             g.canvas.data(), &bmp)) ||
+        !(g_bmp = ToD2D(bmp.Get())))
+        return 0;
+    return delay < 2 ? 100 : delay * 10;  // like browsers: 0-1 (hundredths) means 100 ms
+}
+
+bool LoadGif(IWICBitmapDecoder* dec, UINT frames) {
+    ComPtr<IWICMetadataQueryReader> q;
+    dec->GetMetadataQueryReader(&q);
+    Gif& g = g_gif;
+    g.dec = dec, g.frames = frames, g.index = 0, g.prevDisposal = 0;
+    g.w = MetaUInt(q.Get(), L"/logscrdesc/Width"), g.h = MetaUInt(q.Get(), L"/logscrdesc/Height");
+    if (!g.w || !g.h || (UINT64)g.w * g.h > 64 << 20) return g = {}, false;
+    g.canvas.assign((size_t)g.w * g.h * 4, 0);
+    UINT delay = GifFrame();
+    if (!delay) return g = {}, false;
+    g_orient = 1, g_imgReduced = false;
+    g_natW = (float)g.w, g_natH = (float)g.h;
+    g_sub = std::to_wstring(g.w) + L" × " + std::to_wstring(g.h) + L" · " + std::to_wstring(frames) + L" frames";
+    SetTimer(g_hwnd, kGifTimer, delay, nullptr);
+    return true;
+}
+
 bool LoadImage(const std::wstring& path) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
+    GUID container{};
+    UINT frames = 0;
     if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
-                                                &dec)) ||
-        FAILED(dec->GetFrame(0, &frame)))
+                                                &dec)))
         return false;
+    if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
+        SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
+        return true;
+    if (FAILED(dec->GetFrame(0, &frame))) return false;
     UINT w, h;
     frame->GetSize(&w, &h);
     g_orient = 1;
@@ -261,7 +365,7 @@ bool LoadImage(const std::wstring& path) {
     double maxW, maxH;
     PictureArea(maxW, maxH);
     if (g_orient >= 5) std::swap(maxW, maxH);
-    double s = std::min({1.0, maxW / w, maxH / h});
+    double s = g_decodeScale > 0 ? std::min(1.0, g_decodeScale) : std::min({1.0, maxW / w, maxH / h});
     g_imgReduced = s < 1;
     ComPtr<IWICBitmapSource> src = frame;
     if (s < 1) {
@@ -362,7 +466,15 @@ bool LoadText(const std::wstring& path) {
     }
     StyleSci();
     Sci(SCI_SETREADONLY, 0);
-    Sci(SCI_SETSCROLLWIDTH, 1);  // width tracking only grows: start again from this file's lines
+    // Horizontal extent from the first lines (columns x digit width): with it the horizontal scrollbar is right
+    // before the first paint. Width tracking (only grows) widens it as further lines are drawn.
+    size_t cols = 0, most = 0, rows = 0;
+    for (size_t i = 0; i < buf.size() && rows < 200; i++)
+        if (char c = buf[i]; c == '\n') most = std::max(most, cols), cols = 0, rows++;
+        else if (c == '\t') cols = cols / 4 * 4 + 4;
+        else cols += (c & 0xC0) != 0x80;  // UTF-8 lead bytes only
+    most = std::max(most, cols);
+    Sci(SCI_SETSCROLLWIDTH, std::max<sptr_t>(1, (sptr_t)most * Sci(SCI_TEXTWIDTH, STYLE_DEFAULT, (sptr_t)"0")));
     Sci(SCI_SETTEXT, 0, (sptr_t)buf.c_str());
     Sci(SCI_SETREADONLY, 1);
     sptr_t lines = Sci(SCI_GETLINECOUNT);
@@ -1061,6 +1173,10 @@ void ClearContent() {
     g_mediaVideo = g_seekDrag = g_seekResume = false, g_shownPos = -1, g_seekFrac = -1;
     g_posterGen++, g_posterW = g_posterH = 0;
     g_natW = g_natH = 0;
+    KillTimer(g_hwnd, kGifTimer), KillTimer(g_hwnd, kZoomTimer);
+    g_gif = {};
+    g_zoom = 1, g_panX = g_panY = 0, g_panDrag = false;
+    g_findOn = false, g_hits.clear(), g_hit = -1;
     g_gridGen++, g_gridPending = false, g_sizeGen++;
     for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
     g_kind = K_None;
@@ -1137,19 +1253,68 @@ void Layout() {
     }
     if (g_kind == K_Text) {
         SetWindowPos(g_sci, nullptr, 0, top, rc.right, rc.bottom - top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        SendMessageW(g_sci, WM_SIZE, 0, 0);  // Scintilla skips scrollbar updates while hidden (text loads hidden)
-    }
-    else
+    } else
         ShowWindow(g_sci, SW_HIDE);
+}
+
+D2D1_RECT_F ImageArea() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    return {0, kTitleH, Dip(rc.right), Dip(rc.bottom)};
+}
+
+// Size the picture is shown at without zoom (upright, DIPs): 1 image pixel = 1 DIP (so scaled up with the
+// display scaling), shrunk to fit the area.
+D2D1_SIZE_F FitSize(const D2D1_RECT_F& area) {
+    D2D1_SIZE_F s = g_bmp->GetSize();
+    bool swap = g_orient >= 5;
+    float dw = g_natW > 0 ? g_natW : swap ? s.height : s.width, dh = g_natH > 0 ? g_natH : swap ? s.width : s.height;
+    float fit = std::min({1.f, (area.right - area.left) / dw, (area.bottom - area.top) / dh});
+    return {dw * fit, dh * fit};
+}
+
+// Keeps a zoomed picture covering the area: no empty margin on a side it overflows.
+void ClampPan() {
+    D2D1_RECT_F a = ImageArea();
+    D2D1_SIZE_F f = FitSize(a);
+    float mx = std::max(0.f, (f.width * g_zoom - (a.right - a.left)) / 2);
+    float my = std::max(0.f, (f.height * g_zoom - (a.bottom - a.top)) / 2);
+    g_panX = std::clamp(g_panX, -mx, mx), g_panY = std::clamp(g_panY, -my, my);
+}
+
+void ZoomAt(float mx, float my, float factor) {
+    D2D1_RECT_F a = ImageArea();
+    float cx = (a.left + a.right) / 2, cy = (a.top + a.bottom) / 2;
+    float most = std::max(1.f, 16 * g_natW / FitSize(a).width);  // up to 16 DIPs per image pixel
+    float z = std::clamp(g_zoom * factor, 1.f, most), r = z / g_zoom;
+    g_panX = mx - (mx - (cx + g_panX)) * r - cx;  // the point under the mouse stays under it
+    g_panY = my - (my - (cy + g_panY)) * r - cy;
+    g_zoom = z;
+    ClampPan();
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    SetTimer(g_hwnd, kZoomTimer, 150, nullptr);
+}
+
+// The wheel rested: if the zoomed view shows more pixels than were decoded, decode them.
+// shortcut: decodes the whole picture on the UI thread (24 MP JPEG ~150 ms, ~96 MB at full size);
+// decode only the visible part on a worker if that hitch or the memory matters.
+void Sharpen() {
+    KillTimer(g_hwnd, kZoomTimer);
+    if (g_kind != K_Image || !g_imgReduced || g_gif.dec || HasExt(g_path, L" .svg .svgz ")) return;
+    D2D1_SIZE_F s = g_bmp->GetSize();
+    double have = (g_orient >= 5 ? s.height : s.width) * g_dpi / 96 / g_natW;  // decoded fraction of full width
+    double need = FitSize(ImageArea()).width * g_zoom * g_dpi / 96 / g_natW;
+    if (need <= have * 1.1) return;
+    g_decodeScale = need;
+    LoadImage(g_path);
+    g_decodeScale = 0;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 void DrawImage(const D2D1_RECT_F& area) {
     D2D1_SIZE_F s = g_bmp->GetSize();
     bool swap = g_orient >= 5;
-    // Shown at 1 image pixel = 1 DIP (so scaled up with the display scaling), shrunk to fit the area.
-    float dw = g_natW > 0 ? g_natW : swap ? s.height : s.width, dh = g_natH > 0 ? g_natH : swap ? s.width : s.height;
-    float fit = std::min({1.f, (area.right - area.left) / dw, (area.bottom - area.top) / dh});
-    float k = dw * fit / (swap ? s.height : s.width);  // bitmap DIPs -> shown DIPs
+    float k = FitSize(area).width * g_zoom / (swap ? s.height : s.width);  // bitmap DIPs -> shown DIPs
     D2D1::Matrix3x2F m = D2D1::Matrix3x2F::Identity();
     switch (g_orient) {
         case 2: m = D2D1::Matrix3x2F::Scale(-1, 1); break;
@@ -1160,11 +1325,15 @@ void DrawImage(const D2D1_RECT_F& area) {
         case 7: m = D2D1::Matrix3x2F(0, -1, -1, 0, 0, 0); break;
         case 8: m = D2D1::Matrix3x2F::Rotation(270); break;
     }
-    float cx = std::round((area.left + area.right) / 2), cy = std::round((area.top + area.bottom) / 2);
+    float cx = std::round((area.left + area.right) / 2 + g_panX), cy = std::round((area.top + area.bottom) / 2 + g_panY);
+    g_rt->PushAxisAlignedClip(area, D2D1_ANTIALIAS_MODE_ALIASED);  // zoomed: not over the title bar
     g_rt->SetTransform(m * D2D1::Matrix3x2F::Translation(cx, cy));
     float hw = s.width * k / 2, hh = s.height * k / 2;
-    g_rt->DrawBitmap(g_bmp.Get(), {-hw, -hh, hw, hh}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+    // Zoomed far in: show the pixels as squares rather than a blur.
+    g_rt->DrawBitmap(g_bmp.Get(), {-hw, -hh, hw, hh}, 1,
+                     k * g_dpi / 96 > 3 ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
     g_rt->SetTransform(D2D1::Matrix3x2F::Identity());
+    g_rt->PopAxisAlignedClip();
 }
 
 void DrawInfo(const D2D1_RECT_F& area, ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* sub) {
@@ -1260,6 +1429,146 @@ void SideClick(float y) {
     }
 }
 
+// ---- Find in text
+void FindShow(int i) {
+    sptr_t len = Sci(SCI_GETLENGTH);
+    Sci(SCI_SETINDICATORCURRENT, kCurIndic);
+    Sci(SCI_INDICATORCLEARRANGE, 0, len);
+    g_hit = g_hits.empty() ? -1 : (i % (int)g_hits.size() + (int)g_hits.size()) % (int)g_hits.size();
+    if (g_hit >= 0) {
+        auto [a, b] = g_hits[g_hit];
+        Sci(SCI_INDICATORFILLRANGE, a, b - a);
+        sptr_t line = Sci(SCI_LINEFROMPOSITION, a), first = Sci(SCI_GETFIRSTVISIBLELINE), n = Sci(SCI_LINESONSCREEN);
+        if (line < first || line >= first + n) Sci(SCI_SETFIRSTVISIBLELINE, std::max<sptr_t>(0, line - n / 3));
+        Sci(SCI_SCROLLRANGE, a, b);  // sideways, if the match is off to the right
+    }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Finds every match of g_query; the current one is the first at or after the previous current match
+// (or the top of the view), so typing more letters stays in place.
+void FindRun() {
+    sptr_t len = Sci(SCI_GETLENGTH);
+    sptr_t from = g_hit >= 0 ? g_hits[g_hit].first : Sci(SCI_POSITIONFROMLINE, Sci(SCI_GETFIRSTVISIBLELINE));
+    Sci(SCI_SETINDICATORCURRENT, kHitIndic);
+    Sci(SCI_INDICATORCLEARRANGE, 0, len);
+    g_hits.clear();
+    std::string q = ToUtf8(g_query.c_str(), (int)g_query.size());
+    Sci(SCI_SETSEARCHFLAGS, 0);  // case-insensitive
+    for (sptr_t at = 0; !q.empty() && g_hits.size() < kMaxHits;) {
+        Sci(SCI_SETTARGETRANGE, at, len);
+        sptr_t a = Sci(SCI_SEARCHINTARGET, q.size(), (sptr_t)q.c_str());
+        if (a < 0) break;
+        sptr_t b = Sci(SCI_GETTARGETEND);
+        g_hits.push_back({a, b});
+        Sci(SCI_INDICATORFILLRANGE, a, b - a);
+        at = std::max(b, a + 1);
+    }
+    auto next = std::lower_bound(g_hits.begin(), g_hits.end(), std::pair<sptr_t, sptr_t>{from, 0});
+    FindShow(next == g_hits.end() ? 0 : (int)(next - g_hits.begin()));
+}
+
+void FindOpen() {
+    if (g_kind != K_Text || !g_visible) return;
+    g_findOn = true;
+    if (GetForegroundWindow() != g_hwnd && g_source) {
+        // Typing needs the keyboard. Explorer has it; a key event of our own lets us take the foreground.
+        INPUT alt[2]{{INPUT_KEYBOARD}, {INPUT_KEYBOARD}};
+        alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU, alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
+        SendInput(1, &alt[0], sizeof(INPUT));
+        SetForegroundWindow(g_hwnd);
+        SendInput(1, &alt[1], sizeof(INPUT));
+        g_findTookFocus = true;
+    }
+    FindRun();
+}
+
+void FindClose() {
+    g_findOn = false, g_hits.clear(), g_hit = -1;
+    sptr_t len = Sci(SCI_GETLENGTH);
+    for (int i : {kHitIndic, kCurIndic}) Sci(SCI_SETINDICATORCURRENT, i), Sci(SCI_INDICATORCLEARRANGE, 0, len);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+    if (g_findTookFocus && GetForegroundWindow() == g_hwnd && IsWindow(g_source)) SetForegroundWindow(g_source);
+    g_findTookFocus = false;
+}
+
+// Keys while the find field is open: typing edits the query, Enter/F3 step through matches (Shift: back),
+// Esc closes. Other keys (scrolling) go on to Scintilla.
+bool FindKey(const MSG& m) {
+    bool shift = GetKeyState(VK_SHIFT) < 0, ctrl = GetKeyState(VK_CONTROL) < 0;
+    if (m.message == WM_CHAR) {
+        if (m.wParam < 0x20) return true;
+        g_query += (wchar_t)m.wParam;
+        return FindRun(), true;
+    }
+    if (m.message != WM_KEYDOWN) return false;
+    switch (m.wParam) {
+        case VK_ESCAPE: FindClose(); return true;
+        case VK_RETURN:
+        case VK_F3: FindShow(g_hit + (shift ? -1 : 1)); return true;
+        case VK_BACK:
+            if (!g_query.empty()) g_query.resize(ctrl ? 0 : g_query.size() - 1 - IS_LOW_SURROGATE(g_query.back())), FindRun();
+            return true;
+        case 'V':
+            if (!ctrl || !OpenClipboard(g_hwnd)) return false;
+            if (HANDLE h = GetClipboardData(CF_UNICODETEXT))
+                if (auto* t = (const wchar_t*)GlobalLock(h)) {
+                    for (; *t && *t != '\r' && *t != '\n'; t++) g_query += *t;  // first line only
+                    GlobalUnlock(h);
+                }
+            CloseClipboard();
+            return FindRun(), true;
+        case 'F': return ctrl;
+        case VK_SPACE: g_query += L' '; return FindRun(), true;  // not "close the preview"
+    }
+    return false;
+}
+
+// The search field (Windows 11 text box: accent underline while typing), left of the Open button.
+void DrawFind(float top, ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* sub, ID2D1SolidColorBrush* fill) {
+    const Palette& p = Pal();
+    float right = g_openRc.left - 8, w = std::min(300.f, right - kPad - 140);
+    g_findRc = {right - w, top, right, top + kBtnH};
+    D2D1_ROUNDED_RECT rr{{g_findRc.left + .5f, g_findRc.top + .5f, g_findRc.right - .5f, g_findRc.bottom - .5f}, 4, 4};
+    fill->SetColor(p.btn);
+    g_rt->FillRoundedRectangle(rr, fill);
+    fill->SetColor(p.btnBorder);
+    g_rt->DrawRoundedRectangle(rr, fill);
+    g_rt->PushAxisAlignedClip(g_findRc, D2D1_ANTIALIAS_MODE_ALIASED);
+    fill->SetColor(p.link);  // accent underline, inside the rounded corners
+    g_rt->FillRectangle({g_findRc.left + 3, g_findRc.bottom - 2, g_findRc.right - 3, g_findRc.bottom}, fill);
+    const wchar_t glass = 0xE721, up = 0xE70E, down = 0xE70D;  // Segoe Fluent Icons: Search, ChevronUp/Down
+    g_rt->DrawText(&glass, 1, g_fmtIcon.Get(), {g_findRc.left + 6, top, g_findRc.left + 28, top + kBtnH}, sub);
+    g_findNextRc = {right - 26, top, right - 2, top + kBtnH};
+    g_findPrevRc = {right - 50, top, right - 26, top + kBtnH};
+    for (auto [glyph, rc, hot] : {std::tuple{up, g_findPrevRc, H_FindPrev}, std::tuple{down, g_findNextRc, H_FindNext}}) {
+        if (g_hot == hot) fill->SetColor(p.btnHot), g_rt->FillRoundedRectangle({{rc.left + 2, rc.top + 4, rc.right - 2, rc.bottom - 4}, 3, 3}, fill);
+        g_rt->DrawText(&glyph, 1, g_fmtIcon.Get(), rc, g_hits.empty() ? sub : text);
+    }
+    // Match count right-aligned before the arrows; the query (or a placeholder) fills what is left.
+    std::wstring count = g_query.empty() ? L"" : g_hits.empty() ? L"No results"
+        : std::to_wstring(g_hit + 1) + L" / " + std::to_wstring(g_hits.size()) + (g_hits.size() >= kMaxHits ? L"+" : L"");
+    ComPtr<IDWriteTextLayout> cl, ql;
+    g_dw->CreateTextLayout(count.c_str(), (UINT32)count.size(), g_fmtTitle.Get(), 200, kBtnH, &cl);
+    DWRITE_TEXT_METRICS cm{};
+    cl->GetMetrics(&cm);
+    float countLeft = g_findPrevRc.left - 4 - cm.width;
+    g_rt->DrawTextLayout({countLeft, top}, cl.Get(), sub);
+    bool empty = g_query.empty();
+    const std::wstring& q = empty ? std::wstring(L"Find") : g_query;
+    float qx = g_findRc.left + 30, qw = std::max(0.f, countLeft - 8 - qx);
+    g_dw->CreateTextLayout(q.c_str(), (UINT32)q.size(), g_fmtTitle.Get(), 1000, kBtnH, &ql);
+    DWRITE_TEXT_METRICS qm{};
+    ql->GetMetrics(&qm);
+    float shift = std::max(0.f, qm.widthIncludingTrailingWhitespace - qw);  // long query: keep its end in view
+    g_rt->PushAxisAlignedClip({qx, top, qx + qw, top + kBtnH}, D2D1_ANTIALIAS_MODE_ALIASED);
+    g_rt->DrawTextLayout({qx - shift, top}, ql.Get(), empty ? sub : text);
+    g_rt->PopAxisAlignedClip();
+    float caret = std::round(qx + (empty ? 0 : qm.widthIncludingTrailingWhitespace - shift)) + .5f;
+    g_rt->DrawLine({caret, top + 7}, {caret, top + kBtnH - 7}, text);
+    g_rt->PopAxisAlignedClip();
+}
+
 void Paint() {
     if (!g_rt) CreateTarget();
     const Palette& p = Pal();
@@ -1296,13 +1605,15 @@ void Paint() {
     g_rt->DrawRoundedRectangle(rr, fill.Get());
     g_rt->DrawTextLayout({g_openRc.left + 12, top}, label.Get(), text.Get());
 
+    if (g_findOn) DrawFind(top, text.Get(), sub.Get(), fill.Get());
+
     // Title: file name + dimmed details, trimmed with an ellipsis.
     if (g_kind == K_Pdf && !g_pdfFailed && g_pages.size() > 1)  // reading position: "3 / 94"
         g_sub = std::to_wstring(CurrentItem() + 1) + L" / " + std::to_wstring(g_pages.size());
     std::wstring title = g_title + (g_sub.empty() ? L"" : L"    " + g_sub);
     ComPtr<IDWriteTextLayout> tl;
     g_dw->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_fmtTitle.Get(),
-                           std::max(0.f, g_openRc.left - 16 - kPad), kTitleH, &tl);
+                           std::max(0.f, (g_findOn ? g_findRc.left : g_openRc.left) - 16 - kPad), kTitleH, &tl);
     if (!g_sub.empty()) tl->SetDrawingEffect(sub.Get(), {(UINT32)g_title.size(), (UINT32)(title.size() - g_title.size())});
     g_rt->DrawTextLayout({kPad, 0}, tl.Get(), text.Get());
 
@@ -1401,6 +1712,7 @@ Hot HitButton(LPARAM l) {
     auto in = [&](const D2D1_RECT_F& r) {
         return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom;
     };
+    if (g_findOn && in(g_findRc)) return in(g_findPrevRc) ? H_FindPrev : in(g_findNextRc) ? H_FindNext : H_Find;
     return in(g_closeRc) ? H_Close : in(g_openRc) ? H_Open : H_None;
 }
 
@@ -1497,6 +1809,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            if (g_kind == K_Image && g_bmp && m == WM_MOUSEWHEEL) {
+                POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ScreenToClient(h, &pt);
+                ZoomAt(Dip(pt.x), Dip(pt.y), std::pow(1.25f, GET_WHEEL_DELTA_WPARAM(w) / (float)WHEEL_DELTA));
+                return 0;
+            }
             if (Scrollable()) {  // Shift+wheel or a tilt wheel scrolls sideways
                 bool sideways = m == WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(w) & MK_SHIFT);
                 UINT lines = 3;
@@ -1510,6 +1828,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_MOUSEMOVE: {
             if (g_dragAxis >= 0) return DragThumb(l), 0;
+            if (g_panDrag) {
+                g_panX += Dip(GET_X_LPARAM(l) - g_panAt.x), g_panY += Dip(GET_Y_LPARAM(l) - g_panAt.y);
+                g_panAt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClampPan();
+                InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
             if (g_seekDrag) return SeekAt(Dip(GET_X_LPARAM(l))), 0;
             if (g_volDrag) return VolumeAt(Dip(GET_X_LPARAM(l))), 0;
             if (!g_mouseIn && g_kind == K_Media) g_mouseIn = true, InvalidateRect(h, nullptr, FALSE);
@@ -1528,6 +1853,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (Dip(GET_X_LPARAM(l)) < SideW() - kBarHit && Dip(GET_Y_LPARAM(l)) > kTitleH)
                 return SideClick(Dip(GET_Y_LPARAM(l))), 0;
             g_sideFocus = false;
+            if (g_kind == K_Image && g_zoom > 1 && Dip(GET_Y_LPARAM(l)) > kTitleH) {  // drag the zoomed picture
+                g_panDrag = true, g_panAt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                SetCapture(h);
+                return 0;
+            }
             if (g_kind == K_Media) {
                 D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
                 auto in = [&](const D2D1_RECT_F& r) { return pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom; };
@@ -1556,16 +1886,39 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_CAPTURECHANGED:
             if (g_seekDrag) EndSeek();
-            g_seekDrag = g_volDrag = false;
+            g_seekDrag = g_volDrag = g_panDrag = false;
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
-            if (g_dragAxis >= 0 || g_seekDrag || g_volDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            if (g_dragAxis >= 0 || g_seekDrag || g_volDrag || g_panDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            else if (HitButton(l) == H_FindPrev) FindShow(g_hit - 1);
+            else if (HitButton(l) == H_FindNext) FindShow(g_hit + 1);
             else if (HitButton(l) == H_Close) PreviewHide(true);
             else if (HitButton(l) == H_Open) OpenFile(false);
             return 0;
         case WM_RBUTTONUP:
             if (HitButton(l) == H_Open && g_kind != K_Info) OpenFile(true);
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(l) == HTCLIENT && g_kind == K_Image && g_zoom > 1)
+                return SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)), TRUE;
+            if (LOWORD(l) == HTCLIENT && g_hot == H_Find) return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
+            break;
+        case WM_SYSCOMMAND:
+            if ((w & 0xFFF0) == SC_KEYMENU) return 0;  // the Alt that FindOpen sends must not open a menu
+            break;
+        case WM_TIMER:
+            if (w == kZoomTimer) Sharpen();
+            if (w == kGifTimer) {
+                UINT delay = 0;
+                if (g_kind == K_Image && g_gif.dec && g_visible)
+                    g_gif.index = (g_gif.index + 1) % g_gif.frames, delay = GifFrame();
+                if (delay) SetTimer(h, kGifTimer, delay, nullptr), InvalidateRect(h, nullptr, FALSE);
+                else KillTimer(h, kGifTimer);
+            }
+            return 0;
+        case WM_FLICK_FIND:
+            FindOpen();
             return 0;
         case WM_SETFOCUS:
             if (g_kind == K_Text) SetFocus(g_sci);
@@ -1802,9 +2155,13 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     if (!g_visible) DefWindowProcW(g_hwnd, WM_NCACTIVATE, TRUE, 0);  // shown without focus: active look anyway
     if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
     g_visible = true;
+    g_canFind = g_kind == K_Text;
     t.ready = MsSince(t0);
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(t0);
+    // Scintilla skips scrollbar updates while hidden (text loads hidden): a changed scroll width makes it set
+    // them. ~2.5 ms on a visible Scintilla, so after the frame: until then the bars may be the last file's.
+    if (sptr_t sw = Sci(SCI_GETSCROLLWIDTH); g_kind == K_Text) Sci(SCI_SETSCROLLWIDTH, sw + 1), Sci(SCI_SETSCROLLWIDTH, sw);
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
              : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
@@ -1825,6 +2182,7 @@ void PreviewHide(bool restoreFocus) {
     Cloak(TRUE);
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
+    g_canFind = g_findTookFocus = false;
     g_hot = H_None;
     ClearContent();  // release content memory while idle
     Sci(SCI_SETREADONLY, 0);
@@ -1833,8 +2191,12 @@ void PreviewHide(bool restoreFocus) {
     if (restoreFocus && wasForeground && IsWindow(g_source)) SetForegroundWindow(g_source);
 }
 
+bool PreviewCanFind() { return g_canFind; }
+
 bool PreviewKey(const MSG& m) {
+    if (g_findOn && g_visible && FindKey(m)) return true;
     if (m.message != WM_KEYDOWN || !g_visible) return false;
+    if (m.wParam == 'F' && GetKeyState(VK_CONTROL) < 0 && g_kind == K_Text) return FindOpen(), true;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
     else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_UP || m.wParam == VK_DOWN))
