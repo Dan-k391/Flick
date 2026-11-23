@@ -374,6 +374,7 @@ Para ``code`` and `link <http://x>`_.
             has(rst, L"# Title", L"rst heading");
             has(rst, L"Para `code` and [link](http://x).", L"rst inline");
             has(rst, L"```python\ny = 2\n```", L"rst code");
+            if (std::wstring e = OfficeSelfTest(); !e.empty()) ok = false, Log(L"selftest: office %s", e.c_str());
         }
         {  // tree: a(dir){ b(dir){ c }, d }, e  -> collapsed shows a, e; expanding a shows a, b, d, e
             auto g = std::make_unique<GridData>();

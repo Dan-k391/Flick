@@ -782,6 +782,27 @@ bool LoadCsv(const std::wstring& path) {
     return true;
 }
 
+constexpr wchar_t kSheetExt[] = L" .xlsx .xlsm .xltx .xltm .xls .xlt .ods .ots ";
+constexpr wchar_t kDocExt[] = L" .docx .docm .dotx .dotm .doc .dot .odt .ott .pptx .pptm .potx .potm .ppsx .ppsm .ppt .pps .pot .odp .otp ";
+
+// Excel/Calc: the active sheet as CSV into the grid; Word/PowerPoint/Writer/Impress as Markdown (office.cpp).
+bool LoadSheet(const std::wstring& path) {
+    std::wstring sub, csv = OfficeToCsv(path, sub);
+    auto g = csv.empty() ? nullptr : GridParseCsv(csv, L',');
+    if (!g) return false;
+    g_sub = sub.empty() ? g->sub : sub + L" · " + g->sub;
+    GridSet(std::move(g));
+    return true;
+}
+
+bool LoadOffice(const std::wstring& path) {
+    std::wstring sub, md = OfficeToMarkdown(path, sub);
+    if (md.empty()) return false;
+    MdLoad(md);
+    g_sub = sub;
+    return true;
+}
+
 struct GridJob {
     std::wstring path;
     int gen;
@@ -1324,6 +1345,8 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     }
     else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
+    else if (HasExt(path, kSheetExt) && LoadSheet(path)) g_kind = K_Grid;
+    else if (HasExt(path, kDocExt) && LoadOffice(path)) g_kind = K_Md;
     else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "

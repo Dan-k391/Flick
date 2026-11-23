@@ -26,13 +26,15 @@ src/window.cpp    window: Mica chrome (Direct2D), text (Scintilla) + find, image
                   PDF layout, scrolling, media controls
 src/markdown.cpp  md4c -> blocks -> DirectWrite layouts (lazy); images; code via highlight.cpp
 src/convert.cpp   ipynb, AsciiDoc, rst -> Markdown        src/highlight.cpp Lexilla outside Scintilla
+src/office.cpp    docx/pptx/odt/odp/doc/ppt -> Markdown, xlsx/ods/xls -> CSV (zip + XML scanner, OLE IStorage)
 src/pdf.cpp       PDF worker: Windows.Data.Pdf -> IPdfRendererNative -> WIC bitmap
 src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees
 src/font.cpp      font specimen        src/svg.cpp SVG/SVGZ (lunasvg)        src/fileinfo.cpp exe/dll/msi lines
 src/media.cpp     audio/video: Media Foundation engine (frame server, CPU) + source-reader poster/scrub frames
 src/lang.cpp      extension -> lexer, keywords, colour roles      src/app.h shared declarations, WM_FLICK_*
 third_party/      Scintilla 5.6.9, Lexilla 5.5.5, md4c 0.6.0, lunasvg 3.5.0 + plutovg — unmodified
-scripts/          make-samples.ps1, bench.ps1, e2e.ps1, shot.ps1, make-icon.py
+scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), bench.ps1, e2e.ps1, shot.ps1,
+                  make-icon.py
 .claude/skills/   build, speed-test, add-preview-type, add-language
 ```
 
@@ -56,6 +58,7 @@ Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after st
 |---|---|---|---|
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms | PDF page 1 (simple / real text) | ~20 / ~35 ms |
 | folder tree C:\Windows (10k) | ~53 ms | video first frame (engine alone ~300 ms) | ~45–50 ms |
+| Office (all 9 formats, small) | 7–8 ms | | |
 
 Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
@@ -94,6 +97,10 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   (PM_QS_SENDMESSAGE)` then re-check *before* `MsgWaitForMultipleObjects`.
 - **Markdown**: md4c with `MD4C_USE_UTF16`; blocks laid out lazily; images measured at layout, decoded when drawn.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
+- **Office** without Office: what's written, not the layout (no pictures, charts, page look). OOXML/ODF are zips
+  read with archiveint (members by name, others skipped by seeking); headings from styles.xml names
+  ("heading N" is English in every UI language). `.ppt` text sits in slide drawings (persist directory chain),
+  older files also in SlideListWithText. `.doc` via the piece table: plain paragraphs. `.xls` BIFF8 only.
 - **archiveint.dll** (undocumented) gives zip/7z/rar/tar/cab/iso listing and gunzip; missing → info card.
 - **Folders** list breadth-first ≤60 ms / 10k items; sizes on a worker. Sort with `CompareStringEx(DIGITSASNUMBERS)`.
 - **Video**: the engine takes ~300 ms to a first frame (~200 ms to metadata) and slows a reader on the same file,
@@ -108,6 +115,6 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   `newline='\n'`. No `gh` CLI: releases via curl + the git credential token.
 
 ## Ideas / not done
-Office/eml/CAD via preview handlers; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
+eml/CAD via preview handlers; Office pictures, .doc headings/tables, xlsb, sheet tabs; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
 Markdown links/raw HTML/find; PDF zoom/text selection/find; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.

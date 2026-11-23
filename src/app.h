@@ -1,6 +1,7 @@
 #pragma once
 #include <windows.h>
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -102,6 +103,8 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep);  
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::atomic<int>& gen, int mine);
 std::unique_ptr<GridData> GridReadFolder(const std::wstring& path, const std::atomic<int>& gen, int mine);
 bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
+bool ArchiveReadMembers(const std::wstring& path, const std::function<size_t(std::wstring_view)>& want,
+                        std::vector<std::pair<std::wstring, std::string>>& out);  // want: byte limit, 0 = skip
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);
@@ -125,6 +128,12 @@ std::vector<std::wstring> ProgramInfo(const std::wstring& path);
 std::wstring NotebookToMarkdown(const std::wstring& json);
 std::wstring AsciiDocToMarkdown(const std::wstring& text);
 std::wstring RstToMarkdown(const std::wstring& text);
+
+// ---- office.cpp: Word/PowerPoint documents as Markdown, Excel/Calc sheets as CSV ("" if not readable);
+// sub = title-bar details
+std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
+std::wstring OfficeToCsv(const std::wstring& path, std::wstring& sub);
+std::wstring OfficeSelfTest();  // "" = ok
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
 struct MediaState {

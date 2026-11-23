@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <ctime>
+#include <functional>
 
 using Microsoft::WRL::ComPtr;
 
@@ -489,4 +490,27 @@ bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap) {
     for (long long n; ok && out.size() < cap && (n = api->read_data(a, buf, sizeof buf)) > 0;) out.append(buf, (size_t)n);
     api->free(a);
     return ok && !out.empty();
+}
+
+// Reads the members `want` accepts (it returns a byte limit, 0 = skip) in one pass: Office files are zips.
+bool ArchiveReadMembers(const std::wstring& path, const std::function<size_t(std::wstring_view)>& want,
+                        std::vector<std::pair<std::wstring, std::string>>& out) {
+    Archive* api = Api();
+    if (!api) return false;
+    void* a = api->read_new();
+    api->support_format_all(a);
+    void* e;
+    bool ok = api->open_filename_w(a, path.c_str(), 1 << 16) == 0;
+    while (ok && api->next_header(a, &e) == 0) {
+        const wchar_t* name = api->pathname_w(e);
+        size_t cap = name ? want(name) : 0;
+        if (!cap) continue;  // skipped by seeking, not decompressed
+        std::string data;
+        if (api->size_is_set(e)) data.reserve((size_t)std::min<long long>(api->size(e), cap));
+        char buf[1 << 16];
+        for (long long n; data.size() < cap && (n = api->read_data(a, buf, sizeof buf)) > 0;) data.append(buf, (size_t)n);
+        out.emplace_back(name, std::move(data));
+    }
+    api->free(a);
+    return ok;
 }
