@@ -75,9 +75,6 @@ ComPtr<IDWriteTextFormat> g_fmtTitle, g_fmtIcon, g_fmtName, g_fmtInfo;
 std::string g_codeFont;
 UINT g_dpi = 96;
 bool g_dark, g_placing;
-HWND g_host;               // preview handler's parent window (Office files), shown once it has drawn
-int g_handlerGen;
-bool g_handlerShown, g_wantHandler;
 std::atomic<bool> g_visible;
 float g_natW, g_natH;   // size a picture is shown at, in DIPs: 1 image pixel = 1 DIP, like QuickLook
 bool g_decodeForClient;  // re-decoding after a manual resize: fit the current window, not the screen
@@ -795,7 +792,6 @@ bool LoadSheet(const std::wstring& path) {
     if (!g) return false;
     g_sub = sub.empty() ? g->sub : sub + L" · " + g->sub;
     GridSet(std::move(g));
-    g_wantHandler = HandlerAvailable(path);
     return true;
 }
 
@@ -804,7 +800,6 @@ bool LoadOffice(const std::wstring& path) {
     if (md.empty()) return false;
     MdLoad(md);
     g_sub = sub;
-    g_wantHandler = HandlerAvailable(path);
     return true;
 }
 
@@ -1309,9 +1304,6 @@ void ClearContent() {
     g_zoom = 1, g_panX = g_panY = 0, g_panDrag = false;
     g_findOn = false, g_hits.clear(), g_hit = -1;
     g_gridGen++, g_gridPending = false, g_sizeGen++;
-    HandlerStop();
-    if (g_host) ShowWindow(g_host, SW_HIDE), g_host = nullptr;  // destroyed when its thread finishes
-    g_handlerShown = g_wantHandler = false;
     for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
     g_kind = K_None;
 }
@@ -1391,11 +1383,6 @@ void Layout() {
         SetWindowPos(g_sci, nullptr, 0, top, rc.right, rc.bottom - top, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else
         ShowWindow(g_sci, SW_HIDE);
-    if (g_host) {
-        SetWindowPos(g_host, HWND_TOP, 0, top, rc.right, rc.bottom - top,
-                     SWP_NOACTIVATE | (g_handlerShown ? SWP_SHOWWINDOW : 0));
-        HandlerResize();
-    }
 }
 
 D2D1_RECT_F ImageArea() {
@@ -1878,19 +1865,6 @@ void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWOR
     if (g_visible && h && pid != GetCurrentProcessId() && GetAncestor(h, GA_ROOT) != g_source) {
         wchar_t cls[64] = L"";
         GetClassNameW(h, cls, 64);
-        // An invisible window (Excel's previewer starts a hidden XLMAIN) is not the user switching away.
-        // It took the keyboard from Explorer, though: give it back. A key event of our own allows that; both
-        // halves go to the hidden window (an Alt released in Explorer would show its key tips).
-        if (!IsWindowVisible(h)) {
-            if (IsWindow(g_source)) {
-                INPUT alt[2]{{INPUT_KEYBOARD}, {INPUT_KEYBOARD}};
-                alt[0].ki.wVk = alt[1].ki.wVk = VK_MENU, alt[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                SendInput(2, alt, sizeof(INPUT));
-                BOOL back = SetForegroundWindow(g_source);
-                Log(L"foreground -> invisible %s %p: back to Explorer %s", cls, h, back ? L"ok" : L"failed");
-            }
-            return;
-        }
         for (const wchar_t* shell : {L"XamlExplorerHostIslandWindow", L"MultitaskingViewFrame", L"TaskSwitcherWnd",
                                      L"ForegroundStaging", L"Windows.UI.Core.CoreWindow", L"Shell_TrayWnd",
                                      L"Shell_SecondaryTrayWnd", L"NotifyIconOverflowWindow",
@@ -2127,10 +2101,6 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_FLICK_POSTER:
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
             return 0;
-        case WM_FLICK_HANDLER:
-            if ((int)w == -1) DestroyWindow((HWND)l);
-            else if ((int)w == g_handlerGen && l && g_host) g_handlerShown = true, Layout(), InvalidateRect(g_hwnd, nullptr, FALSE);
-            return 0;
         case WM_FLICK_GRID:
             return OnGrid((int)w, reinterpret_cast<GridData*>(l));
         case WM_FLICK_INFO:
@@ -2199,10 +2169,6 @@ bool PreviewInit(HINSTANCE inst) {
     wc.hInstance = inst;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.lpszClassName = L"FlickPreview";
-    RegisterClassExW(&wc);
-    wc.lpfnWndProc = DefWindowProcW;
-    wc.lpszClassName = L"FlickHost";
-    wc.hbrBackground = nullptr;
     RegisterClassExW(&wc);
     // Tool window: no taskbar button flashing in and out on every preview.
     g_hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"FlickPreview", L"Flick",
@@ -2329,13 +2295,6 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     // Scintilla skips scrollbar updates while hidden (text loads hidden): a changed scroll width makes it set
     // them. ~2.5 ms on a visible Scintilla, so after the frame: until then the bars may be the last file's.
     if (sptr_t sw = Sci(SCI_GETSCROLLWIDTH); g_kind == K_Text) Sci(SCI_SETSCROLLWIDTH, sw + 1), Sci(SCI_SETSCROLLWIDTH, sw);
-    // Office: the fast text view is up; the application's own previewer replaces it when it has drawn.
-    if (g_wantHandler) {
-        g_host = CreateWindowExW(0, L"FlickHost", L"", WS_CHILD | WS_CLIPCHILDREN, 0, 0, 0, 0, g_hwnd, nullptr,
-                                 nullptr, nullptr);
-        Layout();
-        g_handlerGen = HandlerStart(path, g_host, g_dark ? 0x202020 : 0xFFFFFF, g_dark ? 0xFFFFFF : 0);
-    }
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
              : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
