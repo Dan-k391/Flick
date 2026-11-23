@@ -648,7 +648,7 @@ LRESULT OnPdf(PdfMsg& m) {
         g_pdfFailed = g_pages.empty();
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
-                                : std::to_wstring(m.pageCount) + (PagesFor(g_path) ? (m.pageCount == 1 ? L" slide" : L" slides")
+                                : std::to_wstring(m.pageCount) + (PagesFor(g_path) && !HasExt(g_path, L" .docx .docm .dotx .dotm ") ? (m.pageCount == 1 ? L" slide" : L" slides")
                                                                                    : (m.pageCount == 1 ? L" page" : L" pages"));
         if (m.page == -1 && !g_pdfFailed) PlaceWindow();  // before page 1 is requested: rendered at the final width
         InvalidateRect(g_hwnd, nullptr, FALSE);

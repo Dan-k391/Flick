@@ -26,7 +26,8 @@ src/window.cpp    window: Mica chrome (Direct2D), text (Scintilla) + find, image
                   PDF layout, scrolling, media controls
 src/markdown.cpp  md4c -> blocks -> DirectWrite layouts (lazy); images; code via highlight.cpp
 src/convert.cpp   ipynb, AsciiDoc, rst -> Markdown        src/highlight.cpp Lexilla outside Scintilla
-src/office.cpp    docx/pptx/odt/odp/doc/ppt -> Markdown, xlsx/ods/xls -> CSV (zip + XML scanner, OLE IStorage)
+src/pages.cpp     pptx slides and docx pages drawn (D2D + DirectWrite into WIC) for the PDF view, on its worker
+src/office.cpp    odt/odp/doc/ppt -> Markdown, xlsx/ods/xls -> sheet grid (OLE IStorage); xml.h: XML scanner, zips
 src/pdf.cpp       PDF worker: Windows.Data.Pdf -> IPdfRendererNative -> WIC bitmap
 src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees
 src/font.cpp      font specimen        src/svg.cpp SVG/SVGZ (lunasvg)        src/fileinfo.cpp exe/dll/msi lines
@@ -49,8 +50,9 @@ scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), benc
 ## Speed test
 - `scripts\bench.ps1`: in-process, each sample 20×, median `ready` (painted) / `on-screen` (after `DwmFlush`).
 - `scripts\e2e.ps1 [-Shots]`: real Explorer + SendKeys. **Never while someone uses the PC.**
-- `scripts\shot.ps1 <file> [-Wheel n] [-Click x,y] [-Keys vk] [-Find text]`: `--show` + `PrintWindow` screenshot
-  to `build\shots\` — safe while the PC is in use. Look at shots after visual changes.
+- `scripts\shot.ps1 <file> [-Wheel n] [-Click x,y] [-Keys vk] [-Find text] [-Window]`: `--show`, then Flick paints
+  the frame into `build\shots\<name>.png` itself (`WM_FLICK_SHOT`; PrintWindow can return stale DWM frames, and
+  misses the text view, a child window: `-Window`). Safe while the PC is in use. Arrays: `powershell -Command "& ..."`.
 - `--selftest` checks languages, CSV, Markdown, converters; samples: `make-samples.ps1` (video needs ffmpeg).
 
 Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after start ~35 ms):
@@ -58,7 +60,7 @@ Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after st
 |---|---|---|---|
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms | PDF page 1 (simple / real text) | ~20 / ~35 ms |
 | folder tree C:\Windows (10k) | ~53 ms | video first frame (engine alone ~300 ms) | ~45–50 ms |
-| Office (all 9 formats, small) | 7–8 ms | | |
+| sheets xlsx/xls/ods, doc/ppt/odt/odp text | 7–8 ms | docx / pptx page 1 (real files) | 12–23 ms |
 
 Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
@@ -97,7 +99,14 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   (PM_QS_SENDMESSAGE)` then re-check *before* `MsgWaitForMultipleObjects`.
 - **Markdown**: md4c with `MD4C_USE_UTF16`; blocks laid out lazily; images measured at layout, decoded when drawn.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
-- **Office** without Office: what's written, not the layout (no pictures, charts, page look). OOXML/ODF are zips
+- **Office**: Windows preview handlers (Office's own previewers, what QuickLook uses) were tried and dropped:
+  0.1 s warm, 0.6–1.1 s cold, 200–300 MB Office processes stay resident. pptx/docx are drawn by pages.cpp instead:
+  slides follow placeholder inheritance (slide -> layout -> master: idx, then type), text styles chain lstStyle ->
+  master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff. docx is
+  flowed onto pages at open (styles with basedOn, numbering, tables, inline pictures); split paragraphs are one
+  layout drawn clipped per page. Pictures are read from the zip per page, decoded at the drawn size.
+- **Sheets**: cells at their Excel positions (blank rows kept), A/B/C + 1/2/3 headers, tabs reload a sheet.
+- **Office** text formats: what's written, not the layout. OOXML/ODF are zips
   read with archiveint (members by name, others skipped by seeking); headings from styles.xml names
   ("heading N" is English in every UI language). `.ppt` text sits in slide drawings (persist directory chain),
   older files also in SlideListWithText. `.doc` via the piece table: plain paragraphs. `.xls` BIFF8 only.
@@ -115,6 +124,7 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   `newline='\n'`. No `gh` CLI: releases via curl + the git credential token.
 
 ## Ideas / not done
-eml/CAD via preview handlers; Office pictures, .doc headings/tables, xlsb, sheet tabs; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
+eml/CAD via preview handlers; charts/SmartArt, docx headers/footers/floating objects/superscript, odt/odp/doc/ppt
+as pages, cell formatting (fonts, fills, widths) in sheets, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
 Markdown links/raw HTML/find; PDF zoom/text selection/find; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.

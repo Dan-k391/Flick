@@ -1,7 +1,6 @@
-// Office files without Office. docx/pptx/xlsx and odt/odp/ods are zips of XML (libarchive from archiveint.dll
-// + the small tag scanner below); doc/ppt/xls are OLE compound files (IStorage, part of Windows).
-// Documents and slides become Markdown (headings, paragraphs, bullets, tables, bold/italic), sheets CSV for
-// the grid. What is written, in a few ms: no page layout, fonts, pictures or charts.
+// Office files without Office, as text: odt/odp/doc/ppt (and docx/pptx, which pages.cpp normally draws) become
+// Markdown (headings, paragraphs, bullets, tables, bold/italic); xlsx/ods/xls become the sheet grid. Zips of XML
+// go through xml.h; doc/ppt/xls are OLE compound files (IStorage, part of Windows).
 #include "app.h"
 #include "xml.h"
 #include <algorithm>
