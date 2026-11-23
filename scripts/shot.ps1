@@ -1,8 +1,9 @@
 # Screenshots Flick's own window previewing a file, without Explorer or keyboard input (safe while
 # someone uses the PC): runs `Flick.exe --show <file>`, captures the window with PrintWindow, closes it.
 # Usage: shot.ps1 <file> [-Wait ms] [-Wheel notches] [-Click x,y]  -> build\shots\<file name>.png
+# -Screen: content area copied from the screen (preview handlers' windows, which PrintWindow misses).
 # -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...). -Find text: opens the text search, types text.
-param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @(), [string]$Find)
+param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @(), [string]$Find, [switch]$Screen)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path "$PSScriptRoot\..\build\Release\Flick.exe").Path
 $out = Join-Path (New-Item -ItemType Directory -Force "$PSScriptRoot\..\build\shots").FullName ((Split-Path $File -Leaf) + '.png')
@@ -57,6 +58,10 @@ $r = New-Object Shot+RECT; [void][Shot]::GetWindowRect($h, [ref]$r)
 $bmp = New-Object System.Drawing.Bitmap ($r.R - $r.L), ($r.B - $r.T)
 $g = [System.Drawing.Graphics]::FromImage($bmp)
 $dc = $g.GetHdc(); [void][Shot]::PrintWindow($h, $dc, 2); $g.ReleaseHdc($dc)
+if ($Screen) {  # the content area from the screen (child windows of other processes), the title bar from PrintWindow
+    $top = 48 * $g.DpiY / 96
+    $g.CopyFromScreen($r.L, $r.T + $top, 0, $top, (New-Object System.Drawing.Size $bmp.Width, ($bmp.Height - $top)))
+}
 $bmp.Save($out); $g.Dispose(); $bmp.Dispose()
 [void][Shot]::SendMessage($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CLOSE
 if (-not $p.WaitForExit(3000)) { $p.Kill() }

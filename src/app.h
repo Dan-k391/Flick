@@ -27,6 +27,7 @@ enum : UINT {
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
     WM_FLICK_FIND,                 // Ctrl+F in Explorer while a text preview is open
     WM_FLICK_SUBS,                 // sent by the poster worker (wParam = gen, lParam = std::vector<SubCue>*)
+    WM_FLICK_HANDLER,              // preview handler thread: (gen, ok) shown, or (-1, host HWND) finished
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -134,6 +135,13 @@ std::wstring RstToMarkdown(const std::wstring& text);
 std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
 std::wstring OfficeToCsv(const std::wstring& path, std::wstring& sub);
 std::wstring OfficeSelfTest();  // "" = ok
+
+// ---- handler.cpp: the file type's Windows preview handler (Office's own previewers), out of process
+extern bool g_handlersOff;  // --bench measures Flick's own view only
+bool HandlerAvailable(const std::wstring& path);
+int HandlerStart(const std::wstring& path, HWND host, COLORREF bg, COLORREF fg);  // -> gen
+void HandlerResize();  // host was resized
+void HandlerStop();
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
 struct MediaState {

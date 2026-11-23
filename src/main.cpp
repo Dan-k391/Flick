@@ -440,7 +440,7 @@ c
     Log(L"started in %.1f ms (init + warm-up)", MsSince(t0));
     PrintMemory(L"idle");
     MediaMute(bench || (show && argc > 3 && !wcscmp(argv[3], L"--mute")));
-    if (bench) return Bench(argc, argv);
+    if (bench) return g_handlersOff = true, Bench(argc, argv);
     if (show) {
         wchar_t full[MAX_PATH];
         GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);

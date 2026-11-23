@@ -27,6 +27,7 @@ src/window.cpp    window: Mica chrome (Direct2D), text (Scintilla) + find, image
 src/markdown.cpp  md4c -> blocks -> DirectWrite layouts (lazy); images; code via highlight.cpp
 src/convert.cpp   ipynb, AsciiDoc, rst -> Markdown        src/highlight.cpp Lexilla outside Scintilla
 src/office.cpp    docx/pptx/odt/odp/doc/ppt -> Markdown, xlsx/ods/xls -> CSV (zip + XML scanner, OLE IStorage)
+src/handler.cpp   Windows preview handlers (Office's own previewers, out of process) over the fast view
 src/pdf.cpp       PDF worker: Windows.Data.Pdf -> IPdfRendererNative -> WIC bitmap
 src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees
 src/font.cpp      font specimen        src/svg.cpp SVG/SVGZ (lunasvg)        src/fileinfo.cpp exe/dll/msi lines
@@ -97,6 +98,11 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   (PM_QS_SENDMESSAGE)` then re-check *before* `MsgWaitForMultipleObjects`.
 - **Markdown**: md4c with `MD4C_USE_UTF16`; blocks laid out lazily; images measured at layout, decoded when drawn.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
+- **Office**: first frame is our own text view (~7 ms); then the type's preview handler (Office's previewer,
+  `CLSCTX_LOCAL_SERVER`, own STA thread) draws into a child `FlickHost` and replaces it: ~90–190 ms warm,
+  0.6–1.1 s cold (Office process start). Excel's previewer makes a hidden XLMAIN the foreground: ignored, and
+  Explorer gets the keyboard back. `--bench` skips handlers. Screen captures of --show windows can be stale
+  (display asleep?): check handler looks by eye.
 - **Office** without Office: what's written, not the layout (no pictures, charts, page look). OOXML/ODF are zips
   read with archiveint (members by name, others skipped by seeking); headings from styles.xml names
   ("heading N" is English in every UI language). `.ppt` text sits in slide drawings (persist directory chain),
