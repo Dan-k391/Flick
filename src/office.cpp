@@ -240,31 +240,38 @@ struct MdOut {
     }
 };
 
-// ---- sheets: rows of UTF-8 cells -> CSV
-using Rows = std::vector<std::vector<std::string>>;
-void Put(Rows& rows, size_t r, size_t c, std::string v) {
+// ---- sheets: cells at their Excel positions (A1 = row 0, column 0) -> GridData
+struct Cell {
+    std::string v;
+    bool num = false;  // numbers and dates: right-aligned
+};
+using Rows = std::vector<std::vector<Cell>>;
+void Put(Rows& rows, size_t r, size_t c, std::string v, bool num = false) {
     if (r >= kMaxRows || c >= kMaxCols || v.empty()) return;
     if (rows.size() <= r) rows.resize(r + 1);
     if (rows[r].size() <= c) rows[r].resize(c + 1);
-    rows[r][c] = std::move(v);
+    rows[r][c] = {std::move(v), num};
 }
-std::wstring ToCsv(const Rows& rows) {
-    std::string s;
-    for (auto& row : rows) {
-        if (row.empty()) continue;  // the grid drops blank lines anyway
-        for (size_t c = 0; c < row.size(); c++) {
-            if (c) s += ',';
-            const std::string& v = row[c];
-            if (v.find_first_of(",\"\r\n") == v.npos) s += v;
-            else {
-                s += '"';
-                for (char ch : v) s += ch, ch == '"' ? (void)(s += '"') : void();
-                s += '"';
-            }
+std::unique_ptr<GridData> ToGrid(const Rows& rows) {
+    auto g = std::make_unique<GridData>();
+    g->sheet = true;
+    g->cols = 1;
+    for (auto& row : rows) g->cols = std::max(g->cols, (UINT32)row.size());
+    size_t n = std::max<size_t>(rows.size(), 1);
+    g->cells.reserve(n * g->cols), g->num.reserve(n * g->cols);
+    for (size_t r = 0; r < n; r++)
+        for (size_t c = 0; c < g->cols; c++) {
+            const Cell* x = r < rows.size() && c < rows[r].size() ? &rows[r][c] : nullptr;
+            std::wstring w = x ? Wide(x->v) : L"";
+            for (auto& ch : w) ch = ch == L'\n' || ch == L'\r' || ch == L'\t' ? L' ' : ch;
+            g->cells.push_back({(UINT32)g->text.size(), (UINT32)w.size()});
+            g->text += w;
+            g->num.push_back(x && x->num);
         }
-        s += '\n';
-    }
-    return Wide(s);
+    g->rightAlign.assign(g->cols, false);
+    g->sub = rows.empty() ? L"empty" : std::to_wstring(rows.size()) + (rows.size() == 1 ? L" row × " : L" rows × ") +
+                                           std::to_wstring(g->cols) + (g->cols == 1 ? L" column" : L" columns");
+    return g;
 }
 
 // Number formats that show dates: the built-in ids, or a code with d/m/y/h/s outside quotes and [..].
@@ -533,21 +540,24 @@ std::string OdfToMd(std::string_view xml, bool slides, int& count) {
 }
 
 // ---- xlsx
-std::wstring XlsxToCsv(const std::wstring& path, std::wstring& sub) {
+Rows XlsxSheet(const std::wstring& path, int& want, std::vector<std::wstring>& tabs, bool& truncated) {
     Members m;
     auto meta = [](std::wstring_view n) -> size_t {
         return n == L"xl/workbook.xml" || n == L"xl/_rels/workbook.xml.rels" || n == L"xl/sharedStrings.xml" ||
                        n == L"xl/styles.xml"
                    ? kMaxXml : 0;
     };
-    if (!ArchiveReadMembers(path, meta, m)) return L"";
+    if (!ArchiveReadMembers(path, meta, m)) return {};
     std::vector<std::pair<std::string, std::string>> sheets;  // name, relationship id
     size_t active = 0;
     for (Xml x{Member(m, L"xl/workbook.xml")}; int t = x.Next();)
         if (t == Xml::Tag && !x.close && x.name == "sheet") sheets.push_back({XmlText(Attr(x.attrs, "name")), std::string(Attr(x.attrs, "r:id"))});
         else if (t == Xml::Tag && !x.close && x.name == "workbookView") active = AttrInt(x.attrs, "activeTab", 0);
-    if (sheets.empty()) return L"";
+    if (sheets.empty()) return {};
+    if (want >= 0) active = want;
     active = std::min(active, sheets.size() - 1);
+    want = (int)active;
+    for (auto& sh : sheets) tabs.push_back(Wide(sh.first));
     std::wstring target = Rels(Member(m, L"xl/_rels/workbook.xml.rels"), L"xl/")[sheets[active].second];
 
     std::vector<std::string> strings;
@@ -576,8 +586,7 @@ std::wstring XlsxToCsv(const std::wstring& path, std::wstring& sub) {
         }
     }
     m.clear();
-    bool truncated = false;
-    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == target ? kMaxXml : 0; }, m) || m.empty()) return L"";
+    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == target ? kMaxXml : 0; }, m) || m.empty()) return {};
     std::string_view xml = m[0].second;
     truncated = xml.size() >= kMaxXml;
 
@@ -604,29 +613,27 @@ std::wstring XlsxToCsv(const std::wstring& path, std::wstring& sub) {
         else if (n == "rPh" && !x.close) x.Skip();
         if (n != "c" || !(x.close || x.empty)) continue;
         std::string v;
+        bool num = false;
         if (type == "s") {
             size_t k = (size_t)atoll(value.c_str());
             if (k < strings.size()) v = strings[k];
         } else if (type == "b") v = value == "1" ? "TRUE" : "FALSE";
         else if (type == "str" || type == "inlineStr" || type == "e") v = value;
-        else if (!value.empty()) v = Number(atof(value.c_str()), xf < dateXf.size() && dateXf[xf]);
-        Put(rows, r, c, std::move(v));
+        else if (!value.empty()) v = Number(atof(value.c_str()), xf < dateXf.size() && dateXf[xf]), num = true;
+        Put(rows, r, c, std::move(v), num);
     }
-    sub = Wide(sheets[active].first) + (sheets.size() > 1 ? L" (" + std::to_wstring(active + 1) + L" of " +
-                                                               std::to_wstring(sheets.size()) + L" sheets)" : L"") +
-          (truncated ? L" · first " + std::to_wstring(kMaxXml >> 20) + L" MB" : L"");
-    return ToCsv(rows);
+    return rows;
 }
 
 // ---- ods: first table, cells as displayed (text:p)
-std::wstring OdsToCsv(std::string_view xml, std::wstring& sub) {
+Rows OdsSheet(std::string_view xml, int& want, std::vector<std::wstring>& tabs) {
     Rows rows;
-    std::vector<std::string> row;
+    std::vector<Cell> row;
     std::string cell;
-    int tables = 0, rowRep = 1, cellRep = 1, depth = 0, tableDepth = -1;
+    int rowRep = 1, cellRep = 1, depth = 0, tableDepth = -1;
     size_t r = 0, blank = 0;
-    bool inCell = false, inPara = false;
-    std::string name;
+    bool inCell = false, inPara = false, num = false, mine = false;
+    if (want < 0) want = 0;
     for (Xml x{xml}; int t = x.Next();) {
         if (t == Xml::Text) {
             if (inPara) AppendXml(cell, x.text);
@@ -637,28 +644,34 @@ std::wstring OdsToCsv(std::string_view xml, std::wstring& sub) {
             depth--;
             if (n == "p") inPara = false;
             else if ((n == "table-cell" || n == "covered-table-cell") && inCell) {
-                for (int k = 0; k < cellRep && row.size() < kMaxCols; k++) row.push_back(cell);
+                for (int k = 0; k < cellRep && row.size() < kMaxCols; k++) row.push_back({cell, num});
                 inCell = false;
-            } else if (n == "table-row" && tables == 1) {
-                while (!row.empty() && row.back().empty()) row.pop_back();
+            } else if (n == "table-row" && !mine) row.clear();
+            else if (n == "table-row") {
+                while (!row.empty() && row.back().v.empty()) row.pop_back();
                 if (row.empty()) blank += rowRep;  // repeated empty rows pad sheets to a million
                 else {
                     r += std::min<size_t>(blank, 100), blank = 0;
                     for (int k = 0; k < rowRep && r < kMaxRows; k++, r++)
-                        for (size_t c = 0; c < row.size(); c++) Put(rows, r, c, row[c]);
+                        for (size_t c = 0; c < row.size(); c++) Put(rows, r, c, row[c].v, row[c].num);
                 }
                 row.clear();
-            } else if (n == "table" && depth == tableDepth) break;  // first sheet only
+            } else if (n == "table" && depth == tableDepth) mine = false, tableDepth = -1;
             continue;
         }
         if (!x.empty) depth++;
         if (n == "annotation") x.Skip(), depth -= !x.empty;
-        else if (n == "table" && !tables++) name = XmlText(Attr(x.attrs, "name")), tableDepth = depth - !x.empty;
+        else if (n == "table" && tableDepth < 0) {
+            mine = (int)tabs.size() == want, tableDepth = depth - !x.empty;
+            tabs.push_back(Wide(XmlText(Attr(x.attrs, "name"))));
+        }
         else if (n == "table-row") rowRep = std::clamp(AttrInt(x.attrs, "number-rows-repeated", 1), 1, (int)kMaxRows);
         else if (n == "table-cell" || n == "covered-table-cell") {
             cellRep = std::clamp(AttrInt(x.attrs, "number-columns-repeated", 1), 1, (int)kMaxCols);
             cell.clear();
             inCell = !x.empty;
+            std::string_view type = Attr(x.attrs, "value-type");
+            num = type == "float" || type == "percentage" || type == "currency" || type == "date" || type == "time";
             if (x.empty)
                 for (int k = 0; k < cellRep && row.size() < kMaxCols; k++) row.emplace_back();
         } else if (n == "p" && inCell) {
@@ -667,8 +680,8 @@ std::wstring OdsToCsv(std::string_view xml, std::wstring& sub) {
         } else if (n == "s" && inPara) cell.append(std::clamp(AttrInt(x.attrs, "c", 1), 1, 100), ' ');
         else if ((n == "tab" || n == "line-break") && inPara) cell += ' ';
     }
-    sub = Wide(name);
-    return ToCsv(rows);
+    if (want >= (int)tabs.size()) want = 0;
+    return rows;
 }
 
 // ---- OLE compound files (doc, xls, ppt)
@@ -868,9 +881,9 @@ struct Segs {  // record data split over CONTINUE records
     }
 };
 
-std::wstring XlsToCsv(IStorage* stg, std::wstring& sub) {
+Rows XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs) {
     std::string s;
-    if (!ReadStream(stg, L"Workbook", s) || U16(s, 0) != 0x0809 || U16(s, 4) != 0x0600) return L"";  // BIFF8 only
+    if (!ReadStream(stg, L"Workbook", s) || U16(s, 0) != 0x0809 || U16(s, 4) != 0x0600) return {};  // BIFF8 only
     std::vector<std::string> sst;
     std::unordered_map<unsigned, std::string> codes;
     std::vector<unsigned> xfFormat;
@@ -893,11 +906,18 @@ std::wstring XlsToCsv(IStorage* stg, std::wstring& sub) {
             Segs g{{d.substr(std::min<size_t>(6, d.size()))}};
             sheets.push_back({U32(d, 0), d.size() > 5 && d[5] == 0, g.String(false)});
         } else if (type == 0x003D) active = U16(d, 10);
-        else if (type == 0x002F) return L"";  // FILEPASS: encrypted
+        else if (type == 0x002F) return {};  // FILEPASS: encrypted
     }
-    if (active >= sheets.size() || !sheets[active].work)
-        for (active = 0; active < sheets.size() && !sheets[active].work;) active++;
-    if (active >= sheets.size()) return L"";
+    size_t nth = 0;  // the active sheet among the worksheets (charts and macros sheets dropped)
+    for (size_t j = 0; j < active && j < sheets.size(); j++) nth += sheets[j].work;
+    if (active >= sheets.size() || !sheets[active].work) nth = 0;
+    std::erase_if(sheets, [](const Sheet& h) { return !h.work; });
+    active = nth;
+    if (sheets.empty()) return {};
+    if (want >= 0) active = want;
+    active = std::min(active, sheets.size() - 1);
+    want = (int)active;
+    for (auto& h : sheets) tabs.push_back(Wide(h.name));
     auto isDate = [&](unsigned xf) {
         if (xf >= xfFormat.size()) return false;
         unsigned id = xfFormat[xf];
@@ -930,10 +950,10 @@ std::wstring XlsToCsv(IStorage* stg, std::wstring& sub) {
         } else if (type == 0x0203 && d.size() >= 14) {
             double v;
             memcpy(&v, d.data() + 6, 8);
-            Put(rows, r, c, Number(v, isDate(xf)));
-        } else if (type == 0x027E) Put(rows, r, c, Number(rk(U32(d, 6)), isDate(xf)));
+            Put(rows, r, c, Number(v, isDate(xf)), true);
+        } else if (type == 0x027E) Put(rows, r, c, Number(rk(U32(d, 6)), isDate(xf)), true);
         else if (type == 0x00BD && d.size() >= 6)  // MULRK
-            for (size_t o = 4; o + 6 <= d.size() - 2; o += 6, c++) Put(rows, r, c, Number(rk(U32(d, o + 2)), isDate(U16(d, o))));
+            for (size_t o = 4; o + 6 <= d.size() - 2; o += 6, c++) Put(rows, r, c, Number(rk(U32(d, o + 2)), isDate(U16(d, o))), true);
         else if (type == 0x0204) {  // LABEL
             Segs g{{d.substr(std::min<size_t>(6, d.size()))}};
             Put(rows, r, c, g.String(true));
@@ -942,7 +962,7 @@ std::wstring XlsToCsv(IStorage* stg, std::wstring& sub) {
             if (U16(d, 12) != 0xFFFF) {
                 double v;
                 memcpy(&v, d.data() + 6, 8);
-                Put(rows, r, c, Number(v, isDate(xf)));
+                Put(rows, r, c, Number(v, isDate(xf)), true);
             } else if (d[6] == 0) pendingString = true, pr = r, pc = c;
             else if (d[6] == 1) Put(rows, r, c, d[8] ? "TRUE" : "FALSE");
         } else if (type == 0x0207 && pendingString) {  // STRING after a string formula
@@ -951,11 +971,7 @@ std::wstring XlsToCsv(IStorage* stg, std::wstring& sub) {
             pendingString = false;
         }
     }
-    size_t work = std::count_if(sheets.begin(), sheets.end(), [](auto& h) { return h.work; }),
-           nth = std::count_if(sheets.begin(), sheets.begin() + active + 1, [](auto& h) { return h.work; });
-    sub = Wide(sheets[active].name) +
-          (work > 1 ? L" (" + std::to_wstring(nth) + L" of " + std::to_wstring(work) + L" sheets)" : L"");
-    return ToCsv(rows);
+    return rows;
 }
 
 bool Has(const std::wstring& path, const wchar_t* list) {
@@ -1002,15 +1018,21 @@ std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub) {
     return Wide(md);
 }
 
-std::wstring OfficeToCsv(const std::wstring& path, std::wstring& sub) {
-    if (Has(path, L" .xlsx .xlsm .xltx .xltm ")) return XlsxToCsv(path, sub);
-    if (Has(path, L" .ods .ots ")) {
+std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet) {
+    std::vector<std::wstring> tabs;
+    bool truncated = false;
+    Rows rows;
+    if (Has(path, L" .xlsx .xlsm .xltx .xltm ")) rows = XlsxSheet(path, sheet, tabs, truncated);
+    else if (Has(path, L" .ods .ots ")) {
         Members m;
         ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"content.xml" ? kMaxXml : 0; }, m);
-        return m.empty() ? L"" : OdsToCsv(m[0].second, sub);
-    }
-    auto stg = OpenOle(path);
-    return stg ? XlsToCsv(stg.Get(), sub) : L"";
+        if (!m.empty()) rows = OdsSheet(m[0].second, sheet, tabs), truncated = m[0].second.size() >= kMaxXml;
+    } else if (auto stg = OpenOle(path)) rows = XlsSheet(stg.Get(), sheet, tabs);
+    if (tabs.empty()) return nullptr;
+    auto g = ToGrid(rows);
+    g->tabs = std::move(tabs), g->tab = sheet;
+    if (truncated) g->sub += L" · first " + std::to_wstring(kMaxXml >> 20) + L" MB";
+    return g;
 }
 
 // --selftest: "" when the converters behave.

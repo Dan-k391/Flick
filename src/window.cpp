@@ -70,7 +70,8 @@ sptr_t g_sciPtr;
 ComPtr<ID2D1Factory> g_d2d;
 ComPtr<IDWriteFactory> g_dw;
 ComPtr<IWICImagingFactory> g_wic;
-ComPtr<ID2D1HwndRenderTarget> g_rt;
+ComPtr<ID2D1HwndRenderTarget> g_hwndRt;
+ComPtr<ID2D1RenderTarget> g_rt;  // g_hwndRt, or a bitmap target for WM_FLICK_SHOT
 ComPtr<IDWriteTextFormat> g_fmtTitle, g_fmtIcon, g_fmtName, g_fmtInfo;
 std::string g_codeFont;
 UINT g_dpi = 96;
@@ -234,7 +235,8 @@ void CreateTarget() {
         D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                                      D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED)),
         D2D1::HwndRenderTargetProperties(g_hwnd, D2D1::SizeU(rc.right, rc.bottom), D2D1_PRESENT_OPTIONS_IMMEDIATELY),
-        &g_rt);
+        &g_hwndRt);
+    g_rt = g_hwndRt;
     g_rt->SetDpi((float)g_dpi, (float)g_dpi);
 }
 
@@ -785,12 +787,12 @@ bool LoadCsv(const std::wstring& path) {
 constexpr wchar_t kSheetExt[] = L" .xlsx .xlsm .xltx .xltm .xls .xlt .ods .ots ";
 constexpr wchar_t kDocExt[] = L" .docx .docm .dotx .dotm .doc .dot .odt .ott .pptx .pptm .potx .potm .ppsx .ppsm .ppt .pps .pot .odp .otp ";
 
-// Excel/Calc: the active sheet as CSV into the grid; Word/PowerPoint/Writer/Impress as Markdown (office.cpp).
-bool LoadSheet(const std::wstring& path) {
-    std::wstring sub, csv = OfficeToCsv(path, sub);
-    auto g = csv.empty() ? nullptr : GridParseCsv(csv, L',');
+// Excel/Calc: a sheet (the active one first; tabs switch) into the grid; Word/PowerPoint/Writer/Impress as
+// Markdown (office.cpp).
+bool LoadSheet(const std::wstring& path, int sheet = -1) {
+    auto g = OfficeToGrid(path, sheet);
     if (!g) return false;
-    g_sub = sub.empty() ? g->sub : sub + L" · " + g->sub;
+    g_sub = g->sub;
     GridSet(std::move(g));
     return true;
 }
@@ -1763,6 +1765,7 @@ void Paint() {
         if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
         if (g_kind == K_Font) g_doc[1] = FontPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Grid && GridGet()) {
+            if (GridGet()->sheet) doc.left = 0, doc.right = sz.width;  // edge to edge, like Excel
             D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
             g_doc[0] = size.width, g_doc[1] = size.height;
             // A folder was collapsed below the end: pull the view back up (repaints once more).
@@ -1784,7 +1787,7 @@ void Paint() {
     HRESULT hrEnd = g_rt->EndDraw();
     if (g_kind == K_Pdf && g_pdfIdle && NextPdfPage()) g_pdfIdle = false, PdfWake();
     if (hrEnd == D2DERR_RECREATE_TARGET) {  // device lost: rebuild and reload bitmaps
-        g_rt.Reset();
+        g_rt.Reset(), g_hwndRt.Reset();
         CreateTarget();
         if (g_kind != K_Text) LoadContent(g_path, Now());
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -1905,7 +1908,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
-            if (g_rt) g_rt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+            if (g_hwndRt) g_hwndRt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
             Layout();
             InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -1996,6 +1999,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            if (int tab; g_kind == K_Grid && (tab = GridTabAt({Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))})) >= 0) {
+                if (tab != GridGet()->tab && LoadSheet(g_path, tab)) g_scroll[0] = g_scroll[1] = 0, InvalidateRect(h, nullptr, FALSE);
+                return 0;
+            }
             if (g_kind == K_Grid && OnBar(l) < 0) {  // trees: click a folder to expand/collapse it
                 RECT rc;
                 GetClientRect(h, &rc);
@@ -2033,6 +2040,45 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 return SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)), TRUE;
             if (LOWORD(l) == HTCLIENT && g_hot == H_Find) return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
             break;
+        case WM_FLICK_SHOT: {  // screen captures can be stale (DWM): Paint into a bitmap instead, over the theme colour
+            wchar_t out[MAX_PATH];
+            RECT rc;
+            GetClientRect(h, &rc);
+            ComPtr<IWICBitmap> bmp;
+            ComPtr<ID2D1RenderTarget> rt;
+            ComPtr<IWICStream> file;
+            ComPtr<IWICBitmapEncoder> enc;
+            ComPtr<IWICBitmapFrameEncode> frame;
+            if (!GetEnvironmentVariableW(L"FLICK_SHOT", out, MAX_PATH) || !g_rt ||
+                FAILED(g_wic->CreateBitmap(rc.right, rc.bottom, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &bmp)) ||
+                FAILED(g_d2d->CreateWicBitmapRenderTarget(bmp.Get(), D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE), &rt)))
+                return 0;
+            rt->SetDpi((float)g_dpi, (float)g_dpi);
+            std::swap(g_rt, rt);
+            Paint();
+            std::swap(g_rt, rt);
+            ComPtr<ID2D1Bitmap> frameBmp;  // Paint leaves Mica's place transparent: put it over the theme colour
+            ComPtr<IWICBitmap> flat;
+            ComPtr<ID2D1RenderTarget> rt2;
+            if (FAILED(g_wic->CreateBitmap(rc.right, rc.bottom, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &flat)) ||
+                FAILED(g_d2d->CreateWicBitmapRenderTarget(flat.Get(), D2D1::RenderTargetProperties(D2D1_RENDER_TARGET_TYPE_SOFTWARE), &rt2)) ||
+                FAILED(rt2->CreateBitmapFromWicBitmap(bmp.Get(), &frameBmp)))
+                return 0;
+            rt2->BeginDraw();
+            rt2->Clear(C(g_dark ? 0x202020 : 0xF3F3F3));
+            rt2->DrawBitmap(frameBmp.Get());
+            rt2->EndDraw();
+            bmp = flat;
+            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppPBGRA;
+            if (SUCCEEDED(g_wic->CreateStream(&file)) && SUCCEEDED(file->InitializeFromFilename(out, GENERIC_WRITE)) &&
+                SUCCEEDED(g_wic->CreateEncoder(GUID_ContainerFormatPng, nullptr, &enc)) &&
+                SUCCEEDED(enc->Initialize(file.Get(), WICBitmapEncoderNoCache)) &&
+                SUCCEEDED(enc->CreateNewFrame(&frame, nullptr)) && SUCCEEDED(frame->Initialize(nullptr)) &&
+                SUCCEEDED(frame->SetSize(rc.right, rc.bottom)) && SUCCEEDED(frame->SetPixelFormat(&fmt)) &&
+                SUCCEEDED(frame->WriteSource(bmp.Get(), nullptr)))
+                frame->Commit(), enc->Commit();
+            return 0;
+        }
         case WM_SYSCOMMAND:
             if ((w & 0xFFF0) == SC_KEYMENU) return 0;  // the Alt that FindOpen sends must not open a menu
             break;

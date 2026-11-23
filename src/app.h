@@ -27,6 +27,7 @@ enum : UINT {
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
     WM_FLICK_FIND,                 // Ctrl+F in Explorer while a text preview is open
     WM_FLICK_SUBS,                 // sent by the poster worker (wParam = gen, lParam = std::vector<SubCue>*)
+    WM_FLICK_SHOT,                 // scripts/shot.ps1: save the frame as Paint draws it to %FLICK_SHOT% (PNG)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -95,6 +96,10 @@ struct GridData {
     std::vector<bool> folder;                      // archives, per body row
     std::vector<std::wstring> paths;               // trees, per body row: path under the root, '/'-separated
     std::wstring sub;                              // title-bar details
+    bool sheet = false;                            // spreadsheet: A B C / 1 2 3 headers, gridlines, tabs
+    std::vector<bool> num;                         // sheets, per cell: right-aligned (numbers, dates)
+    std::vector<std::wstring> tabs;                // sheets: names
+    int tab = 0;                                   // sheets: the one shown
     size_t Rows() const { return cols ? cells.size() / cols : 0; }
 };
 void GridInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* iconFont);
@@ -109,6 +114,7 @@ void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);
 bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt);  // toggles a folder row
+int GridTabAt(D2D1_POINT_2F pt);  // sheets: tab under the point, -1 none
 size_t GridShownRows();  // body rows visible (--selftest)
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
@@ -132,7 +138,7 @@ std::wstring RstToMarkdown(const std::wstring& text);
 // ---- office.cpp: Word/PowerPoint documents as Markdown, Excel/Calc sheets as CSV ("" if not readable);
 // sub = title-bar details
 std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
-std::wstring OfficeToCsv(const std::wstring& path, std::wstring& sub);
+std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet);  // sheet -1: the active one
 std::wstring OfficeSelfTest();  // "" = ok
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
