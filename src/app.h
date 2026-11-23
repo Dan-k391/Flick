@@ -70,6 +70,17 @@ struct PdfMsg {
 void PdfOpen(const std::wstring& path, int gen);  // "" closes the document
 void PdfWake();                                   // worker idle and the UI needs a page
 
+// ---- pages.cpp: pptx slides drawn for the PDF view (on its worker thread)
+struct Pages;
+struct PagesFree {
+    void operator()(Pages*) const;
+};
+using PagesPtr = std::unique_ptr<Pages, PagesFree>;
+PagesPtr PagesOpen(const std::wstring& path);                   // nullptr: not a readable deck
+std::vector<std::pair<float, float>> PagesSizes(const Pages&);  // points
+Microsoft::WRL::ComPtr<IWICBitmap> PagesRender(Pages&, int index, UINT width, ID2D1Factory*, IWICImagingFactory*);
+bool PagesFor(const std::wstring& path);                        // a file pages.cpp draws (pptx)
+
 // ---- markdown.cpp: parsed into blocks, laid out lazily with DirectWrite
 struct MdColors {
     D2D1_COLOR_F text, dim, link, codeBg, rule;

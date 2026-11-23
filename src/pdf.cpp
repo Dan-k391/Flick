@@ -68,6 +68,7 @@ DWORD WINAPI PdfThread(void*) {
     };
     winrt::get_activation_factory<PdfDocument>();  // warm-up: loads Windows.Data.Pdf.dll
     PdfDocument doc{nullptr};
+    PagesPtr office;  // pptx: slides drawn by pages.cpp instead of a PDF
     std::vector<std::pair<float, float>> sizes;
     UINT32 pages = 0;
     int loaded = -1;
@@ -88,14 +89,16 @@ DWORD WINAPI PdfThread(void*) {
         }
         PdfMsg msg{gen, -2};  // -2: "idle, what next?"
         if (gen != loaded) {
-            loaded = gen, doc = nullptr, sizes.clear(), msg.page = -1;  // -1: opened (sizes) or failed (none)
+            loaded = gen, doc = nullptr, office.reset(), sizes.clear(), msg.page = -1;  // -1: opened (sizes) or failed (none)
             if (path.empty()) {  // closed: release memory, including the renderer's caches
                 renderer.Reset(), dxgi.Reset(), d3d.Reset(), d2d.Reset();
                 continue;
             }
-            if (!renderer) createRenderer();
             if (!d2d) D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, d2d.GetAddressOf());
-            try {
+            if (PagesFor(path)) {
+                if ((office = PagesOpen(path))) sizes = PagesSizes(*office), msg.sizes = sizes, msg.pageCount = (UINT32)sizes.size();
+            } else try {
+                if (!renderer) createRenderer();
                 IRandomAccessStream file{nullptr};
                 winrt::check_hresult(CreateRandomAccessStreamOnFile(path.c_str(), 0 /* read */,
                                                                     winrt::guid_of<IRandomAccessStream>(),
@@ -108,8 +111,12 @@ DWORD WINAPI PdfThread(void*) {
                 doc = nullptr;
             }
         }
-        for (LRESULT next; (next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg)) > 0 && doc;) {
+        for (LRESULT next; (next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg)) > 0 && (doc || office);) {
             msg = {gen, (int)(next & 0xFFFFFFFF) - 1};
+            if (office) {
+                msg.bmp = PagesRender(*office, msg.page, (UINT)(next >> 32), d2d.Get(), wic.Get());
+                continue;
+            }
             try {
                 msg.bmp = Render(doc, msg.page, (UINT)(next >> 32), renderer.Get(), d2d.Get(), wic.Get());
                 if (sizes.size() < pages) readSizes(pages), msg.sizes = sizes;  // the rest, after the first page

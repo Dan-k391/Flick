@@ -648,7 +648,8 @@ LRESULT OnPdf(PdfMsg& m) {
         g_pdfFailed = g_pages.empty();
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
-                                : std::to_wstring(m.pageCount) + (m.pageCount == 1 ? L" page" : L" pages");
+                                : std::to_wstring(m.pageCount) + (PagesFor(g_path) ? (m.pageCount == 1 ? L" slide" : L" slides")
+                                                                                   : (m.pageCount == 1 ? L" page" : L" pages"));
         if (m.page == -1 && !g_pdfFailed) PlaceWindow();  // before page 1 is requested: rendered at the final width
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
@@ -1348,6 +1349,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
     else if (HasExt(path, kSheetExt) && LoadSheet(path)) g_kind = K_Grid;
+    else if (PagesFor(path)) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, kDocExt) && LoadOffice(path)) g_kind = K_Md;
     else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
     else if (HasExt(path, L" .ttf .otf .ttc .otc .woff .woff2 ") && FontLoad(g_dw.Get(), path, g_sub)) g_kind = K_Font;
