@@ -68,7 +68,7 @@ $fast = $count - 3
 $seconds = 0.6 + 3 * 1.0 + $fast * 0.13 + 0.5 + 0.6  # the key presses below, then the closed window
 $ff = Start-Process ffmpeg -PassThru -WindowStyle Hidden -ArgumentList `
     '-y', '-loglevel', 'error', '-f', 'gdigrab', '-t', $seconds, '-framerate', '30', '-draw_mouse', '0', '-offset_x', $wa.X, '-offset_y', $wa.Y,
-    '-video_size', "$($wa.Width)x$($wa.Height)", '-i', 'desktop', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '12', '-pix_fmt', 'yuv420p',  # 4:4:4 doesn't play on Windows "`"$mp4`""
+    '-video_size', "$($wa.Width)x$($wa.Height)", '-i', 'desktop', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '12', '-pix_fmt', 'yuv420p', "`"$mp4`""  # yuv420p: Windows can't decode 4:4:4
 Start-Sleep -Milliseconds 600
 
 [void][D]::SetForegroundWindow($hwnd)
