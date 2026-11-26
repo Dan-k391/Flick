@@ -1036,7 +1036,7 @@ void OnMediaEvent(DWORD event) {
     MediaOnEvent(event);
     MediaState s = MediaGet();
     if (s.error) {
-        if (g_mediaVideo) ShowInfo();
+        if (g_mediaVideo) ShowInfo(), g_info.push_back(L"Can't play: Windows has no decoder for this video's format");
         else g_sub = L"can't play this file";
     } else if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
         g_sub = (s.videoW ? std::to_wstring(s.videoW) + L" × " + std::to_wstring(s.videoH) + L" · " : L"") + Clock(s.dur);
