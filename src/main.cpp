@@ -67,9 +67,23 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
+// Re-installed whenever Explorer or the desktop comes to the front: the newest hook runs first, so another
+// program's hook that swallows keys (games) can't hide Space from us, and one Windows dropped (a callback that
+// once ran past LowLevelHooksTimeout, e.g. with the CPU busy) comes back. New one first, so no key is missed.
+HHOOK g_hook;
+void InstallHook() {
+    HHOOK old = g_hook;
+    g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
+    if (old) UnhookWindowsHookEx(old);
+}
+void CALLBACK OnFront(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD) {
+    if (ClassIs(h, L"CabinetWClass") || IsDesktop(h)) InstallHook();
+}
+
 // The hook lives on its own thread so a busy UI thread never delays system-wide keyboard input.
 DWORD WINAPI HookThread(void*) {
-    SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
+    InstallHook();
+    SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnFront, 0, 0, WINEVENT_OUTOFCONTEXT);
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {}
     return 0;

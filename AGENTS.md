@@ -66,6 +66,8 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   done off-screen at start. Shown `SWP_NOACTIVATE` + `HWND_TOPMOST` so Explorer keeps the keyboard; the hook
   thread watches Space/Esc/arrows (never swallows Space). Hide on foreground change, except shell UI
   (Alt+Tab, Start, search). If foreground when hiding, also `SW_HIDE`. One resize per open (~2 ms each).
+- **Keyboard hook** is re-installed each time Explorer/desktop takes the foreground: a game's own low-level hook
+  (GTA running in the background) swallowed Space, and Windows drops a hook that once timed out.
 - **Explorer lookup**: `IShellWindows` is 10–60 ms → cache the focused tab's `IShellBrowser`.
 - **Scintilla**: load text hidden (`SCI_SETTEXT` 0.1 vs 3 ms), but hidden it skips scrollbar updates. The scroll
   width is set per file from its first 200 lines (tracking only grows), and a scroll-width change after the
