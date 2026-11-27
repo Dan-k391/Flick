@@ -467,48 +467,6 @@ std::string DocxToMd(std::string_view doc, std::string_view styles) {
     return md.out;
 }
 
-// ---- pptx: one slide's shapes. Title placeholders go to `title`, body placeholders become bullets.
-std::string SlideToMd(std::string_view xml, std::string& title) {
-    MdOut md;
-    enum { Other, Title, Body, Hidden } kind = Other;
-    bool inText = false;
-    for (Xml x{xml}; int t = x.Next();) {
-        if (t == Xml::Text) {
-            if (inText) md.Text(x.text, !x.cdata);
-            continue;
-        }
-        std::string_view n = x.name;
-        if (x.close) {
-            if (n == "p") md.Close();
-            else if (n == "t") inText = false;
-            else if (n == "tc") md.CellEnd();  // spanned cells are there too (hMerge), empty
-            else if (n == "tbl") md.TableEnd();
-            else if (n == "sp") kind = Other, md.capture = nullptr;
-            continue;
-        }
-        Para* p = md.Cur();
-        if (n == "Fallback" || (kind == Hidden && !x.empty && n == "txBody")) x.Skip();
-        else if (n == "sp" || n == "graphicFrame") kind = Other, md.capture = nullptr;
-        else if (n == "ph") {
-            std::string_view type = Attr(x.attrs, "type");
-            if (type == "title" || type == "ctrTitle") kind = Title, md.capture = &title;
-            else if (type == "dt" || type == "ftr" || type == "sldNum" || type == "hdr") kind = Hidden;
-            else if (type.empty() || type == "body" || type == "obj") kind = Body;
-        } else if (n == "p") md.Open(0, kind == Body ? 0 : -1);
-        else if (n == "tbl") md.TableStart();
-        else if (n == "tr") md.RowStart();
-        else if (n == "tc") md.CellStart();
-        else if (!p) continue;
-        else if (n == "pPr" && p->list >= 0) p->list = AttrInt(x.attrs, "lvl", 0);
-        else if (n == "buNone") p->list = -1;
-        else if (n == "rPr") p->b = Attr(x.attrs, "b") == "1", p->i = Attr(x.attrs, "i") == "1";
-        else if (n == "r" || n == "fld") p->b = p->i = false;
-        else if (n == "t") inText = !x.empty;
-        else if (n == "br") md.Text("\n");
-    }
-    return md.out;
-}
-
 // Slides as one document: "## title" (or "Slide n") per slide, a rule between them.
 struct Deck {
     std::string out;
@@ -518,6 +476,9 @@ struct Deck {
         out += "## " + (title.empty() ? "Slide " + std::to_string(n) : title) + "\n\n" + body;
     }
 };
+
+// Documents shown as Markdown read at most this much (odt/odp XML, doc/ppt text) on the open path: ~5 ms.
+constexpr size_t kQuickDoc = 512 << 10;
 
 // ---- OpenDocument (odt/odp): content.xml. Slides mode: draw:page per slide, titles from presentation:class.
 std::string OdfToMd(std::string_view xml, bool slides, int& count) {
@@ -1111,7 +1072,7 @@ unsigned U32(std::string_view s, size_t o) { return o + 4 <= s.size() ? U16(s, o
 
 // .doc (Word 97+): the main text through the piece table. Paragraphs only.
 // shortcut: no headings, bold or table structure (needs the style sheet and FKPs); cells become paragraphs.
-std::string DocToMd(IStorage* stg) {
+std::string DocToMd(IStorage* stg, bool& cut) {
     std::string wd, table;
     if (!ReadStream(stg, L"WordDocument", wd) || U16(wd, 0) != 0xA5EC) return "";
     unsigned flags = U16(wd, 0x0A);
@@ -1130,7 +1091,7 @@ std::string DocToMd(IStorage* stg) {
     k += 5;
     size_t pieces = lcb >= 4 ? (lcb - 4) / 12 : 0;
     std::wstring text;
-    for (size_t j = 0; j < pieces; j++) {
+    for (size_t j = 0; j < pieces && !(cut = text.size() >= kQuickDoc / 2); j++) {
         unsigned cp0 = U32(table, k + j * 4), cp1 = std::min(U32(table, k + j * 4 + 4), ccpText);
         if (cp0 >= cp1) continue;
         unsigned fcv = U32(table, k + (pieces + 1) * 4 + j * 8 + 2), n = cp1 - cp0;
@@ -1146,11 +1107,18 @@ std::string DocToMd(IStorage* stg) {
             text.append((const wchar_t*)(wd.data() + off), n);
         }
     }
+    text.resize(std::min(text.size(), kQuickDoc / 2));
     MdOut md;
     md.Open();
     std::vector<bool> field;  // per open field: still in its code (shown from the separator on)
+    std::wstring run;         // plain characters, converted together
     for (wchar_t c : text) {
         bool hide = !field.empty() && field.back();
+        if (c >= 0x20 && !hide) {
+            run += c;
+            continue;
+        }
+        if (!run.empty()) md.Text(Utf8(run)), run.clear();
         if (c == 0x13) field.push_back(true);
         else if (c == 0x14 && !field.empty()) field.back() = false;
         else if (c == 0x15 && !field.empty()) field.pop_back();
@@ -1159,8 +1127,8 @@ std::string DocToMd(IStorage* stg) {
         else if (c == 0x0B) md.Text("\n");
         else if (c == 0x09) md.Text(" ");
         else if (c == 0x1E) md.Text("-");
-        else if (c >= 0x20) md.Text(Utf8({&c, 1}));
     }
+    if (!run.empty()) md.Text(Utf8(run));
     md.Close();
     return md.out;
 }
@@ -1168,7 +1136,7 @@ std::string DocToMd(IStorage* stg) {
 // .ppt: slides in the order of the document's SlideListWithText; per slide its text there (older files) and the
 // text atoms in its drawing (shapes, text boxes), typed by TextHeaderAtom (title / body / other).
 // Records are found through the persist directory of the newest edit (Current User -> UserEditAtom chain).
-std::string PptToMd(IStorage* stg, int& count) {
+std::string PptToMd(IStorage* stg, int& count, bool& cut) {
     std::string s, cu;
     if (!ReadStream(stg, L"PowerPoint Document", s) || !ReadStream(stg, L"Current User", cu)) return "";
     std::unordered_map<unsigned, unsigned> persist;  // persist id -> stream offset (newest edit wins)
@@ -1202,10 +1170,13 @@ std::string PptToMd(IStorage* stg, int& count) {
         else if (type == 2) return;  // notes
         bool bullets = type == 1 || type == 7 || type == 8;
         md.Open(0, bullets ? 0 : -1);
-        for (wchar_t c : w)
-            if (c == L'\r') md.Close(), md.Open(0, bullets ? 0 : -1);
-            else if (c == 0x0B) md.Text("\n");
-            else if (c >= 0x20 || c == L'\t') md.Text(Utf8({&c, 1}));
+        for (size_t j = 0, e; j <= w.size(); j = e + 1) {  // paragraphs end with \r, lines with 0x0B
+            e = std::min(w.find_first_of(L"\r\x0B", j), w.size());
+            std::wstring part = w.substr(j, e - j);
+            std::erase_if(part, [](wchar_t c) { return c < 0x20 && c != L'\t'; });
+            md.Text(Utf8(part));
+            if (e < w.size()) w[e] == L'\r' ? (md.Close(), md.Open(0, bullets ? 0 : -1)) : md.Text("\n");
+        }
         md.Close();
         if (md.inList) md.out += '\n';
         body += md.out;
@@ -1230,7 +1201,7 @@ std::string PptToMd(IStorage* stg, int& count) {
             deck.Add(title, body);
             title.clear(), body.clear();
         };
-        for (size_t a = k + 8; a + 8 <= listEnd; a += 8 + (size_t)U32(s, a + 4)) {
+        for (size_t a = k + 8; a + 8 <= listEnd && !(cut = deck.out.size() >= kQuickDoc); a += 8 + (size_t)U32(s, a + 4)) {
             unsigned rt = U16(s, a + 2), len = U32(s, a + 4);
             if (a + 8 + len > listEnd) break;
             if (rt == 0x03F3) finish(), slide = at(U32(s, a + 8));
@@ -1432,34 +1403,24 @@ bool Has(const std::wstring& path, const wchar_t* list) {
 std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub) {
     std::string md;
     int slides = -1;
+    bool cut = false;
     if (Has(path, L" .docx .docm .dotx .dotm ")) {
         Members m;
         ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"word/document.xml" || n == L"word/styles.xml" ? kMaxXml : 0; }, m);
         md = DocxToMd(Member(m, L"word/document.xml"), Member(m, L"word/styles.xml"));
-    } else if (Has(path, L" .pptx .pptm .potx .potm .ppsx .ppsm ")) {
-        Members m;
-        ArchiveReadMembers(path, [](std::wstring_view n) {
-            return n == L"ppt/presentation.xml" || n == L"ppt/_rels/presentation.xml.rels" ||
-                           (n.starts_with(L"ppt/slides/slide") && n.ends_with(L".xml"))
-                       ? kMaxXml : 0;
-        }, m);
-        auto rels = Rels(Member(m, L"ppt/_rels/presentation.xml.rels"), L"ppt/");
-        Deck deck;
-        for (Xml x{Member(m, L"ppt/presentation.xml")}; int t = x.Next();)
-            if (t == Xml::Tag && !x.close && x.name == "sldId") {
-                std::string title, body = SlideToMd(Member(m, rels[std::string(Attr(x.attrs, "r:id"))]), title);
-                deck.Add(title, body);
-            }
-        md = std::move(deck.out), slides = deck.n;
     } else if (Has(path, L" .odt .ott .odp .otp ")) {
         Members m;
-        ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"content.xml" ? kMaxXml : 0; }, m);
-        if (!m.empty()) md = OdfToMd(m[0].second, Has(path, L" .odp .otp "), slides);
+        ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"content.xml" ? kQuickDoc : 0; }, m);
+        if (!m.empty()) md = OdfToMd(m[0].second, Has(path, L" .odp .otp "), slides), cut = m[0].second.size() >= kQuickDoc;
     } else if (auto stg = OpenOle(path)) {
-        if (Has(path, L" .doc .dot ")) md = DocToMd(stg.Get());
-        else if (Has(path, L" .ppt .pps .pot ")) md = PptToMd(stg.Get(), slides);
+        if (Has(path, L" .doc .dot ")) md = DocToMd(stg.Get(), cut);
+        else if (Has(path, L" .ppt .pps .pot ")) md = PptToMd(stg.Get(), slides, cut);
     }
     if (slides > 0) sub = std::to_wstring(slides) + (slides == 1 ? L" slide" : L" slides");
+    if (cut) {  // shortcut: the rest is not shown; a worker would have to re-lay out the whole document anyway
+        md += "\n\n---\n\n*The rest is not shown in the preview.*\n";
+        sub += (sub.empty() ? L"" : L" · ") + std::wstring(L"first ") + std::to_wstring(kQuickDoc >> 10) + L" KB";
+    }
     return Wide(md);
 }
 
