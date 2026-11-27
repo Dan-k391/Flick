@@ -394,6 +394,12 @@ struct Draw {
         } else if (kind == "leftArrow") {
             float t = h * adj("adj1", 50000) / 2, x = r.left + m * adj("adj2", 50000);
             g = Poly({{r.right, my - t}, {x, my - t}, {x, r.top}, {r.left, my}, {x, r.bottom}, {x, my + t}, {r.right, my + t}});
+        } else if (kind == "downArrow") {
+            float t = w * adj("adj1", 50000) / 2, y = r.bottom - m * adj("adj2", 50000);
+            g = Poly({{mx - t, r.top}, {mx - t, y}, {r.left, y}, {mx, r.bottom}, {r.right, y}, {mx + t, y}, {mx + t, r.top}});
+        } else if (kind == "upArrow") {
+            float t = w * adj("adj1", 50000) / 2, y = r.top + m * adj("adj2", 50000);
+            g = Poly({{mx - t, r.bottom}, {mx - t, y}, {r.left, y}, {mx, r.top}, {r.right, y}, {mx + t, y}, {mx + t, r.bottom}});
         } else {
             ComPtr<ID2D1RectangleGeometry> rg;
             f->CreateRectangleGeometry(r, &rg);
