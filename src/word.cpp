@@ -1348,21 +1348,7 @@ Item* Hit(std::vector<Item>& items, float x, float y, float& ox, float& oy) {
     return Hit(best->items, x, y, ox, oy);
 }
 
-// Copied text: a separator goes in only between pieces (the last one asked for wins: cell over paragraph end).
-struct Out {
-    std::wstring s;
-    const wchar_t* sep = nullptr;
-    bool started = false;
-    void Put(std::wstring_view v) {
-        if (started && sep) s += sep;
-        s += v, started = true, sep = nullptr;
-    }
-    void Sep(const wchar_t* p) {
-        if (started) sep = p;
-    }
-};
-
-void Emit(const std::vector<Item>& items, Out& o) {  // the selected part of laid out items
+void Emit(const std::vector<Item>& items, CopyText& o) {  // the selected part of laid out items
     for (auto& it : items) {
         if (it.table) {
             const Table& t = *it.table;
@@ -1401,7 +1387,7 @@ void NodeText(const Node& n, std::wstring& s) {
         else if (k.name != "pPr" && k.name != "rPr" && !(k.name == "r" && On(At(&k, {"rPr", "vanish"})))) NodeText(k, s);
 }
 
-void NodeBlock(const Node& n, Out& o) {
+void NodeBlock(const Node& n, CopyText& o) {
     if (n.name == "p") {
         std::wstring s;
         NodeText(n, s);
@@ -1443,7 +1429,7 @@ const Table* OpenTable() {  // the last block, a table laid out part way
 
 }  // namespace
 
-bool TextSel::Span(UINT32 para, UINT32 len, UINT32& from, UINT32& to) const {
+bool TextSel::Span(UINT64 para, UINT32 len, UINT32& from, UINT32& to) const {
     if (all) return from = 0, to = len, true;
     Pos lo = std::min(a, b), hi = std::max(a, b);
     if (para < lo.first || para > hi.first) return false;
@@ -1514,12 +1500,12 @@ void WordSelectAll() {
 
 std::wstring WordCopy() {
     if (!g_w || g_sel.Empty()) return {};
-    Out o;
+    CopyText o;
     if (g_sel.all && !(g_w->done && g_next >= g_w->blocks.size() && !OpenTable()))  // the rest isn't laid out: from the XML
         for (size_t i = 0; g_w->Block(i); i++) NodeBlock(*g_w->blocks[i], o);
     else {
         // A re-layout (resize, theme) may have laid out less than the selection: lay out to its end again, as painted.
-        if (g_width > 0 && g_brushRt) g_rt = g_brushRt.Get(), LayOut(*g_w, 0, std::max(g_sel.a, g_sel.b).first + 1);
+        if (g_width > 0 && g_brushRt) g_rt = g_brushRt.Get(), LayOut(*g_w, 0, (UINT32)std::max(g_sel.a, g_sel.b).first + 1);
         Emit(g_items, o);
     }
     return o.s;
@@ -1632,7 +1618,7 @@ std::wstring WordSelfTest() {
                        R"(</w:tbl><w:p><w:r><w:t>y</w:t><w:br/><w:t>z</w:t></w:r></w:p></w:body></w:document>)";
     Word d2;
     d2.xml = doc2;
-    Out out;
+    CopyText out;
     if (!Open(d2)) return L"word: body 2";
     for (size_t i = 0; d2.Block(i); i++) NodeBlock(*d2.blocks[i], out);
     if (out.s != L"x\r\na\tb\tc\r\n\t1/2\r\ny\r\nz") return L"word: copy " + out.s;

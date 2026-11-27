@@ -17,7 +17,8 @@ press **Space**; **Space**/**Esc** closes.
   doc/ppt/odt/odp as text), audio/video with playback, seeking and subtitles (`name.srt`/`.vtt`/`name.<lang>.srt` beside the video), CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
   jar, apk, whl…) and folders as trees, fonts as a specimen, exe/dll/msi details, anything else: thumbnail + info.
 - Keys: Space opens/closes, arrows follow the Explorer selection, Esc closes, Ctrl+F finds in text.
-- Mouse selection + Ctrl+A/Ctrl+C (and a right-click Copy/Select all) in text, docx, sheets/CSV and pptx slides.
+- Mouse selection + Ctrl+A/Ctrl+C (and a right-click Copy/Select all) in text, Markdown (+ ipynb, AsciiDoc, rst,
+  doc/odt/ppt/odp), docx, sheets/CSV and pptx slides. Not in PDFs.
 - Tray: Disable, Start at sign-in, Quit. Archives use Windows' own libarchive (`archiveint.dll`).
 - Third-party licenses: `third_party/*/License.txt`, `third_party/md4c/LICENSE.md`, `third_party/lunasvg/`.
 
@@ -103,6 +104,8 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   document not laid out to the end copies from the XML (`NodeBlock`). pptx: the worker hands each drawn
   paragraph's layout (drawing effects cleared: no worker brushes on the UI thread) + transform with the page;
   highlights are an overlay. Sheets keep the selection when the worker's full copy of the same tab arrives.
+  Markdown: a paragraph is (block << 32 | table cell); every block's text is parsed at load, so copying never
+  lays out and positions survive re-layout. Copied lists get a plain "- " / "1. " / "- [x] " marker.
 - **Images**: JPEG cost is entropy decoding; decode to the window size (DCT scaling for ≥2×), re-decode after
   resize and when zoom passes the decoded size (`Sharpen`, UI thread). EXIF orientation via a transform.
   GIF: frames composed on a canvas per disposal (0/1 keep, 2 clear, 3 restore) on a timer.
@@ -167,5 +170,5 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 eml/CAD via preview handlers; charts/SmartArt (placeholder box), docx headers/footers/footnote bodies/columns/
 explicit tab stops/floating positions/table style conditional formats/EMF pictures, odt/odp/doc/ppt as pages, sheet charts (placeholder box)/zoom/rich-text runs/other conditional formats/[Red] and fractions in
 number formats, ods/xls formatting, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
-Markdown links/raw HTML/find/selection; PDF zoom/text selection/find; selection across slides, Shift+click/keyboard selection; sidebar toggle; progressive >10 MP images;
+Markdown links/raw HTML/find; PDF zoom/text selection/find; selection across slides, Shift+click/keyboard selection; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.

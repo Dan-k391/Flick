@@ -1889,7 +1889,7 @@ void DragThumb(LPARAM l) {
 // ---- Text selection. Selecting needs a click, and a click activates the window: Ctrl+A and Ctrl+C then come to
 // PreviewKey. While Explorer has the keyboard they stay Explorer's (Ctrl+C copies the file, as before).
 bool Selectable() {
-    return g_kind == K_Word || (g_kind == K_Grid && GridGet() && GridGet()->folder.empty()) || (g_kind == K_Pdf && PagesFor(g_path));
+    return g_kind == K_Word || g_kind == K_Md || (g_kind == K_Grid && GridGet() && GridGet()->folder.empty()) || (g_kind == K_Pdf && PagesFor(g_path));
 }
 
 // The page at window y (DIPs): the one whose slot (half the gaps included) contains it.
@@ -1945,7 +1945,7 @@ std::wstring SlideCopy() {
 // clicks 1-3: a click (character, word, paragraph); 0: dragged to l. False: a click hit no text or cell.
 bool SelectAt(LPARAM l, int clicks) {
     D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
-    bool hit = g_kind == K_Word ? WordSelect(pt, g_scroll[1], clicks)
+    bool hit = g_kind == K_Word ? WordSelect(pt, g_scroll[1], clicks) : g_kind == K_Md ? MdSelect(pt, g_scroll[1], clicks)
                : g_kind == K_Grid ? GridSelect(pt, g_scroll[0], g_scroll[1], clicks) : SlideSelect(pt, clicks);
     InvalidateRect(g_hwnd, nullptr, FALSE);
     return hit;
@@ -1960,6 +1960,7 @@ bool OverContent(LPARAM l) {
 void SelectAll() {
     if (g_kind == K_Text) Sci(SCI_SELECTALL);
     else if (g_kind == K_Word) WordSelectAll();
+    else if (g_kind == K_Md) MdSelectAll();
     else if (g_kind == K_Grid) GridSelectAll();
     else if (Selectable()) g_slidePage = CurrentItem(), g_slideSel = {}, g_slideSel.all = true;
     InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -1968,7 +1969,7 @@ void SelectAll() {
 // Plain text onto the clipboard (the text view: Scintilla's own copy).
 void Copy() {
     if (g_kind == K_Text) return (void)Sci(SCI_COPY);
-    std::wstring s = g_kind == K_Word ? WordCopy() : g_kind == K_Grid ? GridCopy() : Selectable() ? SlideCopy() : L"";
+    std::wstring s = g_kind == K_Word ? WordCopy() : g_kind == K_Md ? MdCopy() : g_kind == K_Grid ? GridCopy() : Selectable() ? SlideCopy() : L"";
     size_t bytes = (s.size() + 1) * sizeof(wchar_t);
     HGLOBAL mem = s.empty() ? nullptr : GlobalAlloc(GMEM_MOVEABLE, bytes);
     void* p = mem ? GlobalLock(mem) : nullptr;
@@ -2228,7 +2229,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (LOWORD(l) == HTCLIENT && g_kind == K_Image && g_zoom > 1)
                 return SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)), TRUE;
             if (LOWORD(l) == HTCLIENT && g_hot == H_Find) return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
-            if (LOWORD(l) == HTCLIENT && (g_kind == K_Word || (g_kind == K_Pdf && Selectable()))) {  // an I-beam over text
+            if (LOWORD(l) == HTCLIENT && (g_kind == K_Word || g_kind == K_Md || (g_kind == K_Pdf && Selectable()))) {  // an I-beam over text
                 POINT c;
                 GetCursorPos(&c);
                 ScreenToClient(h, &c);
@@ -2236,7 +2237,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 UINT32 para, pos;
                 float d;
                 if (pt.y > kTitleH && pt.x >= SideW() && OnBar(MAKELPARAM(c.x, c.y)) < 0 &&
-                    (g_kind == K_Word || (SlideHit(PageAt(pt.y), pt, para, pos, &d) && d <= 0)))
+                    (g_kind != K_Pdf || (SlideHit(PageAt(pt.y), pt, para, pos, &d) && d <= 0)))
                     return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
             }
             break;

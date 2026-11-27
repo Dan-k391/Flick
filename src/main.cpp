@@ -417,6 +417,13 @@ c
         std::wstring want = L"H1:Title|P:Para & x y|P•:a|P☑" + std::wstring(1, (wchar_t)0xFE0E) +
                             L":b|P1.:one|P:q>|C:c|R:|T:|";
         if (MdOutline() != want) ok = false, Log(L"selftest: markdown outline %s", MdOutline().c_str());
+        // Copied text: list markers, code as shown (md4c turns the tab into spaces), table cells, nested quotes, no
+        // picture or rule.
+        MdLoad(L"# T\n\n- a\n  - b\n3. c\n- [x] d\n\n```\n  if x:\n\ty\n```\n\n| h | i |\n|---|---|\n| 1 | **2** |\n\n> q\n> > r\n\n---\n\n![p](p.png)\n\nend  \nline");
+        MdSelectAll();
+        if (std::wstring cp = MdCopy(); cp != L"T\r\n- a\r\n  - b\r\n3. c\r\n- [x] d\r\n  if x:\r\n    y\r\nh\ti\r\n1\t2\r\nq\r\nr\r\nend\r\nline")
+            ok = false, Log(L"selftest: markdown copy %s", cp.c_str());
+        MdClear();
         {  // SRT (CRLF, tags, a missing blank line, out of order) and WebVTT (no hours, settings, escapes)
             auto srt = ParseSubtitles(L"1\r\n00:00:05,000 --> 00:00:06,500\r\nLate\r\n\r\n2\r\n00:00:01,250 --> 00:00:02,000\r\n"
                                       L"<i>Hi</i> {\\an8}<font color=\"red\">there</font>\r\nline {\\b1}two{\\b0}\r\n"

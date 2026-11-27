@@ -52,6 +52,13 @@ size_t g_laid;  // blocks [0, g_laid) are laid out for g_width
 float g_width = -1, g_laidH, g_prevAfter;
 ID2D1RenderTarget* g_brushRt;
 ComPtr<ID2D1SolidColorBrush> g_link, g_dim, g_role[R_Count];  // drawing effects stored in layouts
+// Selection: a paragraph is (block << 32 | table cell, row-major); text comes from the parsed blocks, so copying
+// never needs layout, and positions stay valid when blocks are laid out again (resize, theme, pictures arriving).
+TextSel g_sel;
+int g_unit = 1;
+bool g_selOn;               // during a paint: something is selected
+D2D1_COLOR_F g_selColor;
+float g_x0, g_top;          // last paint: the column's left edge, the area's top
 
 // ---- parsing
 std::wstring Entity(std::wstring_view e) {
@@ -381,14 +388,21 @@ void LayoutBlock(Block& b, float width) {
     g_laidH = b.y + b.h, g_prevAfter = b.after;
 }
 
-void DrawRich(ID2D1RenderTarget* rt, const Text& t, float x, float y, ID2D1SolidColorBrush* text,
+// The selected part of text `unit` behind it (fill's colour changes).
+void DrawSel(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float y, ID2D1SolidColorBrush* fill) {
+    if (UINT32 a, b; g_selOn && unit != ~0ull && t.layout && g_sel.Span(unit, (UINT32)t.s.size(), a, b) && b > a)
+        fill->SetColor(g_selColor), FillText(rt, t.layout.Get(), a, b, {x, y}, fill);
+}
+
+void DrawRich(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float y, ID2D1SolidColorBrush* text,
               ID2D1SolidColorBrush* fill, const MdColors& c) {
     fill->SetColor(c.codeBg);
     for (auto& r : t.codeRects) rt->FillRoundedRectangle({{x + r.left, y + r.top, x + r.right, y + r.bottom}, 4, 4}, fill);
+    DrawSel(rt, t, unit, x, y, fill);
     rt->DrawTextLayout({x, y}, t.layout.Get(), text);
 }
 
-void DrawBlock(ID2D1RenderTarget* rt, Block& b, float x0, float y, float width, ID2D1SolidColorBrush* text,
+void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, float width, ID2D1SolidColorBrush* text,
                ID2D1SolidColorBrush* fill, const MdColors& c) {
     float x = x0 + b.indent * kIndent + b.quote * kQuote, right = x0 + width;
     fill->SetColor(c.rule);
@@ -399,15 +413,16 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, float x0, float y, float width, 
     if (!b.bullet.empty())
         rt->DrawText(b.bullet.c_str(), (UINT32)b.bullet.size(), g_fmtBullet.Get(), {x - 60, y, x - 8, y + 100}, text);
     switch (b.kind) {
-        case B_Para: DrawRich(rt, b.text, x, y, text, fill, c); break;
+        case B_Para: DrawRich(rt, b.text, unit, x, y, text, fill, c); break;
         case B_Head:
-            DrawRich(rt, b.text, x, y, text, fill, c);
+            DrawRich(rt, b.text, unit, x, y, text, fill, c);
             fill->SetColor(c.rule);
             if (b.level <= 2) rt->FillRectangle({x, y + b.h - 1, right, y + b.h}, fill);
             break;
         case B_Code:
             fill->SetColor(c.codeBg);
             rt->FillRoundedRectangle({{x, y, right, y + b.h}, 6, 6}, fill);
+            DrawSel(rt, b.text, unit, x + kCodePad, y + kCodePad, fill);
             rt->DrawTextLayout({x + kCodePad, y + kCodePad}, b.text.layout.Get(), text);
             break;
         case B_Rule: rt->FillRectangle({x, y, right, y + b.h}, fill); break;
@@ -417,7 +432,7 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, float x0, float y, float width, 
                 float k = std::min(1.f, (right - x) / b.imgW);
                 rt->DrawBitmap(b.bmp.Get(), {x, y, x + std::round(b.imgW * k), y + b.h}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             } else if (b.imgW <= 0) {
-                DrawRich(rt, b.text, x, y, text, fill, c);
+                DrawRich(rt, b.text, ~0ull, x, y, text, fill, c);  // alt text: not selectable (copied as nothing)
             }
             break;
         case B_Table: {
@@ -426,14 +441,27 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, float x0, float y, float width, 
             fill->SetColor(c.rule);
             for (float cx : b.colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
             for (float ry : b.rowY) rt->FillRectangle({x, y + ry, x + b.colX.back() + 1, y + ry + 1}, fill);
-            for (size_t ri = 0; ri < b.rows.size(); ri++)
-                for (size_t ci = 0; ci < b.rows[ri].size(); ci++)
-                    DrawRich(rt, b.rows[ri][ci], x + b.colX[ci] + kCellPadX, y + b.rowY[ri] + kCellPadY, text, fill, c);
+            for (size_t ri = 0, k = 0; ri < b.rows.size(); ri++)
+                for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++)
+                    DrawRich(rt, b.rows[ri][ci], unit + k, x + b.colX[ci] + kCellPadX, y + b.rowY[ri] + kCellPadY, text, fill, c);
             break;
         }
     }
 }
 
+// Plain text of [from, to) of a block's text: line breaks (code lines too) as CRLF.
+std::wstring Plain(const std::wstring& s, UINT32 from, UINT32 to) {
+    std::wstring v;
+    for (UINT32 k = from; k < to; k++) v += s[k] == L'\n' || s[k] == L'\x2028' ? std::wstring(L"\r\n") : std::wstring(1, s[k]);
+    return v;
+}
+
+// A list item's marker as it pastes well: "- ", "1. ", "- [ ] ", indented two spaces a level.
+std::wstring Marker(const Block& b) {
+    if (b.bullet.empty()) return {};
+    std::wstring m = iswdigit(b.bullet[0]) ? b.bullet + L" " : b.bullet[0] == L'☐' ? L"- [ ] " : b.bullet[0] == L'☑' ? L"- [x] " : L"- ";
+    return std::wstring(2 * std::max(0, b.indent - 1), L' ') + m;
+}
 }  // namespace
 
 void MdInit(IDWriteFactory* dw, const wchar_t* uiFont, const wchar_t* monoFont) {
@@ -448,6 +476,7 @@ void MdInit(IDWriteFactory* dw, const wchar_t* uiFont, const wchar_t* monoFont) 
 
 void MdClear() {
     std::vector<Block>().swap(g_blocks);
+    g_sel = {};
     g_heads.clear();
     g_laid = 0, g_width = -1;
 }
@@ -490,6 +519,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
         g_role[i]->SetColor({GetRValue(c.roles[i]) / 255.f, GetGValue(c.roles[i]) / 255.f, GetBValue(c.roles[i]) / 255.f, 1});
     float dpiY;
     rt->GetDpi(&g_dpi, &dpiY);
+    g_selOn = !g_sel.Empty(), g_selColor = c.sel;
     float width = std::min(kMaxWidth, area.right - area.left), viewH = area.bottom - area.top;
     if (width != g_width) g_width = width, g_laid = 0, g_laidH = 0, g_prevAfter = 8;
     while (g_laid < g_blocks.size() && g_laidH < scroll + viewH + 400) LayoutBlock(g_blocks[g_laid++], width);
@@ -498,11 +528,12 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
     rt->CreateSolidColorBrush(c.text, &text);
     rt->CreateSolidColorBrush(c.rule, &fill);
     float x0 = std::round(area.left + (area.right - area.left - width) / 2);
+    g_x0 = x0, g_top = area.top;
     for (size_t i = 0; i < g_laid; i++) {
         Block& b = g_blocks[i];
         float y = area.top + b.y - scroll;
         if (y > area.bottom) break;
-        if (y + b.h + b.after >= area.top) DrawBlock(rt, b, x0, y, width, text.Get(), fill.Get(), c);
+        if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, text.Get(), fill.Get(), c);
     }
     float h = g_laidH + 24;  // bottom padding
     return g_laid == g_blocks.size() ? h : h * g_blocks.size() / std::max<size_t>(g_laid, 1);  // estimate
@@ -516,4 +547,70 @@ std::wstring MdOutline() {
         s += b.bullet + L":" + b.text.s + (b.quote ? L">" : L"") + L"|";
     }
     return s;
+}
+
+bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
+    auto texty = [](const Block& b) { return (b.kind == B_Para || b.kind == B_Head || b.kind == B_Code || b.kind == B_Table) && !(b.kind == B_Table && b.rows.empty()); };
+    if (!g_laid) return clicks ? (g_sel = {}, false) : false;
+    size_t k = std::upper_bound(g_blocks.begin(), g_blocks.begin() + g_laid, pt.y - g_top + scroll,
+                                [](float v, const Block& b) { return v < b.y; }) - g_blocks.begin();
+    size_t i = SIZE_MAX;  // the block at the point, else the nearest one with text before it, else after it
+    for (size_t j = std::min(k ? k - 1 : 0, g_laid - 1) + 1; j-- > 0 && i == SIZE_MAX;)
+        if (texty(g_blocks[j])) i = j;
+    for (size_t j = k; j < g_laid && i == SIZE_MAX; j++)
+        if (texty(g_blocks[j])) i = j;
+    if (i == SIZE_MAX) {
+        if (clicks) g_sel = {};
+        return false;
+    }
+    Block& b = g_blocks[i];
+    float ox = g_x0 + b.indent * kIndent + b.quote * kQuote, oy = g_top - scroll + b.y;
+    const Text* t = &b.text;
+    UINT32 cell = 0;
+    if (b.kind == B_Table) {  // the cell under the point (the nearest in its row)
+        auto at = [](const std::vector<float>& e, float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(e.begin(), e.end(), v) - e.begin() - 1); };
+        size_t ri = std::min(at(b.rowY, pt.y - oy), b.rows.size() - 1);
+        while (ri > 0 && b.rows[ri].empty()) ri--;
+        if (b.rows[ri].empty()) return false;
+        size_t ci = std::min(at(b.colX, pt.x - ox), b.rows[ri].size() - 1);
+        for (size_t r = 0; r < ri; r++) cell += (UINT32)b.rows[r].size();
+        cell += (UINT32)ci, t = &b.rows[ri][ci];
+        ox += b.colX[ci] + kCellPadX, oy += b.rowY[ri] + kCellPadY;
+    } else if (b.kind == B_Code) ox += kCodePad, oy += kCodePad;
+    if (!t->layout) return false;
+    if (clicks) g_unit = std::min(clicks, 3);
+    UINT32 from, to;
+    TextUnit(t->s, TextHit(t->layout.Get(), pt.x - ox, pt.y - oy), g_unit, from, to);
+    UINT64 unit = (UINT64)i << 32 | cell;
+    if (clicks) g_sel.Click({unit, from}, {unit, to});
+    else g_sel.Drag({unit, from}, {unit, to});
+    return true;
+}
+
+void MdSelectAll() {
+    g_sel = {};
+    g_sel.all = !g_blocks.empty();
+}
+
+std::wstring MdCopy() {
+    CopyText o;
+    if (g_sel.Empty()) return {};
+    for (size_t i = 0; i < g_blocks.size(); i++) {
+        const Block& b = g_blocks[i];
+        UINT64 unit = (UINT64)i << 32;
+        UINT32 from, to;
+        if (b.kind == B_Table) {
+            for (size_t ri = 0, k = 0; ri < b.rows.size(); ri++) {
+                for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++) {
+                    if (ci) o.Sep(L"\t");
+                    if (g_sel.Span(unit + k, (UINT32)b.rows[ri][ci].s.size(), from, to)) o.Put(Plain(b.rows[ri][ci].s, from, to));
+                }
+                o.Sep(L"\r\n");
+            }
+        } else if ((b.kind == B_Para || b.kind == B_Head || b.kind == B_Code) && g_sel.Span(unit, (UINT32)b.text.s.size(), from, to)) {
+            o.Put((from ? L"" : Marker(b)) + Plain(b.text.s, from, to));
+            o.Sep(L"\r\n");
+        }
+    }
+    return o.s;
 }

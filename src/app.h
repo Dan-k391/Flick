@@ -100,10 +100,10 @@ struct MdColors {
     D2D1_COLOR_F sel{};               // selected text's background
 };
 
-// ---- text selection (word.cpp; docx and pptx slides): positions are (paragraph, UTF-16 index). The unit first
-// clicked (1 character, 2 word, 3 paragraph) is what a drag extends by.
+// ---- text selection (word.cpp; docx, Markdown, pptx slides): positions are (paragraph, UTF-16 index), paragraphs
+// numbered in document order. The unit first clicked (1 character, 2 word, 3 paragraph) is what a drag extends by.
 struct TextSel {
-    using Pos = std::pair<UINT32, UINT32>;
+    using Pos = std::pair<UINT64, UINT32>;
     Pos a, b, ua, ub;  // anchor, focus; the unit clicked
     bool all = false;  // Ctrl+A: everything, laid out or not
     bool Empty() const { return !all && a == b; }
@@ -112,17 +112,35 @@ struct TextSel {
         if (to <= ua) a = ub, b = from;
         else a = ua, b = to;
     }
-    bool Span(UINT32 para, UINT32 len, UINT32& from, UINT32& to) const;  // the part of `para` selected
+    bool Span(UINT64 para, UINT32 len, UINT32& from, UINT32& to) const;  // the part of `para` selected
 };
 UINT32 TextHit(IDWriteTextLayout*, float x, float y);  // caret position nearest the point (layout coordinates)
 void TextUnit(const std::wstring& s, UINT32 i, int unit, UINT32& from, UINT32& to);  // the word/paragraph at i
 void FillText(ID2D1RenderTarget*, IDWriteTextLayout*, UINT32 from, UINT32 to, D2D1_POINT_2F at, ID2D1Brush*);
+// Copied text: a separator goes in only between pieces (the last one asked for wins: a cell's tab over a paragraph's CRLF).
+struct CopyText {
+    std::wstring s;
+    const wchar_t* sep = nullptr;
+    bool started = false;
+    void Put(std::wstring_view v) {
+        if (started && sep) s += sep;
+        s += v, started = true, sep = nullptr;
+    }
+    void Sep(const wchar_t* p) {
+        if (started) sep = p;
+    }
+};
 void MdInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* monoFont);
 void MdLoad(const std::wstring& text, const std::wstring& baseDir = L"");
 void MdClear();
 float MdPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
 std::wstring MdOutline();
 size_t MdHeadingCount();  // H1-H3, for the contents sidebar
+// Selection, as WordSelect (window DIPs, the last paint's area). Copy: CRLF between blocks, tabs between table cells,
+// code as written, list items with a plain "- " / "1. " marker, images as nothing.
+bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks);
+void MdSelectAll();
+std::wstring MdCopy();
 const std::wstring& MdHeadingText(size_t i);
 int MdHeadingLevel(size_t i);
 float MdHeadingY(size_t i, bool layout);  // -1: not laid out yet (and layout == false)  // --selftest: one "<kind><level><bullet>:<text>|" per block
