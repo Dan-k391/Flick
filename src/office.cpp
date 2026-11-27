@@ -1114,6 +1114,7 @@ std::string DocToMd(IStorage* stg, bool& cut) {
             text.append((const wchar_t*)(wd.data() + off), n);
         }
     }
+    cut = text.size() >= kQuickDoc / 2;  // (one piece: the loop above never tests it)
     text.resize(std::min(text.size(), kQuickDoc / 2));
     MdOut md;
     md.Open();
@@ -1353,7 +1354,7 @@ Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs, size_t
     int depth = 0;
     bool pendingString = false;
     size_t pr = 0, pc = 0, records = 0;
-    for (k = 0; k + 4 <= t.size(); k += 4 + U16(t, k + 2)) {
+    for (k = 0; k + 4 + U16(t, k + 2) <= t.size(); k += 4 + U16(t, k + 2)) {  // a record cut at the end of `t`: not read
         unsigned type = U16(t, k);
         std::string_view d = rec(t, k);
         size_t r = U16(d, 0), c = U16(d, 2);
@@ -1439,19 +1440,26 @@ std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, floa
     std::vector<std::wstring> tabs;
     Sheet rows;
     if (HasExt(path, L" .ods .ots ")) {
-        Members m;
-        size_t cap = quick ? kQuickXml : kMaxXml;
-        ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m);
-        if (!m.empty()) {
-            more = quick && m[0].second.size() >= cap, truncated = !quick && m[0].second.size() >= cap;
+        // No table within the first part (styles before it): the open path reads the whole XML after all.
+        for (size_t cap = quick ? kQuickXml : kMaxXml;; cap = kMaxXml) {
+            Members m;
+            ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m);
+            if (m.empty()) break;
+            bool cut = m[0].second.size() >= cap;
+            more = quick && cut && cap < kMaxXml, truncated = cut && cap == kMaxXml;
             rows = OdsSheet(m[0].second, sheet, tabs, maxRows, more, gen, mine);
+            if (!tabs.empty() || !cut || cap == kMaxXml) break;
+            more = false;
         }
     } else if (auto stg = OpenOle(path)) rows = XlsSheet(stg.Get(), sheet, tabs, maxRows, more, gen, mine);
     if (tabs.empty()) return nullptr;
+    bool capped = more && !quick;  // the worker stopped at kMaxRows: nothing more is coming
+    more &= quick;
     auto g = std::make_unique<GridData>();
     Fill(*g, rows);
     g->tabs = std::move(tabs), g->tab = sheet, g->more = more;
     if (more) g->sub = L"first " + std::to_wstring(kQuickRows) + L" rows · reading…";
+    if (capped) g->sub += L" · first " + std::to_wstring(kMaxRows) + L" rows";
     if (truncated) g->sub += L" · first " + std::to_wstring(kMaxXml >> 20) + L" MB";
     return g;
 }
