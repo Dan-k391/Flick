@@ -26,9 +26,10 @@ src/window.cpp    window: Mica chrome (Direct2D), text (Scintilla) + find, image
                   PDF layout, scrolling, media controls
 src/markdown.cpp  md4c -> blocks -> DirectWrite layouts (lazy); images; code via highlight.cpp
 src/convert.cpp   ipynb, AsciiDoc, rst -> Markdown        src/highlight.cpp Lexilla outside Scintilla
-src/pages.cpp     pptx slides and docx pages drawn (D2D + DirectWrite into WIC) for the PDF view, on its worker
+src/pages.cpp     pptx slides drawn (D2D + DirectWrite into WIC) for the PDF view, on its worker
+src/word.cpp      docx reading view: lazy blocks -> DirectWrite layouts; tables, pictures (worker), OMML math boxes
 src/office.cpp    odt/odp/doc/ppt -> Markdown; xlsx (formats, number formats, merges, pictures)/ods/xls -> sheet
-                  grid (OLE IStorage); xml.h: XML scanner, zips
+                  grid (OLE IStorage); xml.h: XML scanner + small DOM, zips
 src/pdf.cpp       PDF worker: Windows.Data.Pdf -> IPdfRendererNative -> WIC bitmap
 src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees; sheets drawn like Excel
 src/font.cpp      font specimen        src/svg.cpp SVG/SVGZ (lunasvg)        src/fileinfo.cpp exe/dll/msi lines
@@ -61,7 +62,8 @@ Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after st
 |---|---|---|---|
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms | PDF page 1 (simple / real text) | ~20 / ~35 ms |
 | folder tree C:\Windows (10k) | ~53 ms | video first frame (engine alone ~300 ms) | ~45–50 ms |
-| sheets xlsx (formatted / 50k×20) / xls / ods, doc/ppt/odt/odp text | 7–11 ms | docx / pptx page 1 (real files) | 12–23 ms |
+| sheets xlsx (formatted / 50k×20) / xls / ods, doc/ppt/odt/odp text | 7–11 ms | pptx page 1 (real files) | 12–23 ms |
+| docx (lecture.docx, 2.4 MB Lec16-18 with math + pictures) | 5–6 ms | | |
 
 Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
@@ -101,11 +103,19 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
 - **Markdown**: md4c with `MD4C_USE_UTF16`; blocks laid out lazily; images measured at layout, decoded when drawn.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
 - **Office**: Windows preview handlers (Office's own previewers, what QuickLook uses) were tried and dropped:
-  0.1 s warm, 0.6–1.1 s cold, 200–300 MB Office processes stay resident. pptx/docx are drawn by pages.cpp instead:
+  0.1 s warm, 0.6–1.1 s cold, 200–300 MB Office processes stay resident. pptx are drawn by pages.cpp instead:
   slides follow placeholder inheritance (slide -> layout -> master: idx, then type), text styles chain lstStyle ->
-  master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff. docx is
-  flowed onto pages at open (styles with basedOn, numbering, tables, inline pictures); split paragraphs are one
-  layout drawn clipped per page. Pictures are read from the zip per page, decoded at the drawn size.
+  master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff.
+- **docx** (word.cpp): imitation pages looked bad (tiny text on a fake sheet) → one column at the window width,
+  1 pt = 96/72 DIP. document.xml is inflated at open, but body children are DOM-parsed and laid out only as far as
+  the view scrolls (Markdown's pattern); height = laid height / fraction of the XML consumed until the end.
+  Pictures, math, super/subscripts and first-line indents are `IDWriteInlineObject`s (math/pictures stretch the
+  line; `IDWriteTextLayout3` PROPORTIONAL spacing keeps that for Word's "auto" line rule; East Asian `docGrid`
+  lines snap to the pitch). Display math is an object as wide as the line (centred inside). Math: Unicode math
+  italic letters in Cambria Math, a box per OMML element, delimiters stretched by a transform. Pictures: decoded
+  on a worker at the drawn size (`WM_FLICK_WORD` + generation), requested while drawing. Colours: auto text is
+  the palette's on the window, black/white by luminance on fills; dark explicit colours get lightness mirrored in
+  dark mode. Anchored pictures go after their paragraph's text (ink overlays appear below the picture).
 - **Sheets** (xlsx): styles.xml resolved per cellXfs (theme colours + tint, indexed palette), `cellIs` conditional
   formats, Excel number formats (`FormatNumber`, selftested), column widths from the default font's digit width
   (DengXian is 8 px, not Calibri's 7). The open path reads the first 100 rows (256 KB of XML/strings); a worker
@@ -131,8 +141,8 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   `newline='\n'`. No `gh` CLI: releases via curl + the git credential token.
 
 ## Ideas / not done
-eml/CAD via preview handlers; charts/SmartArt, docx headers/footers/floating objects/superscript, odt/odp/doc/ppt
-as pages, sheet charts (placeholder box)/zoom/rich-text runs/other conditional formats/[Red] and fractions in
+eml/CAD via preview handlers; charts/SmartArt (placeholder box), docx headers/footers/footnote bodies/columns/
+explicit tab stops/floating positions/table style conditional formats/EMF pictures, odt/odp/doc/ppt as pages, sheet charts (placeholder box)/zoom/rich-text runs/other conditional formats/[Red] and fractions in
 number formats, ods/xls formatting, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
 Markdown links/raw HTML/find; PDF zoom/text selection/find; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.
