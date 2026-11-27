@@ -25,18 +25,11 @@ constexpr float kMargin = 12;                // around the column, DIPs
 constexpr UINT32 kAuto = 1, kLink = 2;       // brush keys: the palette's text and link colours (real ones are 0xFFRRGGBB)
 constexpr wchar_t kObj = 0xFFFC;             // stands for an inline object in the text
 
-IDWriteFactory* DW() {
-    static ComPtr<IDWriteFactory> f;
-    if (!f) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)f.GetAddressOf());
-    return f.Get();
-}
-float Num(std::string_view v, float def = 0) { return v.empty() ? def : (float)atof(std::string(v).c_str()); }
 float Twips(std::string_view v, float def = 0) { return Num(v, def * 15) / 15; }  // twentieths of a point -> DIPs
 UINT32 Hex(std::string_view v) {
     return v.size() == 6 && v != "auto" ? 0xFF000000 | (UINT32)strtoul(std::string(v).c_str(), nullptr, 16) : 0;
 }
 float Lum(UINT32 c) { return (0.299f * (c >> 16 & 255) + 0.587f * (c >> 8 & 255) + 0.114f * (c & 255)) / 255; }
-D2D1_COLOR_F Color(UINT32 c) { return {(c >> 16 & 255) / 255.f, (c >> 8 & 255) / 255.f, (c & 255) / 255.f, 1}; }
 bool On(const Node* n) {
     if (!n) return false;
     std::string_view v = n->A("val");
@@ -69,7 +62,7 @@ ComPtr<ID2D1StrokeStyle> g_dash, g_dot;
 
 ID2D1SolidColorBrush* Brush(UINT32 key) {
     auto& b = g_brush[key];
-    if (!b) g_rt->CreateSolidColorBrush(Color(key), &b);
+    if (!b) g_rt->CreateSolidColorBrush(Rgb(key), &b);
     return b.Get();
 }
 

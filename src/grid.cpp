@@ -453,7 +453,6 @@ size_t At(const std::vector<float>& edges, float def, float v) {  // index of th
     if (v >= edges.back()) return edges.size() - 1 + (size_t)((v - edges.back()) / std::max(def, 1.f));
     return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(edges.begin(), edges.end(), v) - edges.begin() - 1);
 }
-D2D1_COLOR_F Rgb(UINT32 c, float a = 1) { return {(c >> 16 & 255) / 255.f, (c >> 8 & 255) / 255.f, (c & 255) / 255.f, a}; }
 
 IDWriteTextFormat* StyleFormat(const GridData& g, size_t i) {
     if (g_styleFmt[i]) return g_styleFmt[i];

@@ -202,6 +202,8 @@ struct FontFace {
 FontFace ResolveFont(const std::wstring& face);
 // A picture (PNG, JPEG, ...) decoded and scaled to w x h pixels; null if WIC can't read it. Any thread.
 Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h);
+bool HasExt(const std::wstring& path, const wchar_t* list);  // list: " .a .b ", lower case
+inline D2D1_COLOR_F Rgb(UINT32 c, float a = 1) { return {(c >> 16 & 255) / 255.f, (c >> 8 & 255) / 255.f, (c & 255) / 255.f, a}; }
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
 struct MediaState {

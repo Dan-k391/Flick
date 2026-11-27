@@ -26,10 +26,7 @@ struct Part {
 // ---- colours
 constexpr std::string_view kScheme[] = {"dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3",
                                         "accent4", "accent5", "accent6", "hlink", "folHlink"};
-D2D1_COLOR_F Rgb(std::string_view hex) {
-    unsigned v = (unsigned)strtoul(std::string(hex).c_str(), nullptr, 16);
-    return {(v >> 16 & 255) / 255.f, (v >> 8 & 255) / 255.f, (v & 255) / 255.f, 1};
-}
+D2D1_COLOR_F Rgb(std::string_view hex) { return ::Rgb((UINT32)strtoul(std::string(hex).c_str(), nullptr, 16)); }
 void ToHsl(const D2D1_COLOR_F& c, float& h, float& s, float& l) {
     float mx = std::max({c.r, c.g, c.b}), mn = std::min({c.r, c.g, c.b}), d = mx - mn;
     l = (mx + mn) / 2, h = s = 0;
@@ -78,13 +75,6 @@ struct Theme {
     }
 };
 
-IDWriteFactory* DW() {
-    static ComPtr<IDWriteFactory> f;
-    if (!f) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)f.GetAddressOf());
-    return f.Get();
-}
-
-float Num(std::string_view v, double def) { return (float)(v.empty() ? def : atof(std::string(v).c_str())); }
 std::string_view PhType(std::string_view t) {  // placeholder kinds that share a master placeholder
     return t.empty() || t == "obj" || t == "subTitle" ? "body" : t == "ctrTitle" ? "title" : t;
 }
@@ -231,6 +221,7 @@ struct Draw {
     }
 
     // ---- pictures
+    // Not DecodePicture: straight into a D2D bitmap (no extra copy on the first frame), and never scaled up.
     ComPtr<ID2D1Bitmap> Picture(const Node* blip, Part& part, UINT w, UINT h) {
         if (!blip) return nullptr;
         auto rel = part.rels.find(std::string(blip->A("r:embed")));
@@ -871,12 +862,7 @@ struct Draw {
 
 void PagesFree::operator()(Pages* p) const { delete p; }
 
-bool PagesFor(const std::wstring& path) {
-    const wchar_t* e = PathFindExtensionW(path.c_str());
-    for (const wchar_t* x : {L".pptx", L".pptm", L".potx", L".potm", L".ppsx", L".ppsm"})
-        if (!_wcsicmp(e, x)) return true;
-    return false;
-}
+bool PagesFor(const std::wstring& path) { return HasExt(path, L" .pptx .pptm .potx .potm .ppsx .ppsm "); }
 
 PagesPtr PagesOpen(const std::wstring& path) {
     PagesPtr d(new Pages);

@@ -514,12 +514,6 @@ bool LoadSvg(const std::wstring& path) {
     return true;
 }
 
-bool HasExt(const std::wstring& path, const wchar_t* list) {
-    std::wstring ext = PathFindExtensionW(path.c_str());
-    for (auto& c : ext) c = towlower(c);
-    return !ext.empty() && wcsstr(list, (L" " + ext + L" ").c_str());
-}
-
 // Markdown, and formats shown through it: notebooks (whole file: outputs embed images), AsciiDoc, rst.
 bool LoadMarkdown(const std::wstring& path) {
     std::string buf;

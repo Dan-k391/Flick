@@ -64,6 +64,13 @@ struct Xml {
     }
 };
 
+IDWriteFactory* DW() {  // for the worker threads too (shared factories are thread-safe)
+    static Microsoft::WRL::ComPtr<IDWriteFactory> f;
+    if (!f) DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)f.GetAddressOf());
+    return f.Get();
+}
+float Num(std::string_view v, float def = 0) { return v.empty() ? def : (float)atof(std::string(v).c_str()); }
+
 // An attribute by local name (any prefix).
 std::string_view Attr(std::string_view a, std::string_view local) {
     for (size_t k = 0; (k = a.find(local, k)) != a.npos; k += local.size()) {

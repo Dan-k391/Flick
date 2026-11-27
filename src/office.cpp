@@ -706,7 +706,9 @@ void Ref(std::string_view ref, long long& r, long long& c) {
 // Column width in Excel's character units -> DIPs (Excel's rule; mdw: the default font's widest digit).
 float ColPx(double w, float mdw) { return (float)std::trunc((256 * w + std::trunc(128 / mdw)) / 256 * mdw); }
 
-Microsoft::WRL::ComPtr<IWICBitmap> DecodePic(std::string_view bytes, UINT w, UINT h) {
+}  // namespace
+
+Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h) {
     using Microsoft::WRL::ComPtr;
     IWICImagingFactory* wic = WicFactory();
     ComPtr<IWICStream> st;
@@ -724,6 +726,8 @@ Microsoft::WRL::ComPtr<IWICBitmap> DecodePic(std::string_view bytes, UINT w, UIN
         return nullptr;
     return out;
 }
+
+namespace {
 
 // Pictures (decoded at drawn size x scale) and charts (placeholders) of a drawing, at their cell anchors.
 void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData& g, float scale) {
@@ -778,7 +782,7 @@ void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData&
     for (size_t i = 0; i < g.pics.size(); i++)
         if (std::string_view bytes = media[i].empty() ? std::string_view{} : Member(m, media[i]); !bytes.empty()) {
             D2D1_RECT_F rc = g.pics[i].rc;
-            g.pics[i].wic = DecodePic(bytes, std::max(1u, (UINT)std::lround((rc.right - rc.left) * scale)),
+            g.pics[i].wic = DecodePicture(bytes, std::max(1u, (UINT)std::lround((rc.right - rc.left) * scale)),
                                       std::max(1u, (UINT)std::lround((rc.bottom - rc.top) * scale)));
         }
 }
@@ -1393,31 +1397,23 @@ Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs, size_t
     return rows;
 }
 
-bool Has(const std::wstring& path, const wchar_t* list) {
-    const wchar_t* e = wcsrchr(path.c_str(), L'.');
-    if (!e) return false;
-    std::wstring key = L" " + std::wstring(e) + L" ";
-    for (auto& ch : key) ch = towlower(ch);
-    return wcsstr(list, key.c_str()) != nullptr;
-}
-
 }  // namespace
 
 std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub) {
     std::string md;
     int slides = -1;
     bool cut = false;
-    if (Has(path, L" .docx .docm .dotx .dotm ")) {
+    if (HasExt(path, L" .docx .docm .dotx .dotm ")) {
         Members m;
         ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"word/document.xml" || n == L"word/styles.xml" ? kMaxXml : 0; }, m);
         md = DocxToMd(Member(m, L"word/document.xml"), Member(m, L"word/styles.xml"));
-    } else if (Has(path, L" .odt .ott .odp .otp ")) {
+    } else if (HasExt(path, L" .odt .ott .odp .otp ")) {
         Members m;
         ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"content.xml" ? kQuickDoc : 0; }, m);
-        if (!m.empty()) md = OdfToMd(m[0].second, Has(path, L" .odp .otp "), slides), cut = m[0].second.size() >= kQuickDoc;
+        if (!m.empty()) md = OdfToMd(m[0].second, HasExt(path, L" .odp .otp "), slides), cut = m[0].second.size() >= kQuickDoc;
     } else if (auto stg = OpenOle(path)) {
-        if (Has(path, L" .doc .dot ")) md = DocToMd(stg.Get(), cut);
-        else if (Has(path, L" .ppt .pps .pot ")) md = PptToMd(stg.Get(), slides, cut);
+        if (HasExt(path, L" .doc .dot ")) md = DocToMd(stg.Get(), cut);
+        else if (HasExt(path, L" .ppt .pps .pot ")) md = PptToMd(stg.Get(), slides, cut);
     }
     if (slides > 0) sub = std::to_wstring(slides) + (slides == 1 ? L" slide" : L" slides");
     if (cut) {  // shortcut: the rest is not shown; a worker would have to re-lay out the whole document anyway
@@ -1427,16 +1423,22 @@ std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub) {
     return Wide(md);
 }
 
-Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h) { return DecodePic(bytes, w, h); }
+bool HasExt(const std::wstring& path, const wchar_t* list) {
+    const wchar_t* e = wcsrchr(path.c_str(), L'.');
+    if (!e || wcschr(e, L'\\')) return false;
+    std::wstring key = L" " + std::wstring(e) + L" ";
+    for (auto& ch : key) ch = towlower(ch);
+    return wcsstr(list, key.c_str()) != nullptr;
+}
 
 std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale, const std::atomic<int>* gen, int mine) {
-    if (Has(path, L" .xlsx .xlsm .xltx .xltm ")) return XlsxGrid(path, sheet, picScale, gen, mine);
+    if (HasExt(path, L" .xlsx .xlsm .xltx .xltm ")) return XlsxGrid(path, sheet, picScale, gen, mine);
     // ods/xls: the open path reads the first rows (and at most kQuickXml of ods XML); the worker the rest.
     bool quick = picScale <= 0, more = false, truncated = false;
     size_t maxRows = quick ? kQuickRows : kMaxRows;
     std::vector<std::wstring> tabs;
     Sheet rows;
-    if (Has(path, L" .ods .ots ")) {
+    if (HasExt(path, L" .ods .ots ")) {
         Members m;
         size_t cap = quick ? kQuickXml : kMaxXml;
         ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m);
