@@ -6,7 +6,7 @@ press **Space**; **Space**/**Esc** closes.
 ## Goals (in order)
 1. **Instant**: 10–15 ms key press → frame on screen for text, Markdown, images, folders (PDF: page 1 is
    bounded by the Windows PDF engine). Measure every change to the open path (*Speed test*); don't guess.
-2. **Light**: idle ~20–25 MB private. No GPU driver in-process.
+2. **Light**: idle ~15–17 MB private. No GPU driver in-process.
 3. **Windows 11 look**: Mica, rounded corners, light/dark, slim title bar (name, details, "Open with …", close).
 4. Small native code; no frameworks or runtime dependencies beyond Windows.
 
@@ -62,10 +62,10 @@ Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after st
 |---|---|---|---|
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms | PDF page 1 (simple / real text) | ~20 / ~35 ms |
 | folder tree C:\Windows (10k) | ~53 ms | video first frame (engine alone ~300 ms) | ~45–50 ms |
-| sheets xlsx (formatted / 50k×20) / xls / ods, doc/ppt/odt/odp text | 7–11 ms | pptx page 1 (real files) | 12–23 ms |
-| docx (lecture.docx, 2.4 MB Lec16-18 with math + pictures) | 5–6 ms | | |
+| sheets xlsx (formatted / 50k×20) / xls / ods, doc/ppt/odt/odp text | 4–11 ms | pptx page 1 (Compiler / real.pptx) | ~13 / ~21 ms |
+| docx (lecture.docx, 2.4 MB Lec16-18 with math + pictures) | 5–6 ms | docx table 3000 rows / 12 MB xls | ~20 / ~11 ms |
 
-Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
+Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
 ## Conventions
 - C++20, MSVC, `/utf-8`, Win32 + COM (`ComPtr`), no exceptions. Direct2D draws in DIPs; Win32 uses pixels.
@@ -105,28 +105,40 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
 - **Office**: Windows preview handlers (Office's own previewers, what QuickLook uses) were tried and dropped:
   0.1 s warm, 0.6–1.1 s cold, 200–300 MB Office processes stay resident. pptx are drawn by pages.cpp instead:
   slides follow placeholder inheritance (slide -> layout -> master: idx, then type), text styles chain lstStyle ->
-  master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff.
+  master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff. Opening
+  reads presentation.xml + the .rels files only; a page reads its slide/layout/master/theme and pictures in one
+  zip pass when first drawn. Page 1 is mostly the 1920 px software bitmap (~2.5 ms to create, ~2.6 ms to
+  rasterise) and picture decoding. Table rows grow to their text (`a:tr h` is a minimum).
+- **Font names** in Office files are GDI faces ("Calibri Light", "等线 Light", "Arial Narrow"): `ResolveFont`
+  (GDI interop, cached) gives DirectWrite family + weight + stretch; as a family name they fell back too heavy.
+- **Untrusted XML**: the DOM drops elements deeper than 256 (`kMaxDepth`): every walker over it recurses.
 - **docx** (word.cpp): imitation pages looked bad (tiny text on a fake sheet) → one column at the window width,
-  1 pt = 96/72 DIP. document.xml is inflated at open, but body children are DOM-parsed and laid out only as far as
+  1 pt = 96/72 DIP. document.xml is inflated at open (~1 ms/MB; streaming it would need the final sectPr for the
+  column width and the archive kept open: not done), but body children are DOM-parsed and laid out only as far as
   the view scrolls (Markdown's pattern); height = laid height / fraction of the XML consumed until the end.
+  Tables: cell grid (spans, borders) for the whole table, rows laid out lazily too. Title: the word count.
   Pictures, math, super/subscripts and first-line indents are `IDWriteInlineObject`s (math/pictures stretch the
   line; `IDWriteTextLayout3` PROPORTIONAL spacing keeps that for Word's "auto" line rule; East Asian `docGrid`
   lines snap to the pitch). Display math is an object as wide as the line (centred inside). Math: Unicode math
   italic letters in Cambria Math, a box per OMML element, delimiters stretched by a transform. Pictures: decoded
-  on a worker at the drawn size (`WM_FLICK_WORD` + generation), requested while drawing. Colours: auto text is
-  the palette's on the window, black/white by luminance on fills; dark explicit colours get lightness mirrored in
-  dark mode. Anchored pictures go after their paragraph's text (ink overlays appear below the picture).
+  on a worker at the drawn size (`WM_FLICK_WORD` + generation), requested while drawing, released 3 screens away.
+  Colours: auto text is the palette's on the window, black/white by luminance on fills; in dark mode `DarkInk`
+  (shared with sheets): near-black only below 60 in every channel (by luminance navy/dark red went white),
+  other dark colours get lightness mirrored, hue kept. Anchored pictures go after their paragraph's text (ink overlays appear below the picture).
 - **Sheets** (xlsx): styles.xml resolved per cellXfs (theme colours + tint, indexed palette), `cellIs` conditional
   formats, Excel number formats (`FormatNumber`, selftested), column widths from the default font's digit width
   (DengXian is 8 px, not Calibri's 7). The open path reads the first 100 rows (256 KB of XML/strings); a worker
   (`more`) re-reads the whole sheet and decodes pictures at drawn size, then replaces the grid. Text drawing is
   the cost: `D2D1_DRAW_TEXT_OPTIONS_CLIP` or a clip per cell doubled it (50k×20: 18 → 8 ms), so only overflowing
   text gets a clip. Dark mode: no-fill cells show the window, near-black text/borders take the palette text,
-  white fills count as none. Tabs scroll (wheel, arrows) to the active one.
+  white fills count as none. Tabs scroll (wheel, arrows) to the active one. xls/ods: first 100 rows on the open
+  path too (xls: direct-mode `StgOpenStorageEx`, 0.2 vs ~8 ms transacted; globals + 256 KB of the sheet; shared
+  strings decoded lazily); ods rows repeated with content cap at 1000 copies.
 - **Office** text formats: what's written, not the layout. OOXML/ODF are zips
   read with archiveint (members by name, others skipped by seeking); headings from styles.xml names
   ("heading N" is English in every UI language). `.ppt` text sits in slide drawings (persist directory chain),
   older files also in SlideListWithText. `.doc` via the piece table: plain paragraphs. `.xls` BIFF8 only.
+  The open path reads 512 KB (XML or text) and cuts the rest with a note: a worker would re-lay out it all anyway.
 - **archiveint.dll** (undocumented) gives zip/7z/rar/tar/cab/iso listing and gunzip; missing → info card.
 - **Folders** list breadth-first ≤60 ms / 10k items; sizes on a worker. Sort with `CompareStringEx(DIGITSASNUMBERS)`.
 - **Video**: the engine takes ~300 ms to a first frame (~200 ms to metadata) and slows a reader on the same file,
