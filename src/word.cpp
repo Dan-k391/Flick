@@ -55,6 +55,8 @@ UINT32 Highlight(std::string_view v) {
 ID2D1RenderTarget* g_rt;  // the target being painted (inline objects draw into it)
 ComPtr<ID2D1RenderTarget> g_brushRt;  // the brushes' target (held: a new one at the same address is still new)
 float g_origin;  // document y 0 on screen during a paint
+float g_top, g_bottom;  // the visible area on screen during a paint
+int g_paint;            // paint counter
 std::map<UINT32, ComPtr<ID2D1SolidColorBrush>> g_brush;
 float g_dpi = 96;
 bool g_dark;
@@ -71,7 +73,8 @@ struct Pic {
     ComPtr<ID2D1Bitmap> bmp;
     UINT px = 0;  // width decoded at
     bool pending = false, failed = false;
-    float y = 0;  // document y where last drawn
+    float y = 0;    // document y where last drawn on screen
+    int seen = -1;  // paint that last drew it on screen
 };
 std::map<std::wstring, Pic> g_pics;
 std::vector<std::tuple<std::wstring, UINT, UINT>> g_want;  // drawn without pixels during this paint
@@ -459,7 +462,9 @@ struct Obj final : IDWriteInlineObject {
         else if (!media.empty() || placeholder) {
             D2D1_RECT_F r{x, y, x + w, y + asc};
             Pic* p = media.empty() ? nullptr : &g_pics[media];
-            if (p) p->y = y - g_origin;
+            // DirectWrite draws every object of a visible paragraph, also far off screen: only those on screen count.
+            bool visible = r.bottom >= g_top && r.top <= g_bottom;
+            if (p && visible) p->y = y - g_origin, p->seen = g_paint;
             if (p && p->bmp) g_rt->DrawBitmap(p->bmp.Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             if (!p || p->failed) {  // quiet placeholder
                 ID2D1SolidColorBrush* b = Brush(kAuto);
@@ -469,7 +474,7 @@ struct Obj final : IDWriteInlineObject {
                 b->SetOpacity(a);
             }
             UINT px = std::max(1u, (UINT)std::lround(w * g_dpi / 96)), py = std::max(1u, (UINT)std::lround(asc * g_dpi / 96));
-            if (p && !p->pending && !p->failed && (!p->bmp || px > p->px * 5 / 4)) g_want.push_back({media, px, py}), p->pending = true;
+            if (p && visible && !p->pending && !p->failed && (!p->bmp || px > p->px * 5 / 4)) g_want.push_back({media, px, py}), p->pending = true;
         }
         return S_OK;
     }
@@ -1349,10 +1354,10 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
         else break;
     }
     g_want.clear();
-    g_origin = area.top - scroll;
+    g_origin = area.top - scroll, g_top = area.top, g_bottom = area.bottom, g_paint++;
     DrawItems(rt, g_items, area.left + kMargin, g_origin, area.top, area.bottom);
     for (auto& [name, p] : g_pics)  // pictures more than 3 screens away give their pixels back (decoded again on return)
-        if (p.bmp && std::abs(p.y - (scroll + viewH / 2)) > 3 * viewH) p.bmp.Reset(), p.px = 0;
+        if (p.bmp && p.seen != g_paint && std::abs(p.y - (scroll + viewH / 2)) > 3 * viewH) p.bmp.Reset(), p.px = 0;
     if (!g_want.empty())
         CloseHandle(CreateThread(nullptr, 0, PicThread, new PicJob{d.path, g_gen, std::move(g_want)}, 0, nullptr)), g_want.clear();
     const Table* open = g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
