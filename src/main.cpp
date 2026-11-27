@@ -162,6 +162,8 @@ int Bench(int argc, wchar_t** argv) {
             t.kind, PathFindFileNameW(full), first.ready, first.composed, t.load, ready[kRuns / 2],
             composed[kRuns / 2], ready[0]);
     }
+    for (LONGLONG s = Now(); MsSince(s) < 1500;)  // workers of the last preview (a big sheet's rows) wind down
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT), Pump();
     PrintMemory(L"after bench");
     return 0;
 }
