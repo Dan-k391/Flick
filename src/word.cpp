@@ -526,11 +526,22 @@ struct Cell {
     Bd bd[4];
     int valign = 0;  // 0 top, 1 centre, 2 bottom
     std::vector<Item> items;
+    const Node* tc = nullptr;  // laid out when its row is reached
+    float mr = 0, mb = 0;
 };
+// Cells (positions, spans, borders) are known up front; rows are laid out as far as the view needs.
 struct Table {
     float x = 0;
-    std::vector<float> rowY{0};
-    std::vector<Cell> cells;
+    std::vector<float> rowY{0};  // edges of the rows laid out so far
+    std::vector<Cell> cells;     // in row order
+    std::vector<float> rowMin;   // per row
+    std::vector<bool> exact;
+    size_t next = 0;             // first cell not laid out
+    std::vector<size_t> spans;   // laid-out cells spanning rows below
+    UINT32 bg = 0;
+    const Node* ts = nullptr;
+    size_t Laid() const { return rowY.size() - 1; }
+    bool Done() const { return Laid() >= rowMin.size(); }
 };
 
 struct Ctx {
@@ -996,7 +1007,36 @@ struct Para {
 };
 
 // ---- tables
-void LayoutTable(Word& d, const Node& tbl, float width, const Ctx& ctx, Item& it) {
+// Lays out rows until the table is `until` tall: a row's cells, then its height (the tallest single-row cell;
+// a cell spanning rows adds what it still needs to its last row).
+void TableRows(Word& d, Item& it, float until) {
+    Table& t = *it.table;
+    while (!t.Done() && t.rowY.back() < until) {
+        size_t r = t.Laid();
+        float h = t.rowMin[r];
+        for (; t.next < t.cells.size() && t.cells[t.next].row == r; t.next++) {
+            Cell& c = t.cells[t.next];
+            std::vector<const Node*> nodes;
+            Word::Flatten(*c.tc, nodes);
+            LayoutAll(d, nodes, std::max(1.f, c.w - c.ml - c.mr), {c.fill ? c.fill : t.bg, t.ts}, c.items);
+            for (auto& i : c.items) c.contentH = std::max(c.contentH, i.y + i.h + i.after);
+            if (!c.items.empty()) c.contentH -= c.items.back().after;  // no space after the last paragraph
+            c.contentH += c.mt + c.mb;
+            if (c.span > 1) t.spans.push_back(t.next);
+            else if (!t.exact[r]) h = std::max(h, c.contentH);
+        }
+        t.rowY.push_back(t.rowY.back() + h);
+        std::erase_if(t.spans, [&](size_t i) {
+            const Cell& c = t.cells[i];
+            if (c.row + c.span - 1 > r && !t.Done()) return false;
+            t.rowY.back() += std::max(0.f, c.contentH - (t.rowY.back() - t.rowY[c.row]));
+            return true;
+        });
+    }
+    it.h = t.rowY.back();
+}
+
+void LayoutTable(Word& d, const Node& tbl, float width, const Ctx& ctx, Item& it, float until) {
     auto t = std::make_unique<Table>();
     const Node* pr = tbl["tblPr"];
     const Node* ts = pr && (*pr)["tblStyle"] ? d.Style((*pr)["tblStyle"]->A("val")) : nullptr;
@@ -1042,8 +1082,8 @@ void LayoutTable(Word& d, const Node& tbl, float width, const Ctx& ctx, Item& it
     float ml = margin(mar, {"left", "start"}, 108 / 15.f), mr = margin(mar, {"right", "end"}, 108 / 15.f);
     float mt = margin(mar, {"top"}, 0), mb = margin(mar, {"bottom"}, 0);
 
-    std::vector<float> rowMin;
-    std::vector<bool> exact;
+    std::vector<float>& rowMin = t->rowMin;
+    std::vector<bool>& exact = t->exact;
     std::vector<int> owner(cols, -1);  // cell a vertical merge started in, per grid column
     size_t r = 0;
     for (auto& tr : tbl.kids) {
@@ -1067,7 +1107,7 @@ void LayoutTable(Word& d, const Node& tbl, float width, const Ctx& ctx, Item& it
             }
             const Node* tm = tcPr ? (*tcPr)["tcMar"] : nullptr;
             Cell cell{colX[c], colX[c + span] - colX[c], margin(tm, {"left", "start"}, rl), margin(tm, {"top"}, rt), 0, r};
-            float cr = margin(tm, {"right", "end"}, rr), cb = margin(tm, {"bottom"}, rb);
+            cell.tc = &tc, cell.mr = margin(tm, {"right", "end"}, rr), cell.mb = margin(tm, {"bottom"}, rb);
             if (const Node* shd = tcPr ? (*tcPr)["shd"] : nullptr)
                 cell.fill = shd->A("val") == "solid" ? Hex(shd->A("color")) : Hex(shd->A("fill"));
             std::string_view va = tcPr && (*tcPr)["vAlign"] ? (*tcPr)["vAlign"]->A("val") : "";
@@ -1081,63 +1121,47 @@ void LayoutTable(Word& d, const Node& tbl, float width, const Ctx& ctx, Item& it
                 cell.bd[s] = Border(b);
                 if (b) cell.bd[s].space = -1;  // decided by the cell
             }
-            std::vector<const Node*> nodes;
-            Word::Flatten(tc, nodes);
-            Ctx inner{cell.fill ? cell.fill : ctx.bg, ts};
-            LayoutAll(d, nodes, std::max(1.f, cell.w - cell.ml - cr), inner, cell.items);
-            for (auto& i : cell.items) cell.contentH = std::max(cell.contentH, i.y + i.h + i.after);
-            if (!cell.items.empty()) cell.contentH -= cell.items.back().after;  // no space after the last paragraph
-            cell.contentH += cell.mt + cb;
             for (size_t k = c; k < c + span; k++) owner[k] = vm ? (int)t->cells.size() : -1;
             t->cells.push_back(std::move(cell));
             c += span;
         }
         r++;
     }
-    std::vector<float> rowH(rowMin);
-    for (auto& c : t->cells)
-        if (c.span == 1 && !exact[c.row]) rowH[c.row] = std::max(rowH[c.row], c.contentH);
-    for (auto& c : t->cells)
-        if (c.span > 1) {
-            float h = 0;
-            for (size_t k = c.row; k < c.row + c.span && k < rowH.size(); k++) h += rowH[k];
-            if (h < c.contentH) rowH[std::min(c.row + c.span, rowH.size()) - 1] += c.contentH - h;
-        }
-    for (float h : rowH) t->rowY.push_back(t->rowY.back() + h);
     auto tb = [&](std::string_view n) { return Border(borders ? (*borders)[n] : nullptr); };
     for (auto& c : t->cells) {
-        bool atL = c.x <= colX[0] + 0.01f, atR = c.x + c.w >= colX.back() - 0.01f, atT = c.row == 0, atB = c.row + c.span >= rowH.size();
+        bool atL = c.x <= colX[0] + 0.01f, atR = c.x + c.w >= colX.back() - 0.01f, atT = c.row == 0, atB = c.row + c.span >= rowMin.size();
         Bd def[4] = {atL ? (borders && (*borders)["left"] ? tb("left") : tb("start")) : tb("insideV"), atT ? tb("top") : tb("insideH"),
                      atR ? (borders && (*borders)["right"] ? tb("right") : tb("end")) : tb("insideV"), atB ? tb("bottom") : tb("insideH")};
         for (int s = 0; s < 4; s++)
             if (c.bd[s].space != -1) c.bd[s] = def[s];
             else c.bd[s].space = 0;
     }
-    it.h = t->rowY.back();
+    t->bg = ctx.bg, t->ts = ts;
     it.after = 0;
     it.table = std::move(t);
+    TableRows(d, it, until);
 }
 
-void LayoutOne(Word& d, const Node& n, float width, const Ctx& ctx, const Item* prev, Item& it) {
-    if (n.name == "tbl") return LayoutTable(d, n, width, ctx, it);
-    Para p{d, n, it, width, ctx};
-    p.Build(prev);
+// A block (and the text boxes it holds) laid out at `y` into `out`; returns the y after it. A table stops
+// once it reaches `until` (the rest: TableRows).
+float LayoutBlock(Word& d, const Node& n, float width, const Ctx& ctx, std::vector<Item>& out, float y, float until = INFINITY) {
+    Item& it = out.emplace_back();
+    it.y = y;
+    if (n.name == "tbl") LayoutTable(d, n, width, ctx, it, until - y);
+    else Para{d, n, it, width, ctx}.Build(out.size() > 1 ? &out[out.size() - 2] : nullptr);
+    y = it.y + it.h + it.after;
+    for (const Node* b : std::vector<const Node*>(it.boxes)) {  // text box paragraphs
+        Item& bi = out.emplace_back();
+        bi.y = y;
+        Para{d, *b, bi, width, ctx}.Build(nullptr);
+        y = bi.y + bi.h + bi.after;
+    }
+    return y;
 }
 
 void LayoutAll(Word& d, const std::vector<const Node*>& nodes, float width, const Ctx& ctx, std::vector<Item>& out) {
     float y = 0;
-    for (size_t i = 0; i < nodes.size(); i++) {
-        Item& it = out.emplace_back();
-        it.y = y;
-        LayoutOne(d, *nodes[i], width, ctx, out.size() > 1 ? &out[out.size() - 2] : nullptr, it);
-        y = it.y + it.h + it.after;
-        for (const Node* b : std::vector<const Node*>(it.boxes)) {  // text box paragraphs
-            Item& bi = out.emplace_back();
-            bi.y = y;
-            LayoutOne(d, *b, width, ctx, nullptr, bi);
-            y = bi.y + bi.h + bi.after;
-        }
-    }
+    for (const Node* n : nodes) y = LayoutBlock(d, *n, width, ctx, out, y);
 }
 
 // ---- drawing
@@ -1157,18 +1181,23 @@ void Line(ID2D1RenderTarget* rt, D2D1_POINT_2F a, D2D1_POINT_2F b, const Bd& bd)
 
 void DrawItems(ID2D1RenderTarget* rt, std::vector<Item>& items, float x, float y, float top, float bottom);
 
-void DrawItem(ID2D1RenderTarget* rt, Item& it, float x, float y) {
+void DrawItem(ID2D1RenderTarget* rt, Item& it, float x, float y, float top, float bottom) {
     if (it.table) {
         Table& t = *it.table;
         x += t.x;
+        auto shown = [&](const Cell& c) {  // laid out and on screen
+            return c.row < t.Laid() && y + t.rowY[c.row] <= bottom && y + t.rowY[std::min(c.row + c.span, t.Laid())] >= top;
+        };
         for (auto& c : t.cells) {
-            D2D1_RECT_F r{x + c.x, y + t.rowY[c.row], x + c.x + c.w, y + t.rowY[std::min(c.row + c.span, t.rowY.size() - 1)]};
+            if (!shown(c)) continue;
+            D2D1_RECT_F r{x + c.x, y + t.rowY[c.row], x + c.x + c.w, y + t.rowY[std::min(c.row + c.span, t.Laid())]};
             if (c.fill) rt->FillRectangle(r, Brush(c.fill));
             float off = c.valign ? std::max(0.f, (r.bottom - r.top) - c.contentH) / (c.valign == 1 ? 2 : 1) : 0;
-            DrawItems(rt, c.items, r.left + c.ml, r.top + c.mt + off, -1e9f, 1e9f);
+            DrawItems(rt, c.items, r.left + c.ml, r.top + c.mt + off, top, bottom);
         }
         for (auto& c : t.cells) {
-            float l = x + c.x, r = l + c.w, tp = y + t.rowY[c.row], b = y + t.rowY[std::min(c.row + c.span, t.rowY.size() - 1)];
+            if (!shown(c)) continue;
+            float l = x + c.x, r = l + c.w, tp = y + t.rowY[c.row], b = y + t.rowY[std::min(c.row + c.span, t.Laid())];
             Line(rt, {l, tp}, {l, b}, c.bd[0]), Line(rt, {l, tp}, {r, tp}, c.bd[1]), Line(rt, {r, tp}, {r, b}, c.bd[2]),
                 Line(rt, {l, b}, {r, b}, c.bd[3]);
         }
@@ -1188,7 +1217,7 @@ void DrawItems(ID2D1RenderTarget* rt, std::vector<Item>& items, float x, float y
     for (auto& it : items) {
         float iy = y + it.y;
         if (iy > bottom) break;
-        if (iy + it.h >= top) DrawItem(rt, it, x, iy);
+        if (iy + it.h >= top) DrawItem(rt, it, x, iy, top, bottom);
     }
 }
 
@@ -1312,25 +1341,24 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
     Brush(kAuto)->SetColor(c.text), Brush(kLink)->SetColor(c.link);
     float width = area.right - area.left - 2 * kMargin, viewH = area.bottom - area.top;
     if (width != g_width) g_width = width, g_items.clear(), g_next = 0, g_laidH = kMargin, d.counters.clear(), d.notes = 0;
-    while (g_laidH < scroll + viewH + 400 && d.Block(g_next)) {
-        const Node* n = d.blocks[g_next++];
-        Item& it = g_items.emplace_back();
-        it.y = g_laidH;
-        LayoutOne(d, *n, width, {}, g_items.size() > 1 ? &g_items[g_items.size() - 2] : nullptr, it);
-        g_laidH = it.y + it.h + it.after;
-        for (const Node* b : std::vector<const Node*>(it.boxes)) {
-            Item& bi = g_items.emplace_back();
-            bi.y = g_laidH;
-            LayoutOne(d, *b, width, {}, nullptr, bi);
-            g_laidH = bi.y + bi.h + bi.after;
-        }
+    float until = scroll + viewH + 400;
+    for (;;) {
+        Item* last = g_items.empty() ? nullptr : &g_items.back();
+        if (last && last->table && !last->table->Done()) {  // a table laid out part way: more rows first
+            if (g_laidH >= until) break;
+            TableRows(d, *last, until - last->y);
+            g_laidH = last->y + last->h + last->after;
+        } else if (g_laidH < until && d.Block(g_next)) g_laidH = LayoutBlock(d, *d.blocks[g_next++], width, {}, g_items, g_laidH, until);
+        else break;
     }
     g_want.clear();
     DrawItems(rt, g_items, area.left + kMargin, area.top - scroll, area.top, area.bottom);
     if (!g_want.empty())
         CloseHandle(CreateThread(nullptr, 0, PicThread, new PicJob{d.path, g_gen, std::move(g_want)}, 0, nullptr)), g_want.clear();
-    bool all = d.done && g_next >= d.blocks.size();
+    const Table* open = g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
+    bool all = d.done && g_next >= d.blocks.size() && !open;
     float h = g_laidH + kMargin;
+    if (open) h += open->rowY.back() / std::max<size_t>(1, open->Laid()) * (open->rowMin.size() - open->Laid());  // the rows to come, at the average so far
     return all ? h : std::max(h, h / d.Parsed());  // estimate until the end is laid out
 }
 
