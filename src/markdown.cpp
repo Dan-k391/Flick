@@ -28,6 +28,7 @@ struct Block {
     BlockKind kind;
     int level = 0, indent = 0, quote = 0;  // heading level, list depth, quote depth
     bool tight = false;                    // text directly in a tight list item: small gap after
+    int part = 0;                          // code split in chunks: 1 first, 2 middle, 3 last (0: whole)
     std::wstring bullet;
     Text text;
     std::vector<std::vector<Text>> rows;  // tables; rows[0] is the header
@@ -41,7 +42,8 @@ struct Block {
 };
 
 constexpr float kIndent = 26, kQuote = 18, kCodePad = 12, kCellPadX = 10, kCellPadY = 6, kMaxWidth = 860;
-constexpr size_t kSampleRows = 50, kKeepRows = 200;  // tables: column widths from the first rows; layouts kept around the view
+// Tables: column widths from the first kSampleRows rows, layouts kept kKeepRows around the view; code: lines per chunk.
+constexpr size_t kSampleRows = 50, kKeepRows = 200, kCodeLines = 200;
 
 IDWriteFactory* g_dw;
 std::wstring g_mono;
@@ -95,6 +97,31 @@ struct Parser {
         Block& b = g_blocks.back();
         while (b.kind == B_Code && !b.text.s.empty() && b.text.s.back() == L'\n') b.text.s.pop_back();
         if (b.kind == B_Para && b.text.s.empty() && b.bullet.empty()) g_blocks.pop_back();  // e.g. an HTML block
+        if (b.kind == B_Code) Split();
+    }
+    // A long code block becomes chunks of kCodeLines lines, each laid out (and coloured) like a block of its own:
+    // one layout with tens of thousands of coloured runs took seconds (setting a run's colour isn't constant-time).
+    // Copying joins the chunks with CRLF, the line break they were split at.
+    // shortcut: each chunk is highlighted on its own (a string or comment open across the split loses its colour).
+    void Split() {
+        Block whole = std::move(g_blocks.back());
+        std::wstring_view s = whole.text.s;
+        size_t lines = std::count(s.begin(), s.end(), L'\n');
+        if (lines < 2 * kCodeLines) return void(g_blocks.back() = std::move(whole));
+        g_blocks.pop_back();
+        for (size_t at = 0, n = 0; at <= s.size(); n++) {
+            size_t end = at;
+            for (size_t k = 0; k < kCodeLines && end != s.npos; k++) end = s.find(L'\n', k ? end + 1 : at);  // its last line's end
+            Block& c = g_blocks.emplace_back(Block{B_Code, whole.level, whole.indent, whole.quote});
+            c.src = whole.src, c.part = n ? 2 : 1;
+            if (!n) c.bullet = whole.bullet;
+            c.text.s = s.substr(at, end == s.npos ? s.npos : end - at);
+            if (end == s.npos) {
+                c.part = 3;
+                break;
+            }
+            at = end + 1;
+        }
     }
     void Start(BlockKind k, int level = 0) {
         End();
@@ -161,6 +188,8 @@ int LeaveBlock(MD_BLOCKTYPE type, void*, void* user) {
     }
     return 0;
 }
+
+float CodeTop(const Block& b) { return b.part <= 1 ? kCodePad : 0; }  // the text's offset in a code block (chunk)
 
 bool Remote(const std::wstring& src) { return src.find(L"://") != std::wstring::npos || src.starts_with(L"//"); }
 
@@ -364,7 +393,8 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
             before = b.level <= 2 ? 24 : 18, b.after = 10;
             break;
         case B_Code:
-            b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + 2 * kCodePad, b.after = 14;
+            b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + CodeTop(b) + (b.part % 3 == 0 ? kCodePad : 0);
+            b.after = b.part % 3 == 0 ? 14 : 0;  // chunks of one block: no gap between them
             for (auto& r : Highlight(b.text.s, LangForName(b.src)))
                 b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, r.len});
             break;
@@ -454,9 +484,13 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             break;
         case B_Code:
             fill->SetColor(c.codeBg);
-            rt->FillRoundedRectangle({{x, y, right, y + b.h}, 6, 6}, fill);
-            DrawSel(rt, b.text, unit, x + kCodePad, y + kCodePad, fill);
-            rt->DrawTextLayout({x + kCodePad, y + kCodePad}, b.text.layout.Get(), text);
+            if (b.part) {  // a chunk: round corners at the block's ends only (the background is translucent: no overlap)
+                rt->PushAxisAlignedClip({x, y, right, y + b.h}, D2D1_ANTIALIAS_MODE_ALIASED);
+                rt->FillRoundedRectangle({{x, b.part == 1 ? y : y - 8, right, b.part == 3 ? y + b.h : y + b.h + 8}, 6, 6}, fill);
+                rt->PopAxisAlignedClip();
+            } else rt->FillRoundedRectangle({{x, y, right, y + b.h}, 6, 6}, fill);
+            DrawSel(rt, b.text, unit, x + kCodePad, y + CodeTop(b), fill);
+            rt->DrawTextLayout({x + kCodePad, y + CodeTop(b)}, b.text.layout.Get(), text);
             break;
         case B_Rule: rt->FillRectangle({x, y, right, y + b.h}, fill); break;
         case B_Image:
@@ -623,7 +657,7 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
         for (size_t r = 0; r < ri; r++) cell += (UINT32)b.rows[r].size();
         cell += (UINT32)ci, t = &Cell(b, ri, ci);
         ox += b.colX[ci] + kCellPadX, oy += b.rowY[ri] + kCellPadY;
-    } else if (b.kind == B_Code) ox += kCodePad, oy += kCodePad;
+    } else if (b.kind == B_Code) ox += kCodePad, oy += CodeTop(b);
     if (!t->layout) return false;
     if (clicks) g_sel.unit = std::min(clicks, 3);
     UINT32 from, to;

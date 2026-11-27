@@ -435,6 +435,15 @@ c
         std::wstring both = MdCopy(part);
         if (item != L"item" || upto != L"one" || both != L"em one\r\n- two")
             ok = false, Log(L"selftest: markdown marker %s|%s|%s", item.c_str(), upto.c_str(), both.c_str());
+        {  // a long code block is laid out in chunks of lines: copied whole, it's the lines as written
+            std::wstring code, want;
+            for (int i = 0; i < 450; i++) code += L"  l" + std::to_wstring(i) + L"\n", want += (i ? L"\r\n  l" : L"  l") + std::to_wstring(i);
+            MdLoad(L"```\n" + code + L"```\n");
+            MdSelectAll();
+            std::wstring outline = MdOutline();
+            if (MdCopy() != want || outline.find(L"|C:  l200\n") == outline.npos || outline.find(L"|C:  l400\n") == outline.npos)
+                ok = false, Log(L"selftest: markdown code chunks");
+        }
         MdClear();
         {  // SRT (CRLF, tags, a missing blank line, out of order) and WebVTT (no hours, settings, escapes)
             auto srt = ParseSubtitles(L"1\r\n00:00:05,000 --> 00:00:06,500\r\nLate\r\n\r\n2\r\n00:00:01,250 --> 00:00:02,000\r\n"
