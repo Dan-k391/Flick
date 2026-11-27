@@ -61,7 +61,7 @@ if ($Window) {  # PrintWindow: includes child windows (the text view), but DWM c
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $dc = $g.GetHdc(); [void][Shot]::PrintWindow($h, $dc, 2); $g.ReleaseHdc($dc)
     $bmp.Save($out); $g.Dispose(); $bmp.Dispose()
-} else { [void][Shot]::SendMessage($h, 0x800E, [IntPtr]::Zero, [IntPtr]::Zero) }  # WM_FLICK_SHOT: Paint into $env:FLICK_SHOT
+} else { [void][Shot]::SendMessage($h, 0x800F, [IntPtr]::Zero, [IntPtr]::Zero) }  # WM_FLICK_SHOT: Paint into $env:FLICK_SHOT
 [void][Shot]::SendMessage($h, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)  # WM_CLOSE
 if (-not $p.WaitForExit(3000)) { $p.Kill() }
 $out
