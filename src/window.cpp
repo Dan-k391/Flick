@@ -1815,10 +1815,10 @@ void Paint() {
             if (GridGet()->sheet) doc.left = 0, doc.right = sz.width;  // edge to edge, like Excel
             D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
             g_doc[0] = size.width, g_doc[1] = size.height;
-            // A folder was collapsed below the end: pull the view back up (repaints once more).
-            if (float max = std::max(0.f, g_doc[1] - (sz.height - kTitleH)); g_scroll[1] > max)
-                g_scroll[1] = max, InvalidateRect(g_hwnd, nullptr, FALSE);
         }
+        // Past the end (a folder collapsed, a height estimate that was too long): pull the view back up, repaint once more.
+        if (float max = std::max(0.f, g_doc[1] - (sz.height - kTitleH)); g_scroll[1] > max)
+            g_scroll[1] = max, InvalidateRect(g_hwnd, nullptr, FALSE);
         g_rt->PopAxisAlignedClip();
         if (SideW() > 0) DrawSidebar(sz, text.Get(), sub.Get(), fill.Get());
         fill->SetColor(p.sub);

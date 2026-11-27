@@ -368,21 +368,25 @@ Text& Cell(Block& b, size_t ri, size_t ci) {
 
 bool Open(const Block& b) { return b.kind == B_Table && b.tab->rowY.size() <= b.tab->rows.size(); }  // rows still to lay out
 
-// Lays out rows until the table is `until` tall. Rows laid out without a limit (a jump past the table) keep no layouts.
+// Lays out rows until the table is `until` tall. Only rows near `until` keep their layouts (a jump far down measures
+// every row before it; without a limit, a jump past the table, none).
 void TableRows(Block& b, float until) {
-    while (Open(b) && b.tab->rowY.back() < until) {
-        size_t ri = b.tab->rowY.size() - 1;
+    Table& t = *b.tab;
+    for (size_t first = t.rowY.size() - 1; Open(b) && t.rowY.back() < until;) {
+        size_t ri = t.rowY.size() - 1;
         float rh = 0;
-        for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) {
+        for (size_t ci = 0; ci < t.rows[ri].size(); ci++) {
             DWRITE_TEXT_METRICS m{};
             Cell(b, ri, ci).layout->GetMetrics(&m);
             rh = std::max(rh, m.height);
-            if (until == INFINITY && ri >= b.tab->live1) b.tab->rows[ri][ci].layout.Reset();
+            if (until == INFINITY && ri >= t.live1) t.rows[ri][ci].layout.Reset();
         }
-        if (until != INFINITY) b.tab->live1 = std::max(b.tab->live1, ri + 1);
-        b.tab->rowY.push_back(b.tab->rowY.back() + std::ceil(rh) + 2 * kCellPadY);
+        if (until != INFINITY) t.live1 = std::max(t.live1, ri + 1);
+        if (size_t old = ri - kKeepRows; until != INFINITY && ri >= first + kKeepRows && old >= t.live0)
+            for (auto& c : t.rows[old]) c.layout.Reset();  // measured: its height is all that's needed
+        t.rowY.push_back(t.rowY.back() + std::ceil(rh) + 2 * kCellPadY);
     }
-    b.h = b.tab->rowY.back();
+    b.h = t.rowY.back();
 }
 
 void LayoutBlock(Block& b, float width, float until = INFINITY) {
@@ -417,16 +421,27 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
         case B_Table: {
             size_t cols = 0;
             for (auto& r : b.tab->rows) cols = std::max(cols, r.size());
-            std::vector<float> natural(cols, 0);  // from the first rows: the widths don't change as more rows are laid out
-            for (size_t ri = 0; ri < std::min(b.tab->rows.size(), kSampleRows); ri++)
-                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) {
-                    Text& c = b.tab->rows[ri][ci];
-                    LayoutText(c, g_fmtBody.Get(), 1e5f, dim);
-                    if (ri == 0) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
-                    DWRITE_TEXT_METRICS m{};
-                    c.layout->GetMetrics(&m);
-                    natural[ci] = std::max(natural[ci], std::ceil(m.widthIncludingTrailingWhitespace) + 2 * kCellPadX);
-                }
+            // Widths from the first rows and, per column, the longest text of any row: they don't change as rows are
+            // laid out (a layout per column, not per row).
+            std::vector<float> natural(cols, 0);
+            std::vector<const Text*> longest(cols, nullptr);
+            for (auto& r : b.tab->rows)
+                for (size_t ci = 0; ci < r.size(); ci++)
+                    if (!longest[ci] || r[ci].s.size() > longest[ci]->s.size()) longest[ci] = &r[ci];
+            auto measure = [&](Text& c, size_t ci, bool head, float slack) {
+                LayoutText(c, g_fmtBody.Get(), 1e5f, dim);
+                if (head) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
+                DWRITE_TEXT_METRICS m{};
+                c.layout->GetMetrics(&m);
+                natural[ci] = std::max(natural[ci], std::ceil(m.widthIncludingTrailingWhitespace * slack) + 2 * kCellPadX);
+            };
+            size_t sample = std::min(b.tab->rows.size(), kSampleRows);
+            for (size_t ri = 0; ri < sample; ri++)
+                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) measure(b.tab->rows[ri][ci], ci, ri == 0, 1);
+            for (size_t ci = 0; ci < cols; ci++) {  // a copy: that row keeps no layout
+                Text t{longest[ci]->s, longest[ci]->runs};
+                measure(t, ci, false, 1.15f);  // as long, but wider letters ("r4990" vs "r1000"): some room
+            }
             float total = 0;
             for (float n : natural) total += n;
             float k = total > w ? w / total : 1;  // shrink every column alike when the table is too wide
@@ -617,8 +632,12 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
         if (y > area.bottom) break;
         if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
     }
-    float h = g_laidH + 24;  // bottom padding; estimates until all is laid out: a table's rows at their average so far
-    if (const Block* t = g_laid ? &g_blocks[g_laid - 1] : nullptr; t && Open(*t)) h += t->h / std::max<size_t>(1, t->tab->rowY.size() - 1) * (t->tab->rows.size() + 1 - t->tab->rowY.size());
+    // Estimates until all is laid out: blocks at their average height so far; an open table's rows at theirs (the blocks
+    // after it at the average of those before it).
+    float h = g_laidH + 24;  // bottom padding
+    if (const Block* t = g_laid ? &g_blocks[g_laid - 1] : nullptr; t && Open(*t))
+        return h + t->h / std::max<size_t>(1, t->tab->rowY.size() - 1) * (t->tab->rows.size() + 1 - t->tab->rowY.size()) +
+               (g_laid > 1 ? t->y / (g_laid - 1) : 40) * (g_blocks.size() - g_laid);
     return g_laid == g_blocks.size() ? h : h * g_blocks.size() / std::max<size_t>(g_laid, 1);
 }
 
