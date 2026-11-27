@@ -423,6 +423,18 @@ c
         MdSelectAll();
         if (std::wstring cp = MdCopy(); cp != L"T\r\n- a\r\n  - b\r\n3. c\r\n- [x] d\r\n  if x:\r\n    y\r\nh\ti\r\n1\t2\r\nq\r\nr\r\nend\r\nline")
             ok = false, Log(L"selftest: markdown copy %s", cp.c_str());
+        // A list marker only with the item's text from its start: not for "item" of "- item one", nor (as an empty
+        // "- " line) for a selection that ends at the start of the next item.
+        MdLoad(L"- item one\n- two\n");
+        TextSel part;
+        part.a = {0, 0}, part.b = {0, 4};
+        std::wstring item = MdCopy(part);
+        part.a = {0, 5}, part.b = {1ull << 32, 0};
+        std::wstring upto = MdCopy(part);
+        part.a = {0, 2}, part.b = {1ull << 32, 3};
+        std::wstring both = MdCopy(part);
+        if (item != L"item" || upto != L"one" || both != L"em one\r\n- two")
+            ok = false, Log(L"selftest: markdown marker %s|%s|%s", item.c_str(), upto.c_str(), both.c_str());
         MdClear();
         {  // SRT (CRLF, tags, a missing blank line, out of order) and WebVTT (no hours, settings, escapes)
             auto srt = ParseSubtitles(L"1\r\n00:00:05,000 --> 00:00:06,500\r\nLate\r\n\r\n2\r\n00:00:01,250 --> 00:00:02,000\r\n"

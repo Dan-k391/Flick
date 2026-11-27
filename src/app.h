@@ -106,6 +106,7 @@ struct TextSel {
     using Pos = std::pair<UINT64, UINT32>;
     Pos a, b, ua, ub;  // anchor, focus; the unit clicked
     bool all = false;  // Ctrl+A: everything, laid out or not
+    int unit = 1;      // what the click that started it selected
     bool Empty() const { return !all && a == b; }
     void Click(Pos from, Pos to) { ua = a = from, ub = b = to, all = false; }
     void Drag(Pos from, Pos to) {
@@ -141,6 +142,7 @@ size_t MdHeadingCount();  // H1-H3, for the contents sidebar
 bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks);
 void MdSelectAll();
 std::wstring MdCopy();
+std::wstring MdCopy(const TextSel&);  // --selftest: a given selection (paragraph = block << 32 | table cell)
 const std::wstring& MdHeadingText(size_t i);
 int MdHeadingLevel(size_t i);
 float MdHeadingY(size_t i, bool layout);  // -1: not laid out yet (and layout == false)  // --selftest: one "<kind><level><bullet>:<text>|" per block

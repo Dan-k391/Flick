@@ -55,7 +55,6 @@ ComPtr<ID2D1SolidColorBrush> g_link, g_dim, g_role[R_Count];  // drawing effects
 // Selection: a paragraph is (block << 32 | table cell, row-major); text comes from the parsed blocks, so copying
 // never needs layout, and positions stay valid when blocks are laid out again (resize, theme, pictures arriving).
 TextSel g_sel;
-int g_unit = 1;
 bool g_selOn;               // during a paint: something is selected
 D2D1_COLOR_F g_selColor;
 float g_x0, g_top;          // last paint: the column's left edge, the area's top
@@ -402,8 +401,8 @@ void DrawRich(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float 
     rt->DrawTextLayout({x, y}, t.layout.Get(), text);
 }
 
-void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, float width, ID2D1SolidColorBrush* text,
-               ID2D1SolidColorBrush* fill, const MdColors& c) {
+void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, float width, float top, float bottom,
+               ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* fill, const MdColors& c) {
     float x = x0 + b.indent * kIndent + b.quote * kQuote, right = x0 + width;
     fill->SetColor(c.rule);
     for (int q = 0; q < b.quote; q++) {
@@ -440,8 +439,13 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             rt->FillRectangle({x, y, x + b.colX.back(), y + b.rowY[1]}, fill);
             fill->SetColor(c.rule);
             for (float cx : b.colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
-            for (float ry : b.rowY) rt->FillRectangle({x, y + ry, x + b.colX.back() + 1, y + ry + 1}, fill);
-            for (size_t ri = 0, k = 0; ri < b.rows.size(); ri++)
+            // Only the rows in view (a long table: thousands of rows off screen).
+            auto row = [&](float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(b.rowY.begin(), b.rowY.end(), v) - b.rowY.begin() - 1); };
+            size_t r0 = row(top - y), r1 = std::min(b.rows.size(), row(bottom - y) + 1), k = 0;
+            for (size_t ri = r0; ri <= r1 && ri < b.rowY.size(); ri++)
+                rt->FillRectangle({x, y + b.rowY[ri], x + b.colX.back() + 1, y + b.rowY[ri] + 1}, fill);
+            for (size_t ri = 0; ri < r0; ri++) k += b.rows[ri].size();
+            for (size_t ri = r0; ri < r1; ri++)
                 for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++)
                     DrawRich(rt, b.rows[ri][ci], unit + k, x + b.colX[ci] + kCellPadX, y + b.rowY[ri] + kCellPadY, text, fill, c);
             break;
@@ -533,7 +537,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
         Block& b = g_blocks[i];
         float y = area.top + b.y - scroll;
         if (y > area.bottom) break;
-        if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, text.Get(), fill.Get(), c);
+        if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
     }
     float h = g_laidH + 24;  // bottom padding
     return g_laid == g_blocks.size() ? h : h * g_blocks.size() / std::max<size_t>(g_laid, 1);  // estimate
@@ -578,9 +582,9 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
         ox += b.colX[ci] + kCellPadX, oy += b.rowY[ri] + kCellPadY;
     } else if (b.kind == B_Code) ox += kCodePad, oy += kCodePad;
     if (!t->layout) return false;
-    if (clicks) g_unit = std::min(clicks, 3);
+    if (clicks) g_sel.unit = std::min(clicks, 3);
     UINT32 from, to;
-    TextUnit(t->s, TextHit(t->layout.Get(), pt.x - ox, pt.y - oy), g_unit, from, to);
+    TextUnit(t->s, TextHit(t->layout.Get(), pt.x - ox, pt.y - oy), g_sel.unit, from, to);
     UINT64 unit = (UINT64)i << 32 | cell;
     if (clicks) g_sel.Click({unit, from}, {unit, to});
     else g_sel.Drag({unit, from}, {unit, to});
@@ -592,9 +596,12 @@ void MdSelectAll() {
     g_sel.all = !g_blocks.empty();
 }
 
-std::wstring MdCopy() {
+std::wstring MdCopy() { return MdCopy(g_sel); }
+
+std::wstring MdCopy(const TextSel& sel) {
     CopyText o;
-    if (g_sel.Empty()) return {};
+    if (sel.Empty()) return {};
+    UINT64 first = std::min(sel.a, sel.b).first;
     for (size_t i = 0; i < g_blocks.size(); i++) {
         const Block& b = g_blocks[i];
         UINT64 unit = (UINT64)i << 32;
@@ -603,12 +610,15 @@ std::wstring MdCopy() {
             for (size_t ri = 0, k = 0; ri < b.rows.size(); ri++) {
                 for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++) {
                     if (ci) o.Sep(L"\t");
-                    if (g_sel.Span(unit + k, (UINT32)b.rows[ri][ci].s.size(), from, to)) o.Put(Plain(b.rows[ri][ci].s, from, to));
+                    if (sel.Span(unit + k, (UINT32)b.rows[ri][ci].s.size(), from, to)) o.Put(Plain(b.rows[ri][ci].s, from, to));
                 }
                 o.Sep(L"\r\n");
             }
-        } else if ((b.kind == B_Para || b.kind == B_Head || b.kind == B_Code) && g_sel.Span(unit, (UINT32)b.text.s.size(), from, to)) {
-            o.Put((from ? L"" : Marker(b)) + Plain(b.text.s, from, to));
+        } else if ((b.kind == B_Para || b.kind == B_Head || b.kind == B_Code) && sel.Span(unit, (UINT32)b.text.s.size(), from, to)) {
+            // The list marker only with the item's text from its start: selected whole, or the selection began earlier.
+            bool marker = !from && to && (to == b.text.s.size() || first < unit || sel.all);
+            if (from == to && unit == std::max(sel.a, sel.b).first && !sel.all) continue;  // ends at the start of this block
+            o.Put((marker ? Marker(b) : L"") + Plain(b.text.s, from, to));
             o.Sep(L"\r\n");
         }
     }

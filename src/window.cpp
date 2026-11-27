@@ -53,7 +53,7 @@ const Palette kDark{
     {Hex(0xD4D4D4), Hex(0x6A9955), Hex(0x569CD6), Hex(0x4EC9B0), Hex(0xDCDCAA), Hex(0xCE9178), Hex(0xB5CEA8),
      Hex(0xC586C0), Hex(0xD4D4D4), Hex(0x569CD6), Hex(0x9CDCFE), Hex(0x569CD6), Hex(0xD4D4D4), Hex(0xD4D4D4),
      Hex(0xF44747), Hex(0x81B88B), Hex(0xF14C4C)},
-    Hex(0x1C1C1C), Hex(0x6E7681), Hex(0x264F78),
+    Hex(0x1C1C1C), Hex(0x6E7681), Hex(0x1D3B5C),  // sel: blue keywords stay readable on it
     C(0xFFFFFF), C(0xFFFFFF, 0.55f), C(0xFFFFFF, 0.06f), C(0xFFFFFF, 0.10f), C(0xFFFFFF, 0.08f),
     C(0x4CC2FF), C(0xFFFFFF, 0.07f), C(0xFFFFFF, 0.13f)};
 const Palette kLight{
@@ -152,8 +152,8 @@ std::vector<UINT> g_pageW;  // pixel width each page was last rendered at (0 = n
 // pptx: each rendered page's paragraphs (kept with its bitmap); a selection lies within one slide.
 std::vector<std::vector<SlideText>> g_pageText;
 TextSel g_slideSel;
-int g_slidePage = -1, g_slideUnit = 1;
-// Text selection (docx, sheets/CSV, slides): dragging with the left button, auto-scrolling past an edge (kSelTimer).
+int g_slidePage = -1;
+// Text selection (docx, Markdown, sheets/CSV, slides): dragging with the left button, auto-scrolling past an edge (kSelTimer).
 bool g_selDrag;
 LPARAM g_selAt;  // the mouse while dragging
 int g_clicks;    // 2 double, 3 triple click
@@ -1923,10 +1923,10 @@ bool SlideHit(int page, D2D1_POINT_2F pt, UINT32& para, UINT32& pos, float* dist
 }
 
 bool SlideSelect(D2D1_POINT_2F pt, int clicks) {
-    if (clicks) g_slidePage = PageAt(pt.y), g_slideUnit = std::min(clicks, 3), g_slideSel = {};
+    if (clicks) g_slidePage = PageAt(pt.y), g_slideSel = {}, g_slideSel.unit = std::min(clicks, 3);
     UINT32 para, pos, from, to;
     if (!SlideHit(g_slidePage, pt, para, pos)) return false;
-    TextUnit(g_pageText[g_slidePage][para].text, pos, g_slideUnit, from, to);
+    TextUnit(g_pageText[g_slidePage][para].text, pos, g_slideSel.unit, from, to);
     if (clicks) g_slideSel.Click({para, from}, {para, to});
     else g_slideSel.Drag({para, from}, {para, to});
     return true;

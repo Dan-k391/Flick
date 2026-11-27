@@ -622,7 +622,6 @@ size_t g_next;              // next block of g_w->blocks to lay out
 float g_width = -1, g_laidH;
 UINT32 g_leaves;            // paragraphs laid out so far (blocks are laid out in document order)
 TextSel g_sel;              // paragraphs by Item::leaf
-int g_unit = 1;             // what the click that started the selection selected
 bool g_selOn;               // during a paint: something is selected
 float g_x0, g_y0;           // last paint: the column's left edge, the area's top
 
@@ -1485,9 +1484,9 @@ bool WordSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
         if (clicks) g_sel = {};
         return false;
     }
-    if (clicks) g_unit = std::min(clicks, 3);
+    if (clicks) g_sel.unit = std::min(clicks, 3);
     UINT32 from, to;
-    TextUnit(it->str, TextHit(it->text.Get(), pt.x - ox - it->tx, pt.y - oy - it->y - it->ty), g_unit, from, to);
+    TextUnit(it->str, TextHit(it->text.Get(), pt.x - ox - it->tx, pt.y - oy - it->y - it->ty), g_sel.unit, from, to);
     if (clicks) g_sel.Click({it->leaf, from}, {it->leaf, to});
     else g_sel.Drag({it->leaf, from}, {it->leaf, to});
     return true;
