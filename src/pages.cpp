@@ -444,8 +444,9 @@ struct Draw {
     }
 
     // ---- text
-    void Text(const Node* txBody, D2D1_RECT_F box, const TextBox& tb) {
-        if (!txBody) return;
+    // Draws a text body in `box` (or only measures it); returns the height it needs, insets included.
+    float Text(const Node* txBody, D2D1_RECT_F box, const TextBox& tb, bool draw = true) {
+        if (!txBody) return 0;
         IDWriteFactory* dw = DW();
         struct Para {
             ComPtr<IDWriteTextLayout> layout;
@@ -603,6 +604,7 @@ struct Draw {
         }
         float total = 0;
         for (auto& p : paras) total += p.before + p.height + p.after;
+        if (!draw) return total + tb.ins[1] + tb.ins[3];
         float avail = box.bottom - box.top - tb.ins[1] - tb.ins[3];
         float y = box.top + tb.ins[1] + (tb.anchor == "ctr" ? (avail - total) / 2 : tb.anchor == "b" ? avail - total : 0);
         ComPtr<ID2D1SolidColorBrush> brush;
@@ -631,6 +633,7 @@ struct Draw {
             }
             y += p.height + p.after;
         }
+        return total + tb.ins[1] + tb.ins[3];
     }
 
     // Text box settings: bodyPr of the shape, then of the placeholders it inherits from.
@@ -771,9 +774,9 @@ struct Draw {
         int r = 0;
         for (auto& tr : tbl.kids) {
             if (tr.name != "tr") continue;
-            float h = Num(tr.A("h"), 0) * xf.sy;
-            size_t c = 0;
-            for (auto& tc : tr.kids) {
+            float h = Num(tr.A("h"), 0) * xf.sy;  // a minimum: rows grow to fit their text, as in PowerPoint
+            for (int pass = 0; pass < 2; pass++)  // 0: measure, 1: draw
+            for (size_t c = 0; auto& tc : tr.kids) {
                 if (tc.name != "tc") continue;
                 size_t span = std::max(1, (int)tc.D("gridSpan", 1));
                 if (tc.A("hMerge") == "1" || tc.A("vMerge") == "1" || c + 1 >= colX.size()) {
@@ -784,6 +787,18 @@ struct Draw {
                 D2D1_RECT_F cell{colX[c], y, colX[std::min(c + span, colX.size() - 1)], y + h};
                 bool head = firstRow && r == 0;
                 const Node* tcPr = tc["tcPr"];
+                TextBox tb;
+                tb.lst = {At(&tc, {"txBody", "lstStyle"}), d.defaults};
+                tb.ins[0] = Num(tcPr ? tcPr->A("marL") : "", 91440) / 12700, tb.ins[2] = Num(tcPr ? tcPr->A("marR") : "", 91440) / 12700;
+                tb.ins[1] = Num(tcPr ? tcPr->A("marT") : "", 45720) / 12700, tb.ins[3] = Num(tcPr ? tcPr->A("marB") : "", 45720) / 12700;
+                tb.anchor = tcPr ? tcPr->A("anchor") : "";
+                tb.color = head ? Scheme("lt1") : Scheme("dk1");
+                tb.bold = head;
+                c += span;
+                if (pass == 0) {
+                    h = std::max(h, Text(tc["txBody"], cell, tb, false));
+                    continue;
+                }
                 ComPtr<ID2D1Factory> f;
                 ComPtr<ID2D1RectangleGeometry> g;
                 rt->GetFactory(&f);
@@ -796,15 +811,7 @@ struct Draw {
                 ComPtr<ID2D1SolidColorBrush> white;
                 rt->CreateSolidColorBrush(Scheme("lt1"), &white);
                 rt->DrawRectangle(cell, white.Get(), 1);
-                TextBox tb;
-                tb.lst = {At(&tc, {"txBody", "lstStyle"}), d.defaults};
-                tb.ins[0] = Num(tcPr ? tcPr->A("marL") : "", 91440) / 12700, tb.ins[2] = Num(tcPr ? tcPr->A("marR") : "", 91440) / 12700;
-                tb.ins[1] = Num(tcPr ? tcPr->A("marT") : "", 45720) / 12700, tb.ins[3] = Num(tcPr ? tcPr->A("marB") : "", 45720) / 12700;
-                tb.anchor = tcPr ? tcPr->A("anchor") : "";
-                tb.color = head ? Scheme("lt1") : Scheme("dk1");
-                tb.bold = head;
                 Text(tc["txBody"], cell, tb);
-                c += span;
             }
             y += h, r++;
         }
