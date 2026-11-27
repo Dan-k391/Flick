@@ -115,6 +115,9 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   `SendMessage`s each page; the reply names the next one (UI thread decides). Wait: `PeekMessage
   (PM_QS_SENDMESSAGE)` then re-check *before* `MsgWaitForMultipleObjects`.
 - **Markdown**: md4c with `MD4C_USE_UTF16`; blocks laid out lazily; images measured at layout, decoded when drawn.
+  Tables: column widths from the first 50 rows, rows laid out lazily, cell layouts far from the view released
+  (5000 rows: 300 -> 8 ms). Code blocks of 400+ lines are split into 200-line chunks: one layout with ~240k
+  coloured runs took 21 s (`SetDrawingEffect` per run grows with the runs already set); chunks highlight separately.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
 - **Office**: Windows preview handlers (Office's own previewers, what QuickLook uses) were tried and dropped:
   0.1 s warm, 0.6–1.1 s cold, 200–300 MB Office processes stay resident. pptx are drawn by pages.cpp instead:
