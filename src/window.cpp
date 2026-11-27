@@ -118,6 +118,13 @@ float g_seekFrac = -1;  // while dragging the seek bar: where the knob is (0..1)
 bool g_seekResume;      // playback was paused for the drag: resume it after
 int g_scrubGen;
 ComPtr<IDWriteTextFormat> g_fmtGlyph;  // media control glyphs
+// Subtitles from a .srt/.vtt next to the video (loaded by the poster worker), and the cues drawn last.
+std::vector<SubCue> g_subs;
+double g_subMaxLen;  // longest cue: how far back a cue that is still on can start
+std::vector<size_t> g_subOn, g_subLayoutOn;
+ComPtr<IDWriteTextLayout> g_subLayout;
+ComPtr<IDWriteTextFormat> g_fmtSub;
+float g_subSize, g_subW;  // font size and wrap width of g_subLayout
 
 // Archives are listed on a worker thread (WM_FLICK_GRID).
 std::atomic<int> g_gridGen;
@@ -1060,6 +1067,25 @@ DWORD WINAPI PosterThread(void* p) {
             frame = MediaFirstFrame(job->path, wic.Get());
         SendMessageW(g_hwnd, WM_FLICK_POSTER, job->gen, (LPARAM)frame.Get());
     }
+    // Subtitles after the poster, so they cost the open nothing: "movie.srt", "movie.vtt", else "movie.<lang>.srt".
+    std::wstring base = job->path.substr(0, job->path.find_last_of(L'.'));
+    std::vector<std::wstring> names{base + L".srt", base + L".vtt"};
+    WIN32_FIND_DATAW fd;
+    if (HANDLE f = FindFirstFileW((base + L".*.srt").c_str(), &fd); f != INVALID_HANDLE_VALUE) {
+        names.push_back(job->path.substr(0, job->path.find_last_of(L'\\') + 1) + fd.cFileName);
+        FindClose(f);
+    }
+    for (auto& name : names) {
+        std::string u8;
+        bool truncated;
+        if (GetFileAttributesW(name.c_str()) == INVALID_FILE_ATTRIBUTES || !ReadText(name, u8, truncated)) continue;
+        std::wstring w(MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), nullptr, 0), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), w.data(), (int)w.size());
+        if (auto subs = ParseSubtitles(w); !subs.empty()) {
+            SendMessageW(g_hwnd, WM_FLICK_SUBS, job->gen, (LPARAM)&subs);
+            break;
+        }
+    }
     CoUninitialize();
     return 0;
 }
@@ -1077,6 +1103,84 @@ void OnPoster(int gen, IWICBitmap* frame) {
         Log(L"video poster ready %.2f ms after key press", MsSince(g_mediaT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
+}
+
+void OnSubs(int gen, std::vector<SubCue>& subs) {
+    if (gen != g_posterGen || g_kind != K_Media) return;
+    g_subs = std::move(subs), g_subMaxLen = 0;
+    for (auto& c : g_subs) g_subMaxLen = std::max(g_subMaxLen, c.end - c.start);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Indices of the cues on screen at `t` (usually none or one; overlapping cues stack in start order).
+std::vector<size_t> SubsAt(double t) {
+    std::vector<size_t> on;
+    auto j = std::upper_bound(g_subs.begin(), g_subs.end(), t, [](double t, const SubCue& c) { return t < c.start; });
+    while (j != g_subs.begin() && (j - 1)->start >= t - g_subMaxLen)
+        if ((--j)->end > t) on.insert(on.begin(), j - g_subs.begin());
+    return on;
+}
+
+double SubClock(const MediaState& s) { return g_seekFrac >= 0 ? g_seekFrac * s.dur : s.pos; }
+
+ComPtr<IDWriteTextFormat> Format(const wchar_t* family, float size, DWRITE_FONT_WEIGHT weight, DWRITE_TEXT_ALIGNMENT align);
+
+// The cues on now, white on a dark band per line, at the bottom of the picture (above the control bar when it shows).
+void DrawSubs(const MediaState& s, ID2D1SolidColorBrush* brush) {
+    g_subOn = g_subs.empty() ? std::vector<size_t>{} : SubsAt(SubClock(s));
+    if (g_subOn.empty() || !(s.videoW || g_posterW)) return;
+    D2D1_RECT_F v = VideoRect(s);
+    float vw = v.right - v.left, vh = v.bottom - v.top;
+    float size = std::round(std::clamp(vh * 0.05f, 14.f, 40.f)), maxW = std::round(vw * 0.9f);
+    if (size != g_subSize) {
+        g_fmtSub = Format(L"Segoe UI", size, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER);
+        g_fmtSub->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+        g_fmtSub->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        DWRITE_TRIMMING none{};
+        g_fmtSub->SetTrimming(&none, nullptr);
+        g_subSize = size, g_subLayout.Reset();
+    }
+    if (!g_subLayout || g_subOn != g_subLayoutOn || maxW != g_subW) {
+        std::wstring text;
+        std::vector<std::pair<DWRITE_TEXT_RANGE, bool>> styles;  // bold?
+        for (size_t i : g_subOn) {
+            if (!text.empty()) text += L'\n';
+            UINT32 at = (UINT32)text.size();
+            text += g_subs[i].text;
+            for (auto [p, n] : g_subs[i].italic) styles.push_back({{at + p, n}, false});
+            for (auto [p, n] : g_subs[i].bold) styles.push_back({{at + p, n}, true});
+        }
+        g_subLayout.Reset();
+        if (FAILED(g_dw->CreateTextLayout(text.c_str(), (UINT32)text.size(), g_fmtSub.Get(), maxW, 0, &g_subLayout))) return;
+        for (auto [r, bold] : styles)
+            bold ? g_subLayout->SetFontWeight(DWRITE_FONT_WEIGHT_BOLD, r) : g_subLayout->SetFontStyle(DWRITE_FONT_STYLE_ITALIC, r);
+        g_subLayoutOn = g_subOn, g_subW = maxW;
+    }
+    DWRITE_TEXT_METRICS m;
+    g_subLayout->GetMetrics(&m);
+    float bottom = v.bottom - std::round(vh * 0.05f);
+    if (g_playRc.bottom > 0) bottom = std::min(bottom, g_playRc.top - 4 - 12);  // the bar is shown
+    float x = std::round(v.left + (vw - maxW) / 2), y = std::round(bottom - m.height), pad = std::round(size * 0.3f);
+    // One band per line, from the line's own extent (lines of a cue differ in length).
+    UINT32 lines = 0;
+    g_subLayout->GetLineMetrics(nullptr, 0, &lines);
+    std::vector<DWRITE_LINE_METRICS> lm(lines);
+    g_subLayout->GetLineMetrics(lm.data(), lines, &lines);
+    brush->SetColor(D2D1::ColorF(0, 0.7f));
+    UINT32 pos = 0;
+    for (auto& l : lm) {
+        DWRITE_HIT_TEST_METRICS hm[4];
+        UINT32 n = 0;
+        if (l.length > l.newlineLength &&
+            SUCCEEDED(g_subLayout->HitTestTextRange(pos, l.length - l.newlineLength, x, y, hm, 4, &n)) && n) {
+            float left = hm[0].left, right = hm[0].left + hm[0].width;
+            for (UINT32 k = 1; k < n; k++) left = std::min(left, hm[k].left), right = std::max(right, hm[k].left + hm[k].width);
+            g_rt->FillRectangle({std::round(left - pad), hm[0].top, std::round(right + pad), hm[0].top + hm[0].height}, brush);
+        }
+        pos += l.length;
+    }
+    brush->SetColor(D2D1::ColorF(D2D1::ColorF::White));
+    g_rt->DrawTextLayout({x, y}, g_subLayout.Get(), brush);
 }
 
 // Dragging the seek bar: the knob follows the mouse, playback pauses, and a source reader on a worker
@@ -1171,6 +1275,7 @@ void ClearContent() {
     MediaScrubStop();
     g_frame.Reset(), g_frameWic.Reset();
     g_mediaVideo = g_seekDrag = g_seekResume = false, g_shownPos = -1, g_seekFrac = -1;
+    g_subs.clear(), g_subOn.clear(), g_subLayoutOn.clear(), g_subLayout.Reset();
     g_posterGen++, g_posterW = g_posterH = 0;
     g_natW = g_natH = 0;
     KillTimer(g_hwnd, kGifTimer), KillTimer(g_hwnd, kZoomTimer);
@@ -1625,6 +1730,7 @@ void Paint() {
         if (!g_mediaVideo) DrawInfo({area.left, area.top, area.right, area.bottom - 52}, text.Get(), sub.Get());
         else if (g_frame && (ms.videoW || g_posterW)) g_rt->DrawBitmap(g_frame.Get(), VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         DrawControls(sz, text.Get(), fill.Get());
+        if (g_mediaVideo) DrawSubs(ms, fill.Get());
     }
     if (Scrollable()) {
         D2D1_RECT_F doc{kPad + SideW(), kTitleH, sz.width - kPad, sz.height};
@@ -1956,6 +2062,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             double frac = g_seekFrac >= 0 ? g_seekFrac : s.dur > 0 ? s.pos / s.dur : 0;
             double shown = std::floor(frac * (g_trackRc.right - g_trackRc.left) * g_dpi / 96) * 1e6 + std::floor(s.pos);
             if (shown != g_shownPos) g_shownPos = shown, repaint = true;
+            if (!g_subs.empty() && SubsAt(SubClock(s)) != g_subOn) repaint = true;  // a cue starts or ends between frames
             if (repaint) InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
@@ -1964,6 +2071,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_SCRUB:
             OnScrub((int)w, reinterpret_cast<IWICBitmap*>(l));
+            return 0;
+        case WM_FLICK_SUBS:
+            OnSubs((int)w, *reinterpret_cast<std::vector<SubCue>*>(l));
             return 0;
         case WM_FLICK_POSTER:
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));

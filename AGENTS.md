@@ -13,7 +13,7 @@ press **Space**; **Space**/**Esc** closes.
 ## What it does (README keeps one line of this)
 - Previews: code/text (Lexilla, 100+ languages, Ctrl+F find), Markdown (+ ipynb, AsciiDoc, rst), images (WIC: JPEG,
   PNG, animated GIF, BMP, TIFF, WebP, ICO; HEIC/AVIF with Store codecs; wheel zoom + pan), SVG/SVGZ, PDF (all
-  pages, thumbnails), audio/video with playback and seeking, CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
+  pages, thumbnails), audio/video with playback, seeking and subtitles (`name.srt`/`.vtt`/`name.<lang>.srt` beside the video), CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
   jar, apk, whl…) and folders as trees, fonts as a specimen, exe/dll/msi details, anything else: thumbnail + info.
 - Keys: Space opens/closes, arrows follow the Explorer selection, Esc closes, Ctrl+F finds in text.
 - Tray: Disable, Start at sign-in, Quit. Archives use Windows' own libarchive (`archiveint.dll`).
@@ -100,6 +100,8 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   so a `MF_LOW_LATENCY` source reader decodes the poster (~40 ms) first, then the engine starts. Seek-bar drag
   pauses and shows key frames from another reader (~28 ms 1080p, ~110 ms 4K); one exact seek on release.
   `GetVideoAspectRatio` is the picture aspect. `MFShutdown` per preview made memory worse.
+- **Subtitles**: the engine's timed-text API doesn't draw in frame-server mode, so SRT/WebVTT are parsed by us
+  (`ParseSubtitles`, after the poster on its worker) and drawn with DirectWrite over the frame. Embedded tracks: not done.
 - `/GL` gained nothing. lunasvg rejects a UTF-8 BOM. `small`/`near`/`far` are macros.
 - PowerShell: 5.x reads BOM-less scripts as ANSI (write `[char]0xE3`); `$null` → `""` in P/Invoke strings;
   DPI-unaware (sizes ×1.5 at 150%); piping into `git credential` fails — use bash. Python writes CRLF unless

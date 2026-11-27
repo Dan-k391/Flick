@@ -25,6 +25,7 @@ enum : UINT {
     WM_FLICK_SCRUB,                // sent by the scrub worker (wParam = gen, lParam = IWICBitmap* frame)
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
     WM_FLICK_FIND,                 // Ctrl+F in Explorer while a text preview is open
+    WM_FLICK_SUBS,                 // sent by the poster worker (wParam = gen, lParam = std::vector<SubCue>*)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -148,6 +149,13 @@ Microsoft::WRL::ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWI
 int MediaScrubStart(const std::wstring& path, UINT w, UINT h);  // frames while the seek bar is dragged; returns gen
 void MediaScrubTo(double seconds);
 void MediaScrubStop();
+// Subtitles (SRT, WebVTT): cues sorted by start, text without tags; italic/bold as (start, length) ranges.
+struct SubCue {
+    double start, end;
+    std::wstring text;
+    std::vector<std::pair<UINT32, UINT32>> italic, bold;
+};
+std::vector<SubCue> ParseSubtitles(const std::wstring& s);
 
 // window.cpp helpers for the views
 Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory

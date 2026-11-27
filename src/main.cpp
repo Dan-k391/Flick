@@ -409,6 +409,17 @@ c
         std::wstring want = L"H1:Title|P:Para & x y|P•:a|P☑" + std::wstring(1, (wchar_t)0xFE0E) +
                             L":b|P1.:one|P:q>|C:c|R:|T:|";
         if (MdOutline() != want) ok = false, Log(L"selftest: markdown outline %s", MdOutline().c_str());
+        {  // SRT (CRLF, tags, a missing blank line, out of order) and WebVTT (no hours, settings, escapes)
+            auto srt = ParseSubtitles(L"1\r\n00:00:05,000 --> 00:00:06,500\r\nLate\r\n\r\n2\r\n00:00:01,250 --> 00:00:02,000\r\n"
+                                      L"<i>Hi</i> {\\an8}<font color=\"red\">there</font>\r\nline {\\b1}two{\\b0}\r\n"
+                                      L"00:01:00,000 --> 01:00:00,000\r\nlong\r\n");
+            auto vtt = ParseSubtitles(L"WEBVTT\n\nNOTE x --> y\n\n00:02.500 --> 00:03.000 align:start\n<v Bob>a &amp; b</v>\n");
+            if (srt.size() != 3 || srt[0].start != 1.25 || srt[0].end != 2 || srt[0].text != L"Hi there\nline two" ||
+                srt[0].italic != std::vector<std::pair<UINT32, UINT32>>{{0, 2}} ||
+                srt[0].bold != std::vector<std::pair<UINT32, UINT32>>{{14, 3}} || srt[1].text != L"Late" ||
+                srt[2].text != L"long" || srt[2].end != 3600 || vtt.size() != 1 || vtt[0].start != 2.5 || vtt[0].text != L"a & b")
+                ok = false, Log(L"selftest: subtitles");
+        }
         return ok ? 0 : 1;
     }
     if (argc > 1 && !wcscmp(argv[1], L"--exit")) {

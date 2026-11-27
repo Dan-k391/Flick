@@ -169,6 +169,114 @@ void MediaToggleMute() {
     if (g_engine) g_engine->SetMuted(g_muted || g_userMuted);
 }
 
+namespace {
+
+// "01:02:03,456" or (WebVTT, no hours) "02:03.456" -> seconds; -1 if it isn't one.
+double SubTime(std::wstring_view& p) {
+    auto digit = [&] { return !p.empty() && p[0] >= L'0' && p[0] <= L'9'; };
+    while (!p.empty() && p[0] == L' ') p.remove_prefix(1);
+    double part[3];
+    int n = 0;
+    for (;;) {
+        if (!digit()) return -1;
+        double v = 0;
+        while (digit()) v = v * 10 + (p[0] - L'0'), p.remove_prefix(1);
+        part[n++] = v;
+        if (n < 3 && !p.empty() && p[0] == L':') p.remove_prefix(1);
+        else break;
+    }
+    if (n < 2) return -1;
+    double t = n == 3 ? part[0] * 3600 + part[1] * 60 + part[2] : part[0] * 60 + part[1];
+    if (!p.empty() && (p[0] == L',' || p[0] == L'.')) {
+        p.remove_prefix(1);
+        for (double k = 0.1; digit(); k /= 10) t += (p[0] - L'0') * k, p.remove_prefix(1);
+    }
+    return t;
+}
+
+// "start --> end [WebVTT settings]"
+bool SubTiming(std::wstring_view l, double& a, double& b) {
+    size_t arrow = l.find(L"-->");
+    if (arrow == l.npos) return false;
+    std::wstring_view pa = l.substr(0, arrow), pb = l.substr(arrow + 3);
+    a = SubTime(pa), b = SubTime(pb);
+    return a >= 0 && b > a;
+}
+
+}  // namespace
+
+std::vector<SubCue> ParseSubtitles(const std::wstring& s) {
+    std::vector<SubCue> cues;
+    size_t i = 0;
+    auto line = [&](std::wstring_view& l) {
+        if (i >= s.size()) return false;
+        size_t e = std::min(s.find(L'\n', i), s.size());
+        l = std::wstring_view(s).substr(i, e - i), i = e + 1;
+        if (!l.empty() && l.back() == L'\r') l.remove_suffix(1);
+        return true;
+    };
+    std::wstring_view l;
+    bool have = line(l);
+    while (have) {
+        SubCue c{};
+        if (!SubTiming(l, c.start, c.end)) {  // cue numbers, WEBVTT header, NOTE/STYLE blocks
+            have = line(l);
+            continue;
+        }
+        size_t open[2] = {SIZE_MAX, SIZE_MAX};  // italic, bold: where the open tag was
+        auto tag = [&](int k, bool on) {
+            auto& o = open[k];
+            if (on && o == SIZE_MAX) o = c.text.size();
+            else if (!on && o != SIZE_MAX) {
+                if (c.text.size() > o) (k ? c.bold : c.italic).push_back({(UINT32)o, (UINT32)(c.text.size() - o)});
+                o = SIZE_MAX;
+            }
+        };
+        double a, b;
+        // Text lines up to a blank line (or, in a file missing it, the next timing line).
+        while ((have = line(l)) && l.find_first_not_of(L" \t") != l.npos && !SubTiming(l, a, b)) {
+            if (!c.text.empty()) c.text += L'\n';
+            for (size_t k = 0; k < l.size(); k++) {
+                wchar_t ch = l[k];
+                size_t e = ch == L'<' ? l.find(L'>', k) : ch == L'{' ? l.find(L'}', k) : l.npos;
+                if (e != l.npos) {  // <i>, </b>, <font ...>, <c.x>, <v Name>; {\i1} (ASS overrides) and other tags dropped
+                    std::wstring_view t = l.substr(k + 1, e - k - 1);
+                    bool ass = ch == L'{';
+                    if (ass && (t.empty() || t[0] != L'\\')) e = l.npos;  // a plain brace
+                    else if (ass) {
+                        for (size_t q = 0; (q = t.find(L'\\', q)) != t.npos; q++)
+                            if (q + 2 < t.size() && (t[q + 1] == L'i' || t[q + 1] == L'b') && (t[q + 2] == L'0' || t[q + 2] == L'1'))
+                                tag(t[q + 1] == L'b', t[q + 2] == L'1');
+                    } else {
+                        bool close = !t.empty() && t[0] == L'/';
+                        if (close) t.remove_prefix(1);
+                        if (t.size() == 1 || (t.size() > 1 && (t[1] == L'.' || t[1] == L' ')))
+                            if (wchar_t n = (wchar_t)towlower(t[0]); n == L'i' || n == L'b') tag(n == L'b', !close);
+                    }
+                    if (e != l.npos) {
+                        k = e;
+                        continue;
+                    }
+                }
+                if (ch == L'&') {  // WebVTT escapes
+                    static const std::pair<std::wstring_view, wchar_t> ent[] = {
+                        {L"&amp;", L'&'}, {L"&lt;", L'<'}, {L"&gt;", L'>'}, {L"&nbsp;", 0xA0}, {L"&lrm;", 0x200E}, {L"&rlm;", 0x200F}};
+                    bool hit = false;
+                    for (auto& [name, c2] : ent)
+                        if (l.substr(k, name.size()) == name) c.text += c2, k += name.size() - 1, hit = true;
+                    if (hit) continue;
+                }
+                c.text += ch;
+            }
+        }
+        tag(0, false), tag(1, false);
+        if (c.text.find_first_not_of(L" \n") != c.text.npos) cues.push_back(std::move(c));
+        // `l` is now a blank line (skipped by the outer loop) or the next cue's timing line.
+    }
+    std::stable_sort(cues.begin(), cues.end(), [](const SubCue& x, const SubCue& y) { return x.start < y.start; });
+    return cues;
+}
+
 // Frames straight from a source reader (no playback pipeline): the poster shown while the media engine
 // starts (200-300 ms), and the frames shown while the seek bar is dragged. Worker threads.
 namespace {
