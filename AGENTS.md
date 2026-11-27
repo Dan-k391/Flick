@@ -27,9 +27,10 @@ src/window.cpp    window: Mica chrome (Direct2D), text (Scintilla) + find, image
 src/markdown.cpp  md4c -> blocks -> DirectWrite layouts (lazy); images; code via highlight.cpp
 src/convert.cpp   ipynb, AsciiDoc, rst -> Markdown        src/highlight.cpp Lexilla outside Scintilla
 src/pages.cpp     pptx slides and docx pages drawn (D2D + DirectWrite into WIC) for the PDF view, on its worker
-src/office.cpp    odt/odp/doc/ppt -> Markdown, xlsx/ods/xls -> sheet grid (OLE IStorage); xml.h: XML scanner, zips
+src/office.cpp    odt/odp/doc/ppt -> Markdown; xlsx (formats, number formats, merges, pictures)/ods/xls -> sheet
+                  grid (OLE IStorage); xml.h: XML scanner, zips
 src/pdf.cpp       PDF worker: Windows.Data.Pdf -> IPdfRendererNative -> WIC bitmap
-src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees
+src/grid.cpp      CSV/TSV; archive (Windows' archiveint.dll = libarchive) and folder trees; sheets drawn like Excel
 src/font.cpp      font specimen        src/svg.cpp SVG/SVGZ (lunasvg)        src/fileinfo.cpp exe/dll/msi lines
 src/media.cpp     audio/video: Media Foundation engine (frame server, CPU) + source-reader poster/scrub frames
 src/lang.cpp      extension -> lexer, keywords, colour roles      src/app.h shared declarations, WM_FLICK_*
@@ -60,7 +61,7 @@ Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after st
 |---|---|---|---|
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms | PDF page 1 (simple / real text) | ~20 / ~35 ms |
 | folder tree C:\Windows (10k) | ~53 ms | video first frame (engine alone ~300 ms) | ~45–50 ms |
-| sheets xlsx/xls/ods, doc/ppt/odt/odp text | 7–8 ms | docx / pptx page 1 (real files) | 12–23 ms |
+| sheets xlsx (formatted / 50k×20) / xls / ods, doc/ppt/odt/odp text | 7–11 ms | docx / pptx page 1 (real files) | 12–23 ms |
 
 Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
@@ -105,7 +106,13 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
   master txStyles -> presentation defaultTextStyle, colours through clrMap + theme with lumMod/lumOff. docx is
   flowed onto pages at open (styles with basedOn, numbering, tables, inline pictures); split paragraphs are one
   layout drawn clipped per page. Pictures are read from the zip per page, decoded at the drawn size.
-- **Sheets**: cells at their Excel positions (blank rows kept), A/B/C + 1/2/3 headers, tabs reload a sheet.
+- **Sheets** (xlsx): styles.xml resolved per cellXfs (theme colours + tint, indexed palette), `cellIs` conditional
+  formats, Excel number formats (`FormatNumber`, selftested), column widths from the default font's digit width
+  (DengXian is 8 px, not Calibri's 7). The open path reads the first 100 rows (256 KB of XML/strings); a worker
+  (`more`) re-reads the whole sheet and decodes pictures at drawn size, then replaces the grid. Text drawing is
+  the cost: `D2D1_DRAW_TEXT_OPTIONS_CLIP` or a clip per cell doubled it (50k×20: 18 → 8 ms), so only overflowing
+  text gets a clip. Dark mode: no-fill cells show the window, near-black text/borders take the palette text,
+  white fills count as none. Tabs scroll (wheel, arrows) to the active one.
 - **Office** text formats: what's written, not the layout. OOXML/ODF are zips
   read with archiveint (members by name, others skipped by seeking); headings from styles.xml names
   ("heading N" is English in every UI language). `.ppt` text sits in slide drawings (persist directory chain),
@@ -125,6 +132,7 @@ Memory: idle ~20–25 MB private; ~58 MB after any video (Media Foundation keeps
 
 ## Ideas / not done
 eml/CAD via preview handlers; charts/SmartArt, docx headers/footers/floating objects/superscript, odt/odp/doc/ppt
-as pages, cell formatting (fonts, fills, widths) in sheets, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
+as pages, sheet charts (placeholder box)/zoom/rich-text runs/other conditional formats/[Red] and fractions in
+number formats, ods/xls formatting, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
 Markdown links/raw HTML/find; PDF zoom/text selection/find; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.
