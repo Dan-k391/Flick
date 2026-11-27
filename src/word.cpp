@@ -60,7 +60,8 @@ UINT32 Highlight(std::string_view v) {
 
 // ---- drawing state (UI thread)
 ID2D1RenderTarget* g_rt;  // the target being painted (inline objects draw into it)
-ID2D1RenderTarget* g_brushRt;
+ComPtr<ID2D1RenderTarget> g_brushRt;  // the brushes' target (held: a new one at the same address is still new)
+float g_origin;  // document y 0 on screen during a paint
 std::map<UINT32, ComPtr<ID2D1SolidColorBrush>> g_brush;
 float g_dpi = 96;
 bool g_dark;
@@ -72,11 +73,12 @@ ID2D1SolidColorBrush* Brush(UINT32 key) {
     return b.Get();
 }
 
-// ---- pictures: decoded on a worker at the size drawn, kept by zip path while the document is open
+// ---- pictures: decoded on a worker at the size drawn, kept by zip path while near the view
 struct Pic {
     ComPtr<ID2D1Bitmap> bmp;
     UINT px = 0;  // width decoded at
     bool pending = false, failed = false;
+    float y = 0;  // document y where last drawn
 };
 std::map<std::wstring, Pic> g_pics;
 std::vector<std::tuple<std::wstring, UINT, UINT>> g_want;  // drawn without pixels during this paint
@@ -464,6 +466,7 @@ struct Obj final : IDWriteInlineObject {
         else if (!media.empty() || placeholder) {
             D2D1_RECT_F r{x, y, x + w, y + asc};
             Pic* p = media.empty() ? nullptr : &g_pics[media];
+            if (p) p->y = y - g_origin;
             if (p && p->bmp) g_rt->DrawBitmap(p->bmp.Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             if (!p || p->failed) {  // quiet placeholder
                 ID2D1SolidColorBrush* b = Brush(kAuto);
@@ -1314,8 +1317,8 @@ bool WordLoad(const std::wstring& path, std::wstring& sub) {
                     break;
                 }
     std::string_view app = Member(d->m, L"docProps/app.xml");
-    if (size_t k = app.find("<Pages>"); k != app.npos)
-        if (int n = atoi(std::string(app.substr(k + 7, 8)).c_str()); n > 0) sub = std::to_wstring(n) + (n == 1 ? L" page" : L" pages");
+    if (size_t k = app.find("<Words>"); k != app.npos)  // Word's saved page count has no meaning in a view without pages
+        if (int n = atoi(std::string(app.substr(k + 7, 10)).c_str()); n > 0) sub = std::to_wstring(n) + (n == 1 ? L" word" : L" words");
     g_w = std::move(d);
     return true;
 }
@@ -1324,6 +1327,7 @@ void WordClear() {
     g_gen++;
     g_items.clear(), g_next = 0, g_width = -1, g_laidH = 0;
     g_pics.clear(), g_want.clear();
+    g_brush.clear(), g_brushRt.Reset();
     g_w.reset();
 }
 
@@ -1335,7 +1339,7 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
     g_rt = rt;
     float dpiY;
     rt->GetDpi(&g_dpi, &dpiY);
-    if (rt != g_brushRt) g_brush.clear(), g_brushRt = rt, g_width = -1;  // layouts hold brushes of one target
+    if (rt != g_brushRt.Get()) g_brush.clear(), g_brushRt = rt, g_width = -1;  // layouts hold brushes of one target
     bool dark = Lum(((UINT32)(c.text.r * 255) << 16) | ((UINT32)(c.text.g * 255) << 8) | (UINT32)(c.text.b * 255)) > 0.5f;
     if (dark != g_dark) g_dark = dark, g_width = -1;
     Brush(kAuto)->SetColor(c.text), Brush(kLink)->SetColor(c.link);
@@ -1352,7 +1356,10 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
         else break;
     }
     g_want.clear();
-    DrawItems(rt, g_items, area.left + kMargin, area.top - scroll, area.top, area.bottom);
+    g_origin = area.top - scroll;
+    DrawItems(rt, g_items, area.left + kMargin, g_origin, area.top, area.bottom);
+    for (auto& [name, p] : g_pics)  // pictures more than 3 screens away give their pixels back (decoded again on return)
+        if (p.bmp && std::abs(p.y - (scroll + viewH / 2)) > 3 * viewH) p.bmp.Reset(), p.px = 0;
     if (!g_want.empty())
         CloseHandle(CreateThread(nullptr, 0, PicThread, new PicJob{d.path, g_gen, std::move(g_want)}, 0, nullptr)), g_want.clear();
     const Table* open = g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
