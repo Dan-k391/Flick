@@ -636,7 +636,7 @@ LRESULT NextPdfPage(bool* thumb = nullptr) {
         for (size_t i = 0; i < top.size(); i++)
             if (top[i] + height[i] > g_scroll[2] && top[i] < g_scroll[2] + viewH && !g_thumbW[i]) {
                 if (thumb) *thumb = true;
-                return ((LRESULT)tpx << 32) | (i + 1);
+                return ((LRESULT)tpx << 32) | kPdfThumb | (i + 1);
             }
     }
     return 0;
@@ -1922,13 +1922,14 @@ bool SlideHit(int page, D2D1_POINT_2F pt, UINT32& para, UINT32& pos, float* dist
     return best < INFINITY;
 }
 
-void SlideSelect(D2D1_POINT_2F pt, int clicks) {
+bool SlideSelect(D2D1_POINT_2F pt, int clicks) {
     if (clicks) g_slidePage = PageAt(pt.y), g_slideUnit = std::min(clicks, 3), g_slideSel = {};
     UINT32 para, pos, from, to;
-    if (!SlideHit(g_slidePage, pt, para, pos)) return;
+    if (!SlideHit(g_slidePage, pt, para, pos)) return false;
     TextUnit(g_pageText[g_slidePage][para].text, pos, g_slideUnit, from, to);
     if (clicks) g_slideSel.Click({para, from}, {para, to});
     else g_slideSel.Drag({para, from}, {para, to});
+    return true;
 }
 
 std::wstring SlideCopy() {
@@ -1937,17 +1938,23 @@ std::wstring SlideCopy() {
     bool first = true;
     for (UINT32 k = 0, a, b; k < g_pageText[g_slidePage].size(); k++)
         if (const SlideText& t = g_pageText[g_slidePage][k]; g_slideSel.Span(k, (UINT32)t.text.size(), a, b))
-            s += (first ? L"" : L"\r\n") + t.text.substr(a, b - a), first = false;
+            for (s += first ? L"" : L"\r\n", first = false; a < b; a++) s += t.text[a] == L'\u2028' ? std::wstring(L"\r\n") : std::wstring(1, t.text[a]);
     return s;
 }
 
-// clicks 1-3: a click (character, word, paragraph); 0: dragged to l.
-void SelectAt(LPARAM l, int clicks) {
+// clicks 1-3: a click (character, word, paragraph); 0: dragged to l. False: a click hit no text or cell.
+bool SelectAt(LPARAM l, int clicks) {
     D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
-    if (g_kind == K_Word) WordSelect(pt, g_scroll[1], clicks);
-    else if (g_kind == K_Grid) GridSelect(pt, g_scroll[0], g_scroll[1], clicks);
-    else SlideSelect(pt, clicks);
+    bool hit = g_kind == K_Word ? WordSelect(pt, g_scroll[1], clicks)
+               : g_kind == K_Grid ? GridSelect(pt, g_scroll[0], g_scroll[1], clicks) : SlideSelect(pt, clicks);
     InvalidateRect(g_hwnd, nullptr, FALSE);
+    return hit;
+}
+
+// Over selectable content (not the title bar, sidebar, scrollbars, a sheet's tab strip): where a click selects.
+bool OverContent(LPARAM l) {
+    D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
+    return Selectable() && pt.y > kTitleH && pt.x >= SideW() && OnBar(l) < 0 && (g_kind != K_Grid || pt.y < GridCells().bottom);
 }
 
 void SelectAll() {
@@ -1962,24 +1969,26 @@ void SelectAll() {
 void Copy() {
     if (g_kind == K_Text) return (void)Sci(SCI_COPY);
     std::wstring s = g_kind == K_Word ? WordCopy() : g_kind == K_Grid ? GridCopy() : Selectable() ? SlideCopy() : L"";
-    if (s.empty() || !OpenClipboard(g_hwnd)) return;
-    EmptyClipboard();
     size_t bytes = (s.size() + 1) * sizeof(wchar_t);
-    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
-        if (void* p = GlobalLock(mem)) memcpy(p, s.c_str(), bytes), GlobalUnlock(mem);
-        if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
-    }
-    CloseClipboard();
+    HGLOBAL mem = s.empty() ? nullptr : GlobalAlloc(GMEM_MOVEABLE, bytes);
+    void* p = mem ? GlobalLock(mem) : nullptr;
+    if (!p) return (void)(mem && GlobalFree(mem));
+    memcpy(p, s.c_str(), bytes);
+    GlobalUnlock(mem);
+    bool open = false;
+    for (int i = 0; i < 5 && !(open = OpenClipboard(g_hwnd)); i++) Sleep(10);  // another program may hold it a moment
+    if (!open || !EmptyClipboard() || !SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
+    if (open) CloseClipboard();
 }
 
 // While dragging a selection past an edge of the view, the view scrolls (every kSelTimer tick) and the selection follows.
 void EdgeScroll() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    bool sheet = g_kind == K_Grid && GridGet() && GridGet()->sheet;  // its headers and tab strip count as edges
-    float x = Dip(GET_X_LPARAM(g_selAt)), y = Dip(GET_Y_LPARAM(g_selAt)), left = sheet ? 40.f : 0, right = Dip(rc.right);
-    float top = kTitleH + (sheet ? 22 : 0), bottom = Dip(rc.bottom) - (sheet ? 30 : 0);
-    float dy = y < top ? y - top : y > bottom ? y - bottom : 0, dx = g_kind != K_Grid ? 0 : x < left ? x - left : x > right ? x - right : 0;
+    D2D1_RECT_F e{-INFINITY, kTitleH, INFINITY, Dip(rc.bottom)};  // edges; a grid's: its cells (not headers, tabs)
+    if (g_kind == K_Grid) e = GridCells();
+    float x = Dip(GET_X_LPARAM(g_selAt)), y = Dip(GET_Y_LPARAM(g_selAt));
+    float dy = y < e.top ? y - e.top : y > e.bottom ? y - e.bottom : 0, dx = x < e.left ? x - e.left : x > e.right ? x - e.right : 0;
     if (!dx && !dy) return;
     ScrollBy(0, dx), ScrollBy(1, dy);
     SelectAt(g_selAt, 0);
@@ -2152,16 +2161,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else if (tab != GridGet()->tab && LoadSheet(g_path, tab)) g_scroll[0] = g_scroll[1] = 0, InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
-            if (Selectable() && OnBar(l) < 0 && Dip(GET_Y_LPARAM(l)) > kTitleH) {
+            if (OverContent(l)) {
                 DWORD now = GetTickCount();
                 POINT at{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
                 bool again = now - g_clickT <= GetDoubleClickTime() && abs(at.x - g_clickAt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
                              abs(at.y - g_clickAt.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
                 g_clicks = again ? g_clicks + 1 : 1, g_clickT = now, g_clickAt = at;
-                SelectAt(l, g_clicks);
-                g_selDrag = true, g_selAt = l;
-                SetCapture(h);
-                SetTimer(h, kSelTimer, 30, nullptr);
+                if (SelectAt(l, g_clicks)) {  // a drag only from text or a cell
+                    g_selDrag = true, g_selAt = l;
+                    SetCapture(h);
+                    SetTimer(h, kSelTimer, 30, nullptr);
+                }
                 return 0;
             }
             if (g_kind == K_Grid && OnBar(l) < 0) {  // trees: click a folder to expand/collapse it
@@ -2196,7 +2206,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_RBUTTONUP:
             if (HitButton(l) == H_Open && g_kind != K_Info) OpenFile(true);
-            else if (Selectable() && Dip(GET_Y_LPARAM(l)) > kTitleH) {  // Copy, Select all
+            else if (OverContent(l)) {  // Copy, Select all
                 HMENU menu = CreatePopupMenu();
                 AppendMenuW(menu, MF_STRING, 1, L"Copy\tCtrl+C");
                 AppendMenuW(menu, MF_STRING, 2, L"Select all\tCtrl+A");

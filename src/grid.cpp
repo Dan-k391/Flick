@@ -855,12 +855,18 @@ bool CellAt(const GridData& g, D2D1_POINT_2F pt, float sx, float sy, bool drag, 
 }
 }  // namespace
 
-void GridSelect(D2D1_POINT_2F pt, float sx, float sy, int clicks) {
+bool GridSelect(D2D1_POINT_2F pt, float sx, float sy, int clicks) {
     size_t r, c;
     int head = 0;
-    if (!g_grid || !g_grid->folder.empty() || !CellAt(*g_grid, pt, sx, sy, !clicks, r, c, head)) return;
+    if (!g_grid || !g_grid->folder.empty() || !CellAt(*g_grid, pt, sx, sy, !clicks, r, c, head)) return false;
     if (clicks) g_sel = {{r, r}, {c, c}, head, true};
     else g_sel.r[1] = r, g_sel.c[1] = c;
+    return true;
+}
+
+D2D1_RECT_F GridCells() {
+    if (g_grid && g_grid->sheet) return {g_x0, g_y0, g_area.right, g_bottom};
+    return {g_area.left, g_area.top + (g_grid && g_grid->header ? kRowH : 0), g_area.right, g_area.bottom};
 }
 
 void GridSelectAll() {

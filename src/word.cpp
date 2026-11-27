@@ -577,6 +577,7 @@ struct Word {
     bool done = false;
     std::deque<Node> parsed;
     std::vector<const Node*> blocks;
+    std::vector<size_t> ends;  // per block: where its XML ends (how much of the body the blocks up to it are)
 
     const Node* Style(std::string_view id) {
         auto it = byId.find(id);
@@ -605,11 +606,15 @@ struct Word {
                 ParseKids(scan, n);
                 if (n.name == "p" || n.name == "tbl") blocks.push_back(&n);
                 else Flatten(n, blocks);
+                ends.resize(blocks.size(), scan.i);
             }
         }
         return i < blocks.size();
     }
-    float Parsed() const { return done ? 1 : std::clamp((float)(scan.i - bodyStart) / (bodyEnd - bodyStart), 0.01f, 1.f); }
+    // Share of the body the first n blocks are (not how far it was parsed: a Ctrl+A copy parses it all).
+    float Share(size_t n) const {
+        return n >= blocks.size() && done ? 1 : std::clamp((float)((n ? ends[n - 1] : bodyStart) - bodyStart) / (bodyEnd - bodyStart), 0.01f, 1.f);
+    }
 };
 std::unique_ptr<Word> g_w;
 std::vector<Item> g_items;  // top-level blocks laid out at g_width
@@ -1225,9 +1230,20 @@ void DrawItem(ID2D1RenderTarget* rt, Item& it, float x, float y, float top, floa
     Line(rt, {band.right, band.top}, {band.right, band.bottom}, it.bd[2]), Line(rt, {band.left, band.bottom}, {band.right, band.bottom}, it.bd[3]);
     float tx = x + it.tx, ty = y + it.ty;
     for (auto& [r, c] : it.marks) rt->FillRectangle({tx + r.left, ty + r.top, tx + r.right, ty + r.bottom}, Brush(c));
-    if (UINT32 a, b; g_selOn && it.text && g_sel.Span(it.leaf, (UINT32)it.str.size(), a, b) && b > a)
-        FillText(rt, it.text.Get(), a, b, {tx, ty}, Brush(kSel));
+    UINT32 a = 0, b = 0;
+    if (g_selOn && it.text && g_sel.Span(it.leaf, (UINT32)it.str.size(), a, b) && b > a) FillText(rt, it.text.Get(), a, b, {tx, ty}, Brush(kSel));
     if (it.text) rt->DrawTextLayout({tx, ty}, it.text.Get(), Brush(kAuto), D2D1_DRAW_TEXT_OPTIONS_NONE);
+    for (UINT32 k = a; k < b; k++)  // selected pictures cover the highlight behind them: a tint over them
+        if (ComPtr<IDWriteInlineObject> io; it.str[k] == kObj && SUCCEEDED(it.text->GetInlineObject(k, &io, nullptr)) && io)
+            if (auto* o = static_cast<Obj*>(io.Get()); !o->media.empty() || o->placeholder) {
+                DWRITE_HIT_TEST_METRICS m{};
+                UINT32 n = 0;
+                if (SUCCEEDED(it.text->HitTestTextRange(k, 1, tx, ty, &m, 1, &n)) && n) {
+                    Brush(kSel)->SetOpacity(0.5f);
+                    rt->FillRectangle({m.left, m.top + m.height - o->asc, m.left + m.width, m.top + m.height}, Brush(kSel));
+                    Brush(kSel)->SetOpacity(1);
+                }
+            }
     if (it.bullet) rt->DrawTextLayout({x + it.bx, ty}, it.bullet.Get(), Brush(kAuto), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
 
@@ -1407,6 +1423,20 @@ void NodeBlock(const Node& n, Out& o) {
     }
 }
 
+// Lays out top-level blocks at g_width until they reach `until` and `leaves` paragraphs are laid out (or the end).
+void LayOut(Word& d, float until, UINT32 leaves = 0) {
+    for (;;) {
+        float u = g_leaves < leaves ? INFINITY : until;
+        Item* last = g_items.empty() ? nullptr : &g_items.back();
+        if (last && last->table && !last->table->Done()) {  // a table laid out part way: more rows first
+            if (g_laidH >= u) break;
+            TableRows(d, *last, u - last->y);
+            g_laidH = last->y + last->h + last->after;
+        } else if (g_laidH < u && d.Block(g_next)) g_laidH = LayoutBlock(d, *d.blocks[g_next++], g_width, {}, g_items, g_laidH, u);
+        else break;
+    }
+}
+
 const Table* OpenTable() {  // the last block, a table laid out part way
     return g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
 }
@@ -1462,18 +1492,19 @@ void FillText(ID2D1RenderTarget* rt, IDWriteTextLayout* l, UINT32 from, UINT32 t
     }
 }
 
-void WordSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
+bool WordSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
     float ox = g_x0, oy = g_y0 - scroll;
-    Item* it = g_w ? Hit(g_items, pt.x, pt.y, ox, oy) : nullptr;
+    Item* it = g_w ? Hit(g_items, pt.x, pt.y, ox, oy) : nullptr;  // in the margins: the nearest text
     if (!it || !it->text) {
         if (clicks) g_sel = {};
-        return;
+        return false;
     }
     if (clicks) g_unit = std::min(clicks, 3);
     UINT32 from, to;
     TextUnit(it->str, TextHit(it->text.Get(), pt.x - ox - it->tx, pt.y - oy - it->y - it->ty), g_unit, from, to);
     if (clicks) g_sel.Click({it->leaf, from}, {it->leaf, to});
     else g_sel.Drag({it->leaf, from}, {it->leaf, to});
+    return true;
 }
 
 void WordSelectAll() {
@@ -1486,7 +1517,11 @@ std::wstring WordCopy() {
     Out o;
     if (g_sel.all && !(g_w->done && g_next >= g_w->blocks.size() && !OpenTable()))  // the rest isn't laid out: from the XML
         for (size_t i = 0; g_w->Block(i); i++) NodeBlock(*g_w->blocks[i], o);
-    else Emit(g_items, o);
+    else {
+        // A re-layout (resize, theme) may have laid out less than the selection: lay out to its end again, as painted.
+        if (g_width > 0 && g_brushRt) g_rt = g_brushRt.Get(), LayOut(*g_w, 0, std::max(g_sel.a, g_sel.b).first + 1);
+        Emit(g_items, o);
+    }
     return o.s;
 }
 
@@ -1544,16 +1579,7 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
     float width = area.right - area.left - 2 * kMargin, viewH = area.bottom - area.top;
     if (width != g_width) g_width = width, g_items.clear(), g_next = 0, g_laidH = kMargin, g_leaves = 0, d.counters.clear(), d.notes = 0;
     g_x0 = area.left + kMargin, g_y0 = area.top;
-    float until = scroll + viewH + 400;
-    for (;;) {
-        Item* last = g_items.empty() ? nullptr : &g_items.back();
-        if (last && last->table && !last->table->Done()) {  // a table laid out part way: more rows first
-            if (g_laidH >= until) break;
-            TableRows(d, *last, until - last->y);
-            g_laidH = last->y + last->h + last->after;
-        } else if (g_laidH < until && d.Block(g_next)) g_laidH = LayoutBlock(d, *d.blocks[g_next++], width, {}, g_items, g_laidH, until);
-        else break;
-    }
+    LayOut(d, scroll + viewH + 400);
     g_want.clear();
     g_origin = area.top - scroll, g_top = area.top, g_bottom = area.bottom, g_paint++;
     DrawItems(rt, g_items, area.left + kMargin, g_origin, area.top, area.bottom);
@@ -1565,7 +1591,7 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
     bool all = d.done && g_next >= d.blocks.size() && !open;
     float h = g_laidH + kMargin;
     if (open) h += open->rowY.back() / std::max<size_t>(1, open->Laid()) * (open->rowMin.size() - open->Laid());  // the rows to come, at the average so far
-    return all ? h : std::max(h, h / d.Parsed());  // estimate until the end is laid out
+    return all ? h : std::max(h, h / d.Share(g_next));  // estimate until the end is laid out
 }
 
 bool WordPicture(WPARAM gen, LPARAM lp) {
@@ -1610,6 +1636,11 @@ std::wstring WordSelfTest() {
     if (!Open(d2)) return L"word: body 2";
     for (size_t i = 0; d2.Block(i); i++) NodeBlock(*d2.blocks[i], out);
     if (out.s != L"x\r\na\tb\tc\r\n\t1/2\r\ny\r\nz") return L"word: copy " + out.s;
+    Word d3;  // the height estimate's share of the body: the same before and after a Ctrl+A copy parsed it all
+    d3.xml = doc2;
+    float share = Open(d3) && d3.Block(0) ? d3.Share(1) : 0;
+    while (d3.Block(d3.blocks.size())) {}
+    if (share <= 0.01f || share >= 0.5f || d3.Share(1) != share || d3.Share(d3.blocks.size()) != 1) return L"word: share";
     // Selection: a word double-clicked, then dragged back into an earlier paragraph.
     UINT32 f1, t1;
     TextUnit(L"ab cd", 3, 2, f1, t1);

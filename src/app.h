@@ -63,7 +63,9 @@ bool PreviewCanFind();  // a text preview is showing (Ctrl+F opens its search fi
 bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;
 
-// ---- pdf.cpp: PDF worker. Reply to WM_FLICK_PDF with (pixelWidth << 32 | page + 1), or 0 for "nothing".
+// ---- pdf.cpp: PDF worker. Reply to WM_FLICK_PDF with (pixelWidth << 32 | page + 1), plus
+// kPdfThumb for a sidebar thumbnail, or 0 for "nothing".
+constexpr LRESULT kPdfThumb = 0x80000000;
 struct SlideText {  // pptx: a paragraph as drawn on its slide
     Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;  // without drawing effects (no worker brushes): UI thread
     D2D1_MATRIX_3X2_F toPage;                          // layout coordinates -> page points
@@ -132,8 +134,9 @@ float WordColumn();  // the document's text width at 100%, DIPs
 float WordPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
 bool WordPicture(WPARAM gen, LPARAM msg);  // WM_FLICK_WORD: true = repaint
 // Selection, in window DIPs against the last paint's area (scrolled to `scroll`). clicks 1-3: a click (character,
-// word, paragraph), 0: dragged there. Copy: plain text (CRLF between paragraphs, tabs between table cells).
-void WordSelect(D2D1_POINT_2F pt, float scroll, int clicks);
+// word, paragraph), 0: dragged there; false: a click hit no text (nothing to drag from).
+// Copy: plain text (CRLF between paragraphs, tabs between table cells).
+bool WordSelect(D2D1_POINT_2F pt, float scroll, int clicks);
 void WordSelectAll();
 std::wstring WordCopy();
 std::wstring WordSelfTest();  // "" = ok
@@ -199,7 +202,8 @@ float GridDigitWidth(const std::wstring& font, float size);  // widest digit in 
 size_t GridShownRows();  // body rows visible (--selftest)
 // Sheets and CSV (not trees): a cell range, selected as in WordSelect (clicks 0: dragged there); a column letter,
 // row number or the corner selects columns, rows, all. Copy: cells as shown, tab-separated rows ending in CRLF.
-void GridSelect(D2D1_POINT_2F pt, float scrollX, float scrollY, int clicks);
+bool GridSelect(D2D1_POINT_2F pt, float scrollX, float scrollY, int clicks);  // false: not on a cell or header
+D2D1_RECT_F GridCells();  // the cells' area as last painted (window DIPs): headers, tab strip outside
 void GridSelectAll();
 std::wstring GridCopy();
 std::wstring GridRangeText(const GridData&, size_t r0, size_t c0, size_t r1, size_t c1);  // inclusive, clamped
