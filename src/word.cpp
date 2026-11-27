@@ -619,7 +619,7 @@ struct RunFmt {
     int va;  // 1 superscript, 2 subscript
     DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL;  // of the face ("Calibri Light"), when not bold
     DWRITE_FONT_STRETCH st = DWRITE_FONT_STRETCH_NORMAL;
-    DWRITE_FONT_WEIGHT Weight() const { return b ? DWRITE_FONT_WEIGHT_BOLD : w; }
+    DWRITE_FONT_WEIGHT Weight() const { return b ? std::max(w, DWRITE_FONT_WEIGHT_BOLD) : w; }  // Arial Black stays 900
 };
 
 struct Para {

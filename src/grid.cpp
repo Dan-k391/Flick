@@ -462,7 +462,7 @@ IDWriteTextFormat* StyleFormat(const GridData& g, size_t i) {
     ComPtr<IDWriteTextFormat>& f = g_fonts[key];
     if (!f) {
         FontFace face = ResolveFont(s.font);
-        g_dw->CreateTextFormat(face.family.c_str(), nullptr, s.bold ? DWRITE_FONT_WEIGHT_BOLD : face.weight,
+        g_dw->CreateTextFormat(face.family.c_str(), nullptr, s.bold ? std::max(face.weight, DWRITE_FONT_WEIGHT_BOLD) : face.weight,
                                s.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, face.stretch, size, L"", &f);
     }
     return g_styleFmt[i] = f ? f.Get() : g_fmtCell.Get();

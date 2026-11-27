@@ -479,7 +479,7 @@ struct Draw {
                 bool b, i, u;
                 D2D1_COLOR_F color;
                 FontFace font;
-                DWRITE_FONT_WEIGHT Weight() const { return b ? DWRITE_FONT_WEIGHT_BOLD : font.weight; }
+                DWRITE_FONT_WEIGHT Weight() const { return b ? std::max(font.weight, DWRITE_FONT_WEIGHT_BOLD) : font.weight; }
             };
             auto style = [&](const Node* rPr) {
                 std::vector<const Node*> rr{rPr};
