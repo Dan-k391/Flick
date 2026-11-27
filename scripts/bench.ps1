@@ -4,4 +4,6 @@ $exe = Join-Path $PSScriptRoot '..\build\Release\Flick.exe'
 $dir = & "$PSScriptRoot\make-samples.ps1"
 $files = 'code.cpp', 'big.log', 'photo-1920.jpg', 'photo-12mp.jpg', 'photo-24mp.jpg', 'icon-512.png', 'readme.md', 'doc.pdf', 'data.csv', 'archive.zip', 'archive.tar.gz', 'drawing.svg', 'font.ttf', 'notebook.ipynb', 'guide.adoc', 'guide.rst', 'video.mp4', 'audio.mp3', 'data.bin', 'folder' |
     ForEach-Object { Join-Path $dir $_ }
+# Workbooks from make-office-samples.ps1 (needs Excel), when they exist: a formatted one and 50k rows x 20 columns.
+$files += 'office\lab.xlsx', 'office\big.xlsx' | ForEach-Object { Join-Path $dir $_ } | Where-Object { Test-Path $_ }
 & $exe --bench @files | Write-Output
