@@ -461,8 +461,11 @@ IDWriteTextFormat* StyleFormat(const GridData& g, size_t i) {
     float size = s.size >= 1 ? s.size : 11 * 96 / 72.f;
     std::wstring key = s.font + L"|" + std::to_wstring(std::lround(size * 100)) + (s.bold ? L"b" : L"") + (s.italic ? L"i" : L"");
     ComPtr<IDWriteTextFormat>& f = g_fonts[key];
-    if (!f) g_dw->CreateTextFormat(s.font.c_str(), nullptr, s.bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                   s.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
+    if (!f) {
+        FontFace face = ResolveFont(s.font);
+        g_dw->CreateTextFormat(face.family.c_str(), nullptr, s.bold ? DWRITE_FONT_WEIGHT_BOLD : face.weight,
+                               s.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, face.stretch, size, L"", &f);
+    }
     return g_styleFmt[i] = f ? f.Get() : g_fmtCell.Get();
 }
 }  // namespace

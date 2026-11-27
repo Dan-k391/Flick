@@ -616,6 +616,9 @@ struct RunFmt {
     bool b, i, u, strike, caps, hidden;
     UINT32 color, mark;
     int va;  // 1 superscript, 2 subscript
+    DWRITE_FONT_WEIGHT w = DWRITE_FONT_WEIGHT_NORMAL;  // of the face ("Calibri Light"), when not bold
+    DWRITE_FONT_STRETCH st = DWRITE_FONT_STRETCH_NORMAL;
+    DWRITE_FONT_WEIGHT Weight() const { return b ? DWRITE_FONT_WEIGHT_BOLD : w; }
 };
 
 struct Para {
@@ -673,6 +676,8 @@ struct Para {
                     break;
                 }
             }
+        FontFace face = ResolveFont(f.font);
+        f.font = face.family, f.w = face.weight, f.st = face.stretch;
         if (const Node* c = rc("color", "val")) f.color = Hex(c->A("val"));
         if (const Node* h = rc("highlight", "val")) f.mark = Highlight(h->A("val"));
         if (const Node* s = rc("shd", "fill"); s && !f.mark) f.mark = Hex(s->A("fill"));
@@ -703,8 +708,7 @@ struct Para {
             auto o = Make<Obj>();
             ComPtr<IDWriteTextFormat> fmt;
             float size = f.size * 0.65f, shift = f.va == 1 ? -0.33f * f.size : 0.14f * f.size;
-            if (FAILED(DW()->CreateTextFormat(f.font.c_str(), nullptr, f.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                              f.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            if (FAILED(DW()->CreateTextFormat(f.font.c_str(), nullptr, f.Weight(), f.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, f.st,
                                               size, L"", &fmt)) ||
                 FAILED(DW()->CreateTextLayout(s.c_str(), (UINT32)s.size(), fmt.Get(), 1e5f, 1e5f, &o->script)))
                 return;
@@ -934,8 +938,7 @@ struct Para {
 
         RunFmt base = runs.empty() ? Props(At(pPr, {"rPr"})) : runs[0].f;
         ComPtr<IDWriteTextFormat> fmt;
-        if (FAILED(DW()->CreateTextFormat(base.font.c_str(), nullptr, base.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                          base.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+        if (FAILED(DW()->CreateTextFormat(base.font.c_str(), nullptr, base.Weight(), base.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, base.st,
                                           base.size, L"", &fmt)))
             return;
         std::string_view jc = PA("jc", "val");
@@ -952,7 +955,8 @@ struct Para {
             DWRITE_TEXT_RANGE rg{r.start, r.len};
             it.text->SetFontFamilyName(r.f.font.c_str(), rg);
             it.text->SetFontSize(r.f.size, rg);
-            it.text->SetFontWeight(r.f.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL, rg);
+            it.text->SetFontWeight(r.f.Weight(), rg);
+            it.text->SetFontStretch(r.f.st, rg);
             it.text->SetFontStyle(r.f.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, rg);
             it.text->SetUnderline(r.f.u || r.link, rg);
             it.text->SetStrikethrough(r.f.strike, rg);

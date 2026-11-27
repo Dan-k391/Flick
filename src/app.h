@@ -189,6 +189,14 @@ std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
 std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale = 0,
                                        const std::atomic<int>* gen = nullptr, int mine = 0);
 std::wstring OfficeSelfTest();  // "" = ok
+// Office font names are GDI face names ("Calibri Light", "Arial Narrow", "等线 Light"), not DirectWrite families:
+// the family, weight and stretch they stand for (unknown fonts: the name as is). Cached per name; any thread.
+struct FontFace {
+    std::wstring family;
+    DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL;
+    DWRITE_FONT_STRETCH stretch = DWRITE_FONT_STRETCH_NORMAL;
+};
+FontFace ResolveFont(const std::wstring& face);
 // A picture (PNG, JPEG, ...) decoded and scaled to w x h pixels; null if WIC can't read it. Any thread.
 Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h);
 

@@ -226,10 +226,8 @@ struct Draw {
             if (kScheme[i] == name) return theme.c[i];
         return theme.c[0];
     }
-    std::wstring Font(std::string_view face) {
-        if (face.empty() || face.starts_with("+mn")) return theme.minor;
-        if (face.starts_with("+mj")) return theme.major;
-        return Wide(face);
+    FontFace Font(std::string_view face) {
+        return ResolveFont(face.empty() || face.starts_with("+mn") ? theme.minor : face.starts_with("+mj") ? theme.major : Wide(face));
     }
 
     // ---- pictures
@@ -482,7 +480,8 @@ struct Draw {
                 float size;
                 bool b, i, u;
                 D2D1_COLOR_F color;
-                std::wstring font;
+                FontFace font;
+                DWRITE_FONT_WEIGHT Weight() const { return b ? DWRITE_FONT_WEIGHT_BOLD : font.weight; }
             };
             auto style = [&](const Node* rPr) {
                 std::vector<const Node*> rr{rPr};
@@ -550,7 +549,7 @@ struct Draw {
             if (text.empty()) out.bullet.clear();  // no bullet on an empty line
             if (!out.bullet.empty()) {
                 const Node* bf = pc("buFont");
-                out.bulletFont = bf ? Font(bf->A("typeface")) : base.font;
+                out.bulletFont = bf ? Font(bf->A("typeface")).family : base.font.family;
                 out.bulletX = marL + indent;
                 out.bulletSize = base.size * (pc("buSzPct") ? Num(pc("buSzPct")->A("val"), 100000) / 100000 : 1);
                 out.bulletColor = base.color;
@@ -558,9 +557,9 @@ struct Draw {
             }
 
             ComPtr<IDWriteTextFormat> fmt;
-            if (FAILED(dw->CreateTextFormat(base.font.c_str(), nullptr, base.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                            base.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL,
-                                            DWRITE_FONT_STRETCH_NORMAL, base.size, L"", &fmt)))
+            if (FAILED(dw->CreateTextFormat(base.font.family.c_str(), nullptr, base.Weight(),
+                                            base.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, base.font.stretch,
+                                            base.size, L"", &fmt)))
                 continue;
             std::string_view algn = pa("algn");
             fmt->SetTextAlignment(algn == "ctr" ? DWRITE_TEXT_ALIGNMENT_CENTER : algn == "r" ? DWRITE_TEXT_ALIGNMENT_TRAILING
@@ -573,10 +572,11 @@ struct Draw {
                 ComPtr<ID2D1SolidColorBrush> brush;
                 rt->CreateSolidColorBrush(x.color, &brush);
                 out.layout->SetFontSize(x.size, rg);
-                out.layout->SetFontWeight(x.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL, rg);
+                out.layout->SetFontWeight(x.Weight(), rg);
+                out.layout->SetFontStretch(x.font.stretch, rg);
                 out.layout->SetFontStyle(x.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, rg);
                 out.layout->SetUnderline(x.u, rg);
-                out.layout->SetFontFamilyName(x.font.c_str(), rg);
+                out.layout->SetFontFamilyName(x.font.family.c_str(), rg);
                 out.layout->SetDrawingEffect(brush.Get(), rg);
             }
             // Line spacing: a percentage of single (1.2 x size) or exact points.

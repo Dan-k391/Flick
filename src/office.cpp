@@ -1454,6 +1454,39 @@ std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, floa
     return g;
 }
 
+FontFace ResolveFont(const std::wstring& face) {
+    static SRWLOCK lock = SRWLOCK_INIT;
+    static std::unordered_map<std::wstring, FontFace> cache;
+    AcquireSRWLockExclusive(&lock);
+    auto [it, added] = cache.try_emplace(face, FontFace{face});
+    if (added && !face.empty() && face.size() < LF_FACESIZE) {
+        static Microsoft::WRL::ComPtr<IDWriteGdiInterop> gdi;
+        if (!gdi) {
+            Microsoft::WRL::ComPtr<IDWriteFactory> f;
+            if (SUCCEEDED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory), (IUnknown**)f.GetAddressOf())))
+                f->GetGdiInterop(&gdi);
+        }
+        LOGFONTW lf{};
+        lf.lfCharSet = DEFAULT_CHARSET;
+        wcscpy_s(lf.lfFaceName, face.c_str());
+        Microsoft::WRL::ComPtr<IDWriteFont> font;
+        Microsoft::WRL::ComPtr<IDWriteFontFamily> family;
+        Microsoft::WRL::ComPtr<IDWriteLocalizedStrings> names;
+        UINT32 i = 0, n = 0;
+        BOOL found = FALSE;
+        if (gdi && SUCCEEDED(gdi->CreateFontFromLOGFONT(&lf, &font)) && SUCCEEDED(font->GetFontFamily(&family)) &&
+            SUCCEEDED(family->GetFamilyNames(&names)) && (names->FindLocaleName(L"en-us", &i, &found), true) &&
+            SUCCEEDED(names->GetStringLength(found ? i : 0, &n))) {
+            std::wstring name(n + 1, L'\0');
+            if (SUCCEEDED(names->GetString(found ? i : 0, name.data(), n + 1)))
+                name.resize(n), it->second = {name, font->GetWeight(), font->GetStretch()};
+        }
+    }
+    FontFace r = it->second;
+    ReleaseSRWLockExclusive(&lock);
+    return r;
+}
+
 // --selftest: "" when the converters behave.
 std::wstring OfficeSelfTest() {
     std::string md = DocxToMd(R"(<w:body><w:p><w:pPr><w:pStyle w:val="T1"/></w:pPr><w:r><w:t>Title</w:t></w:r></w:p>
@@ -1486,5 +1519,8 @@ std::wstring OfficeSelfTest() {
     size_t depth = 0;
     for (const Node* n = &root; !n->kids.empty(); n = &n->kids[0]) depth++;
     if (depth != kMaxDepth) return L"xml depth cap: " + std::to_wstring(depth);
+    if (FontFace f = ResolveFont(L"Calibri Light"); f.family != L"Calibri" || f.weight != DWRITE_FONT_WEIGHT_LIGHT) return L"font: " + f.family;
+    if (FontFace f = ResolveFont(L"Segoe UI Semibold"); f.family != L"Segoe UI" || f.weight != DWRITE_FONT_WEIGHT_SEMI_BOLD) return L"font: " + f.family;
+    if (FontFace f = ResolveFont(L"No Such Font 123"); f.family != L"No Such Font 123" || f.weight != DWRITE_FONT_WEIGHT_NORMAL) return L"font: unknown";
     return L"";
 }
