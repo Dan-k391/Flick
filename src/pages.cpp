@@ -1,14 +1,15 @@
 // pptx slides drawn for the PDF view. Slides: shapes, text, pictures, tables and backgrounds, with what a
 // slide inherits from its layout, master and theme (positions, text styles, colours, fonts). Opened on the PDF
-// worker (zip + XML, a few ms); each page is drawn with Direct2D + DirectWrite into a WIC bitmap at the width
-// the view asks for, so slides and their thumbnails take the same path as PDF pages.
+// worker: presentation.xml and the (small) relationship files; a page reads the parts it needs (slide, layout,
+// master, theme, pictures) in one pass over the zip the first time it is drawn. Each page is drawn with
+// Direct2D + DirectWrite into a WIC bitmap at the width the view asks for, so slides and their thumbnails take
+// the same path as PDF pages.
 // shortcut: no charts, SmartArt, effects (shadows, glow), vertical text, EMF/WMF pictures or group rotation;
 // uncommon preset shapes are drawn as rectangles and every table gets the default table style's look.
 #include "app.h"
 #include "xml.h"
 #include <shlwapi.h>
 #include <cmath>
-#include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 using D2D1::Matrix3x2F;
@@ -16,6 +17,7 @@ using D2D1::Matrix3x2F;
 namespace {
 
 struct Part {
+    std::string xml;  // the DOM points into it (a Part never moves: unordered_map nodes are stable)
     Node root;
     std::unordered_map<std::string, std::wstring> rels;
     bool loaded = false;
@@ -127,22 +129,43 @@ struct TextBox {  // what a text body inherits, nearest first
 
 struct Pages {
     std::wstring path;
-    Members m;  // owns the XML text the DOM points into: never changed after opening
+    Members relsXml;  // every relationship file, read on opening
     std::unordered_map<std::wstring, Part> parts;
     std::vector<std::wstring> slides;
     float w = 720, h = 405;  // points
     const Node* defaults = nullptr;  // presentation.xml defaultTextStyle
 
+    static std::wstring RelsName(const std::wstring& name) {
+        size_t slash = name.rfind(L'/');
+        return name.substr(0, slash + 1) + L"_rels/" + name.substr(slash + 1) + L".rels";
+    }
+    std::unordered_map<std::string, std::wstring> RelsOf(const std::wstring& name) {
+        return Rels(Member(relsXml, RelsName(name)), name.substr(0, name.rfind(L'/') + 1));
+    }
+    void Set(Part& p, const std::wstring& name, std::string xml) {
+        p.loaded = true, p.xml = std::move(xml), p.root = Parse(p.xml), p.rels = RelsOf(name);
+    }
+    // Reads the parts not loaded yet, and the pictures `media` asks for, in one pass over the zip.
+    void Load(const std::vector<std::wstring>& names, Members* media = nullptr) {
+        auto wanted = [&](std::wstring_view n) { return std::find(names.begin(), names.end(), n) != names.end() && !parts[std::wstring(n)].loaded; };
+        auto pic = [&](std::wstring_view n) {
+            if (media)
+                for (auto& [m, b] : *media)
+                    if (m == n) return true;
+            return false;
+        };
+        Members got;
+        ArchiveReadMembers(path, [&](std::wstring_view n) -> size_t { return wanted(n) ? kMaxXml : pic(n) ? 64 << 20 : 0; }, got);
+        for (auto& [n, data] : got)
+            if (pic(n)) {
+                for (auto& [m, b] : *media)
+                    if (m == n) b = std::move(data);
+            } else Set(parts[n], n, std::move(data));
+        for (auto& n : names) parts[n].loaded = true;  // missing ones too: not looked for again
+    }
     Part& Get(const std::wstring& name) {
-        Part& p = parts[name];
-        if (!p.loaded) {
-            p.loaded = true;
-            p.root = Parse(Member(m, name));
-            size_t slash = name.rfind(L'/');
-            std::wstring dir = name.substr(0, slash + 1);
-            p.rels = Rels(Member(m, dir + L"_rels/" + name.substr(slash + 1) + L".rels"), dir);
-        }
-        return p;
+        if (!parts[name].loaded) Load({name});
+        return parts[name];
     }
     Part* Related(Part& p, std::wstring_view kind) {
         for (auto& [id, t] : p.rels)
@@ -820,18 +843,6 @@ struct Draw {
         clrMap = At(TopOf(master), {"clrMap"});
         txStyles = At(TopOf(master), {"txStyles"});
 
-        // Pictures used on this page, read from the zip in one pass.
-        std::unordered_set<std::wstring> want;
-        auto collect = [&](auto& self, const Node& n, Part& p) -> void {
-            if (n.name == "blip")
-                if (auto it = p.rels.find(std::string(n.A("r:embed"))); it != p.rels.end()) want.insert(it->second);
-            for (auto& k : n.kids) self(self, k, p);
-        };
-        for (Part* p : {slide, layout, master})
-            if (p) collect(collect, p->root, *p);
-        if (!want.empty())
-            ArchiveReadMembers(d.path, [&](std::wstring_view n) -> size_t { return want.count(std::wstring(n)) ? 64 << 20 : 0; }, media);
-
         Background();
         bool showMaster = TopOf(slide)->A("showMasterSp") != "0";
         if (showMaster && master && TopOf(layout)->A("showMasterSp") != "0")
@@ -858,13 +869,18 @@ PagesPtr PagesOpen(const std::wstring& path) {
     PagesPtr d(new Pages);
     d->path = path;
     auto want = [](std::wstring_view n) -> size_t {
-        if (!n.starts_with(L"ppt/") || !(n.ends_with(L".xml") || n.ends_with(L".rels"))) return 0;
+        if (n == L"ppt/presentation.xml") return kMaxXml;
+        if (!n.starts_with(L"ppt/") || !n.ends_with(L".rels")) return 0;
         for (const wchar_t* skip : {L"ppt/notes", L"ppt/handout", L"ppt/charts", L"ppt/diagrams", L"ppt/embeddings", L"ppt/comments"})
             if (n.starts_with(skip)) return 0;
         return kMaxXml;
     };
-    if (!ArchiveReadMembers(path, want, d->m)) return nullptr;
-    Part& pres = d->Get(L"ppt/presentation.xml");
+    Members m;
+    if (!ArchiveReadMembers(path, want, m)) return nullptr;
+    for (auto& [n, data] : m)
+        if (n.ends_with(L".rels")) d->relsXml.push_back({n, std::move(data)});
+    Part& pres = d->parts[L"ppt/presentation.xml"];
+    d->Set(pres, L"ppt/presentation.xml", std::string(Member(m, L"ppt/presentation.xml")));
     const Node* p = Top(pres.root);
     if (!p || p->name != "presentation") return nullptr;
     if (const Node* sz = (*p)["sldSz"]) d->w = (float)sz->D("cx", 9144000) / 12700, d->h = (float)sz->D("cy", 5143500) / 12700;
@@ -892,7 +908,22 @@ ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2
     rt->SetDpi(96, 96);
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     float scale = width / d.w;
+    // The slide, its layout, master and theme (followed through the relationship files) and their pictures.
+    std::vector<std::wstring> names{d.slides[index]};
+    for (const wchar_t* kind : {L"slideLayouts/", L"slideMasters/", L"theme/"})
+        for (auto& [id, t] : d.RelsOf(names.back()))
+            if (t.find(kind) != t.npos) {
+                names.push_back(t);
+                break;
+            }
+    Members media;
+    for (auto& n : names)
+        for (auto& [id, t] : d.RelsOf(n))
+            if (t.find(L"/media/") != t.npos && std::none_of(media.begin(), media.end(), [&](auto& m) { return m.first == t; }))
+                media.push_back({t, {}});
+    d.Load(names, &media);
     Draw draw{d, rt.Get(), wic, scale, Matrix3x2F::Scale(scale, scale), &d.Get(d.slides[index])};
+    draw.media = std::move(media);
     rt->BeginDraw();
     rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
     if (Top(draw.slide->root)) draw.Run();
