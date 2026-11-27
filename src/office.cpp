@@ -1019,14 +1019,16 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
     return g;
 }
 
-// ---- ods: first table, cells as displayed (text:p)
-Sheet OdsSheet(std::string_view xml, int& want, std::vector<std::wstring>& tabs) {
+// ---- ods: the table `want`, cells as displayed (text:p); stops after maxRows rows (more = true).
+// `more` comes in true when the XML was cut: then the table may lie beyond it, and `want` stays.
+Sheet OdsSheet(std::string_view xml, int& want, std::vector<std::wstring>& tabs, size_t maxRows, bool& more,
+               const std::atomic<int>* gen, int mine) {
     Sheet rows;
     std::vector<Cell> row;
     std::string cell;
     int rowRep = 1, cellRep = 1, depth = 0, tableDepth = -1;
     size_t r = 0, blank = 0;
-    bool inCell = false, inPara = false, num = false, mine = false;
+    bool inCell = false, inPara = false, num = false, ours = false;
     if (want < 0) want = 0;
     for (Xml x{xml}; int t = x.Next();) {
         if (t == Xml::Text) {
@@ -1040,23 +1042,29 @@ Sheet OdsSheet(std::string_view xml, int& want, std::vector<std::wstring>& tabs)
             else if ((n == "table-cell" || n == "covered-table-cell") && inCell) {
                 for (int k = 0; k < cellRep && row.size() < kMaxCols; k++) row.push_back({cell, num});
                 inCell = false;
-            } else if (n == "table-row" && !mine) row.clear();
+            } else if (n == "table-row" && !ours) row.clear();
             else if (n == "table-row") {
                 while (!row.empty() && row.back().v.empty()) row.pop_back();
                 if (row.empty()) blank += rowRep;  // repeated empty rows pad sheets to a million
                 else {
                     r += std::min<size_t>(blank, 100), blank = 0;
-                    for (int k = 0; k < rowRep && r < kMaxRows; k++, r++)
+                    // shortcut: a row with content repeated more than 1000 times shows 1000 (a 476-byte file can ask for 25M cells)
+                    for (int k = 0; k < std::min(rowRep, 1000) && r < std::min(kMaxRows, maxRows); k++, r++)
                         for (size_t c = 0; c < row.size(); c++) Put(rows, r, c, row[c].v, row[c].num);
                 }
                 row.clear();
-            } else if (n == "table" && depth == tableDepth) mine = false, tableDepth = -1;
+                if ((r & 255) == 0 && gen && *gen != mine) return {};  // a newer preview: stop
+                if (ours && r >= maxRows) {
+                    more = true;
+                    break;
+                }
+            } else if (n == "table" && depth == tableDepth) ours = false, tableDepth = -1;
             continue;
         }
         if (!x.empty) depth++;
         if (n == "annotation") x.Skip(), depth -= !x.empty;
         else if (n == "table" && tableDepth < 0) {
-            mine = (int)tabs.size() == want, tableDepth = depth - !x.empty;
+            ours = (int)tabs.size() == want, tableDepth = depth - !x.empty;
             tabs.push_back(Wide(XmlText(Attr(x.attrs, "name"))));
         }
         else if (n == "table-row") rowRep = std::clamp(AttrInt(x.attrs, "number-rows-repeated", 1), 1, (int)kMaxRows);
@@ -1074,14 +1082,16 @@ Sheet OdsSheet(std::string_view xml, int& want, std::vector<std::wstring>& tabs)
         } else if (n == "s" && inPara) cell.append(std::clamp(AttrInt(x.attrs, "c", 1), 1, 100), ' ');
         else if ((n == "tab" || n == "line-break") && inPara) cell += ' ';
     }
-    if (want >= (int)tabs.size()) want = 0;
+    if (want >= (int)tabs.size() && !more) want = 0;
     return rows;
 }
 
 // ---- OLE compound files (doc, xls, ppt)
 Microsoft::WRL::ComPtr<IStorage> OpenOle(const std::wstring& path) {
     Microsoft::WRL::ComPtr<IStorage> stg;
-    StgOpenStorageEx(path.c_str(), STGM_READ | STGM_SHARE_DENY_NONE | STGM_TRANSACTED, STGFMT_STORAGE, 0, nullptr,
+    // Direct mode opens in 0.2 ms (transacted: ~8 ms for 12 MB); a file open for writing (Excel) needs transacted.
+    if (FAILED(StgOpenStorageEx(path.c_str(), STGM_READ | STGM_SHARE_DENY_WRITE, STGFMT_STORAGE, 0, nullptr, nullptr, IID_PPV_ARGS(&stg))))
+        StgOpenStorageEx(path.c_str(), STGM_READ | STGM_SHARE_DENY_NONE | STGM_TRANSACTED, STGFMT_STORAGE, 0, nullptr,
                      nullptr, IID_PPV_ARGS(&stg));
     return stg;
 }
@@ -1275,33 +1285,60 @@ struct Segs {  // record data split over CONTINUE records
     }
 };
 
-Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs) {
-    std::string s;
-    if (!ReadStream(stg, L"Workbook", s) || U16(s, 0) != 0x0809 || U16(s, 4) != 0x0600) return {};  // BIFF8 only
+Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs, size_t maxRows, bool& more,
+              const std::atomic<int>* gen, int mine) {
+    // The open path reads the globals and the start of the sheet, not the whole stream (12 MB: 5 ms), and
+    // decodes shared strings only as far as its cells use them (50k strings: 5 ms).
+    bool quick = maxRows < kMaxRows;
+    Microsoft::WRL::ComPtr<IStream> st;
+    STATSTG info{};
+    if (FAILED(stg->OpenStream(L"Workbook", nullptr, STGM_READ | STGM_SHARE_EXCLUSIVE, 0, &st)) || FAILED(st->Stat(&info, STATFLAG_NONAME)))
+        return {};
+    size_t total = (size_t)std::min<ULONGLONG>(info.cbSize.QuadPart, 256 << 20);
+    auto read = [&](size_t at, size_t n, std::string& out) {
+        out.resize(std::min(n, total - std::min(at, total)));
+        ULONG got = 0;
+        LARGE_INTEGER li{};
+        li.QuadPart = (LONGLONG)at;
+        if (FAILED(st->Seek(li, STREAM_SEEK_SET, nullptr)) || FAILED(st->Read(out.data(), (ULONG)out.size(), &got))) got = 0;
+        out.resize(got);
+    };
+    std::string s, part;
     std::vector<std::string> sst;
+    Segs sstData;
+    unsigned sstLeft = 0;
     std::unordered_map<unsigned, std::string> codes;
     std::vector<unsigned> xfFormat;
     struct Bound { size_t pos; bool work; std::string name; };
     std::vector<Bound> sheets;
     size_t active = 0, k = 0;
-    auto rec = [&](size_t at) { return std::string_view(s).substr(std::min(at + 4, s.size()), U16(s, at + 2)); };
-    for (; k + 4 <= s.size() && U16(s, k) != 0x000A; k += 4 + U16(s, k + 2)) {
-        unsigned type = U16(s, k);
-        std::string_view d = rec(k);
-        if (type == 0x00FC) {  // SST
-            Segs g{{d.substr(std::min<size_t>(8, d.size()))}};
-            for (size_t c = k + 4 + d.size(); c + 4 <= s.size() && U16(s, c) == 0x003C; c += 4 + U16(s, c + 2)) g.seg.push_back(rec(c));
-            for (unsigned n = U32(d, 4); n-- && g.s < g.seg.size();) sst.push_back(g.String(true));
-        } else if (type == 0x041E) {  // FORMAT
-            Segs g{{d.substr(std::min<size_t>(2, d.size()))}};
-            codes[U16(d, 0)] = g.String(true);
-        } else if (type == 0x00E0) xfFormat.push_back(U16(d, 2));
-        else if (type == 0x0085) {  // BOUNDSHEET
-            Segs g{{d.substr(std::min<size_t>(6, d.size()))}};
-            sheets.push_back({U32(d, 0), d.size() > 5 && d[5] == 0, g.String(false)});
-        } else if (type == 0x003D) active = U16(d, 10);
-        else if (type == 0x002F) return {};  // FILEPASS: encrypted
+    auto rec = [](std::string_view b, size_t at) { return b.substr(std::min(at + 4, b.size()), U16(b, at + 2)); };
+    for (size_t first = quick ? 1 << 20 : total;; first = total) {  // globals past the first MB: read it all
+        read(0, first, s);
+        if (U16(s, 0) != 0x0809 || U16(s, 4) != 0x0600) return {};  // BIFF8 only
+        sstData = {}, sstLeft = 0, codes.clear(), xfFormat.clear(), sheets.clear(), active = 0;
+        for (k = 0; k + 4 <= s.size() && U16(s, k) != 0x000A; k += 4 + U16(s, k + 2)) {
+            unsigned type = U16(s, k);
+            std::string_view d = rec(s, k);
+            if (type == 0x00FC) {  // SST
+                sstData = {{d.substr(std::min<size_t>(8, d.size()))}}, sstLeft = U32(d, 4);
+                for (size_t c = k + 4 + d.size(); c + 4 <= s.size() && U16(s, c) == 0x003C; c += 4 + U16(s, c + 2)) sstData.seg.push_back(rec(s, c));
+            } else if (type == 0x041E) {  // FORMAT
+                Segs g{{d.substr(std::min<size_t>(2, d.size()))}};
+                codes[U16(d, 0)] = g.String(true);
+            } else if (type == 0x00E0) xfFormat.push_back(U16(d, 2));
+            else if (type == 0x0085) {  // BOUNDSHEET
+                Segs g{{d.substr(std::min<size_t>(6, d.size()))}};
+                sheets.push_back({U32(d, 0), d.size() > 5 && d[5] == 0, g.String(false)});
+            } else if (type == 0x003D) active = U16(d, 10);
+            else if (type == 0x002F) return {};  // FILEPASS: encrypted
+        }
+        if (k + 4 <= s.size() || s.size() >= total) break;
     }
+    auto str = [&](size_t i) -> std::string {
+        for (; sst.size() <= i && sstLeft && sstData.s < sstData.seg.size(); sstLeft--) sst.push_back(sstData.String(true));
+        return i < sst.size() ? sst[i] : std::string();
+    };
     size_t nth = 0;  // the active sheet among the worksheets (charts and macros sheets dropped)
     for (size_t j = 0; j < active && j < sheets.size(); j++) nth += sheets[j].work;
     if (active >= sheets.size() || !sheets[active].work) nth = 0;
@@ -1327,21 +1364,34 @@ Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs) {
         }
         return v & 1 ? d / 100 : d;
     };
+    // The sheet's records: in the buffer when it holds them, else read from the stream (the open path: a part).
+    constexpr size_t kPart = 256 << 10;
+    size_t pos = sheets[active].pos;
+    std::string_view t;
+    if (s.size() >= total || (quick && pos + kPart <= s.size())) t = std::string_view(s).substr(std::min(pos, s.size()));
+    else read(pos, quick ? kPart : total, part), t = part;
+    bool cut = pos + t.size() < total;  // the sheet may go on past `t`
     Sheet rows;
     int depth = 0;
     bool pendingString = false;
-    size_t pr = 0, pc = 0;
-    for (k = sheets[active].pos; k + 4 <= s.size(); k += 4 + U16(s, k + 2)) {
-        unsigned type = U16(s, k);
-        std::string_view d = rec(k);
+    size_t pr = 0, pc = 0, records = 0;
+    for (k = 0; k + 4 <= t.size(); k += 4 + U16(t, k + 2)) {
+        unsigned type = U16(t, k);
+        std::string_view d = rec(t, k);
         size_t r = U16(d, 0), c = U16(d, 2);
         unsigned xf = U16(d, 4);
+        if ((++records & 4095) == 0 && gen && *gen != mine) return {};  // a newer preview: stop
         if (type == 0x0809) depth++;
-        else if (type == 0x000A && --depth <= 0) break;
-        else if (depth != 1) continue;
-        else if (type == 0x00FD) {
-            if (size_t i = U32(d, 6); i < sst.size()) Put(rows, r, c, sst[i]);
-        } else if (type == 0x0203 && d.size() >= 14) {
+        else if (type == 0x000A && --depth <= 0) {
+            cut = false;
+            break;
+        } else if (depth != 1) continue;
+        else if (r >= maxRows && (type == 0x00FD || type == 0x0203 || type == 0x027E || type == 0x00BD || type == 0x0204 ||
+                                  type == 0x0205 || type == 0x0006)) {  // cells come in row order
+            more = true;
+            break;
+        } else if (type == 0x00FD) Put(rows, r, c, str(U32(d, 6)));
+        else if (type == 0x0203 && d.size() >= 14) {
             double v;
             memcpy(&v, d.data() + 6, 8);
             Put(rows, r, c, FormatNumber(v, fmt(xf)), true);
@@ -1365,6 +1415,7 @@ Sheet XlsSheet(IStorage* stg, int& want, std::vector<std::wstring>& tabs) {
             pendingString = false;
         }
     }
+    more |= quick && cut;
     return rows;
 }
 
@@ -1416,18 +1467,25 @@ Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w,
 
 std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale, const std::atomic<int>* gen, int mine) {
     if (Has(path, L" .xlsx .xlsm .xltx .xltm ")) return XlsxGrid(path, sheet, picScale, gen, mine);
+    // ods/xls: the open path reads the first rows (and at most kQuickXml of ods XML); the worker the rest.
+    bool quick = picScale <= 0, more = false, truncated = false;
+    size_t maxRows = quick ? kQuickRows : kMaxRows;
     std::vector<std::wstring> tabs;
-    bool truncated = false;
     Sheet rows;
     if (Has(path, L" .ods .ots ")) {
         Members m;
-        ArchiveReadMembers(path, [](std::wstring_view n) { return n == L"content.xml" ? kMaxXml : 0; }, m);
-        if (!m.empty()) rows = OdsSheet(m[0].second, sheet, tabs), truncated = m[0].second.size() >= kMaxXml;
-    } else if (auto stg = OpenOle(path)) rows = XlsSheet(stg.Get(), sheet, tabs);
+        size_t cap = quick ? kQuickXml : kMaxXml;
+        ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m);
+        if (!m.empty()) {
+            more = quick && m[0].second.size() >= cap, truncated = !quick && m[0].second.size() >= cap;
+            rows = OdsSheet(m[0].second, sheet, tabs, maxRows, more, gen, mine);
+        }
+    } else if (auto stg = OpenOle(path)) rows = XlsSheet(stg.Get(), sheet, tabs, maxRows, more, gen, mine);
     if (tabs.empty()) return nullptr;
     auto g = std::make_unique<GridData>();
     Fill(*g, rows);
-    g->tabs = std::move(tabs), g->tab = sheet;
+    g->tabs = std::move(tabs), g->tab = sheet, g->more = more;
+    if (more) g->sub = L"first " + std::to_wstring(kQuickRows) + L" rows · reading…";
     if (truncated) g->sub += L" · first " + std::to_wstring(kMaxXml >> 20) + L" MB";
     return g;
 }
