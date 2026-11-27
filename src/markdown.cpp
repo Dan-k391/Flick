@@ -46,7 +46,7 @@ struct Block {  // kept small: a long document has hundreds of thousands
 
 constexpr float kIndent = 26, kQuote = 18, kCodePad = 12, kCellPadX = 10, kCellPadY = 6, kMaxWidth = 860;
 // Tables: column widths from the first kSampleRows rows, layouts kept kKeepRows around the view; code: lines per chunk.
-constexpr size_t kSampleRows = 50, kKeepRows = 200, kCodeLines = 200;
+constexpr size_t kSampleRows = 50, kKeepRows = 200, kCodeLines = 50;
 
 IDWriteFactory* g_dw;
 std::wstring g_mono;
@@ -110,7 +110,7 @@ struct Parser {
         Block whole = std::move(g_blocks.back());
         std::wstring_view s = whole.text.s;
         size_t lines = std::count(s.begin(), s.end(), L'\n');
-        if (lines < 2 * kCodeLines) return void(g_blocks.back() = std::move(whole));
+        if (lines < kCodeLines) return void(g_blocks.back() = std::move(whole));
         g_blocks.pop_back();
         for (size_t at = 0, n = 0; at <= s.size(); n++) {
             size_t end = at;
@@ -684,9 +684,15 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
     if (clicks) g_sel.unit = std::min(clicks, 3);
     UINT32 from, to;
     TextUnit(t->s, TextHit(t->layout.Get(), pt.x - ox, pt.y - oy), g_sel.unit, from, to);
-    UINT64 unit = (UINT64)i << 32 | cell;
-    if (clicks) g_sel.Click({unit, from}, {unit, to});
-    else g_sel.Drag({unit, from}, {unit, to});
+    TextSel::Pos lo{(UINT64)i << 32 | cell, from}, hi{(UINT64)i << 32 | cell, to};
+    if (g_sel.unit == 3 && b.part) {  // a chunk of a code block: the whole block
+        size_t i0 = i, i1 = i;
+        while (i0 > 0 && g_blocks[i0].part > 1) i0--;
+        while (i1 + 1 < g_blocks.size() && g_blocks[i1].part != 3) i1++;
+        lo = {(UINT64)i0 << 32, 0}, hi = {(UINT64)i1 << 32, (UINT32)g_blocks[i1].text.s.size()};
+    }
+    if (clicks) g_sel.Click(lo, hi);
+    else g_sel.Drag(lo, hi);
     return true;
 }
 
