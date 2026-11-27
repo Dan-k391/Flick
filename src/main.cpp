@@ -345,6 +345,22 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             for (auto& r : runs) kw |= r.start == 0 && r.len == 3, comment |= r.role == R_Comment;
             if (!kw || !comment) ok = false, Log(L"selftest: highlight cpp");
             Highlight(L"def f(x):\n    return f\"{x}\"  # c\n", LangForName(L"python"));
+            // Lexed in parts (a long code block's chunks), a docstring open across a part's border keeps its colour.
+            std::wstring py = L"def f():\n    \"\"\"doc\n    def not_code\n    \"\"\"\n    return 1\n";
+            auto whole = Highlight(py, LangForName(L"python"));
+            auto lex = LexBegin(py, LangForName(L"python"));
+            UINT32 border = (UINT32)py.find(L"    def not_code");
+            auto a = LexRange(*lex, 0, border), b = LexRange(*lex, border, (UINT32)py.size());
+            for (auto& r : b) r.start += border;
+            a.insert(a.end(), b.begin(), b.end());
+            auto roleAt = [](const std::vector<StyleRun>& rs, UINT32 at) {
+                for (auto& r : rs)
+                    if (at >= r.start && at < r.start + r.len) return r.role;
+                return R_Default;
+            };
+            UINT32 def2 = border + 4, ret = (UINT32)py.find(L"return");
+            if (roleAt(a, def2) != roleAt(whole, def2) || roleAt(a, def2) != R_String || roleAt(a, ret) != R_Keyword)
+                ok = false, Log(L"selftest: highlight in parts");
         }
         {
             auto has = [&](const std::wstring& s, const std::wstring& part, const wchar_t* what) {

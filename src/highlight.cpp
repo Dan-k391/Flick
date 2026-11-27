@@ -108,15 +108,33 @@ private:
 
 }  // namespace
 
-std::vector<StyleRun> Highlight(const std::wstring& code, const Lang* lang) {
-    std::vector<StyleRun> runs;
-    if (!lang || code.empty()) return runs;
-    // UTF-8 for the lexer, remembering the UTF-16 index of every byte.
+// A code block as UTF-8 for the lexer, lexed as far as asked so far (always up to a line start: the lexer continues
+// from there with the style the text before it ended in, and the line states it left in the document).
+struct Lexing {
+    const Lang* lang = nullptr;
+    Scintilla::ILexer5* lexer = nullptr;
+    std::unique_ptr<Doc> doc;
+    std::vector<UINT32> lines16;  // per line: UTF-16 index of its start
+    Sci_Position done = 0;        // bytes lexed
+    ~Lexing() {
+        if (lexer) lexer->Release();
+    }
+};
+
+std::shared_ptr<Lexing> LexBegin(const std::wstring& code, const Lang* lang) {
+    if (!lang || code.empty()) return nullptr;
+    Scintilla::ILexer5* lexer = CreateLexer(lang->lexer);
+    if (!lexer) return nullptr;
+    auto l = std::make_shared<Lexing>();
+    l->lang = lang, l->lexer = lexer;
+    lexer->WordListSet(0, lang->keywords0);
+    lexer->WordListSet(1, lang->keywords1);
     std::string utf8;
-    std::vector<UINT32> index;
-    utf8.reserve(code.size()), index.reserve(code.size() + 1);
+    utf8.reserve(code.size());
+    l->lines16.push_back(0);
     for (size_t i = 0; i < code.size(); i++) {
-        UINT32 c = code[i], at = (UINT32)i;
+        UINT32 c = code[i];
+        if (c == L'\n') l->lines16.push_back((UINT32)i + 1);
         if (c >= 0xD800 && c < 0xDC00 && i + 1 < code.size()) c = 0x10000 + ((c - 0xD800) << 10) + (code[++i] - 0xDC00);
         char b[4];
         int n = c < 0x80 ? (b[0] = (char)c, 1)
@@ -125,27 +143,45 @@ std::vector<StyleRun> Highlight(const std::wstring& code, const Lang* lang) {
                               : (b[0] = (char)(0xF0 | c >> 18), b[1] = (char)(0x80 | ((c >> 12) & 0x3F)),
                                  b[2] = (char)(0x80 | ((c >> 6) & 0x3F)), b[3] = (char)(0x80 | (c & 0x3F)), 4);
         utf8.append(b, n);
-        index.insert(index.end(), n, at);
     }
-    index.push_back((UINT32)code.size());
-    Scintilla::ILexer5* lexer = CreateLexer(lang->lexer);
-    if (!lexer) return runs;
-    lexer->WordListSet(0, lang->keywords0);
-    lexer->WordListSet(1, lang->keywords1);
-    Doc doc(std::move(utf8));
-    lexer->Lex(0, doc.Length(), 0, &doc);
-    lexer->Release();
-    const std::vector<char>& styles = doc.Styles();
+    l->doc = std::make_unique<Doc>(std::move(utf8));
+    return l;
+}
+
+std::vector<StyleRun> LexRange(Lexing& l, UINT32 from, UINT32 to) {
+    std::vector<StyleRun> runs;
+    Doc& doc = *l.doc;
+    auto byteOf = [&](UINT32 at) {  // `at` is a line start, or the end
+        size_t line = std::upper_bound(l.lines16.begin(), l.lines16.end(), at) - l.lines16.begin() - 1;
+        return l.lines16[line] == at ? doc.LineStart((Sci_Position)line) : doc.Length();
+    };
+    Sci_Position b0 = byteOf(from), b1 = byteOf(to);
+    if (b1 > l.done) {
+        l.lexer->Lex(l.done, b1 - l.done, l.done ? doc.StyleAt(l.done - 1) : 0, &doc);
+        l.done = b1;
+    }
     auto roleOf = [&](char s) {
-        for (size_t i = 0; i < lang->styleCount; i++)
-            if (lang->styles[i].style == (unsigned char)s) return lang->styles[i].role;
+        for (size_t i = 0; i < l.lang->styleCount; i++)
+            if (l.lang->styles[i].style == (unsigned char)s) return l.lang->styles[i].role;
         return R_Default;
     };
-    for (size_t i = 0; i < styles.size();) {
-        size_t j = i;
-        while (j < styles.size() && styles[j] == styles[i]) j++;
-        if (Role r = roleOf(styles[i]); r != R_Default) runs.push_back({index[i], index[j] - index[i], r});
-        i = j;
+    // Bytes -> UTF-16 positions relative to `from`: one unit per character, two for one of 4 bytes.
+    const char* text = doc.BufferPointer();
+    UINT32 u = 0, runStart = 0;
+    char style = b0 < b1 ? doc.StyleAt(b0) : 0;
+    for (Sci_Position i = b0; i <= b1; i++) {
+        if (i == b1 || doc.StyleAt(i) != style) {
+            if (Role r = roleOf(style); r != R_Default && u > runStart) runs.push_back({runStart, u - runStart, r});
+            if (i == b1) break;
+            style = doc.StyleAt(i), runStart = u;
+        }
+        unsigned char c = (unsigned char)text[i];
+        if ((c & 0xC0) != 0x80) u += c >= 0xF0 ? 2 : 1;
     }
     return runs;
+}
+
+std::vector<StyleRun> Highlight(const std::wstring& code, const Lang* lang) {
+    auto l = LexBegin(code, lang);
+    return l ? LexRange(*l, 0, (UINT32)code.size()) : std::vector<StyleRun>{};
 }

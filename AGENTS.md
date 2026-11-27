@@ -118,7 +118,8 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   Tables: column widths from the first 50 rows + each column's longest text, rows laid out lazily, cell layouts
   far from the view released (5000 rows: 300 -> 8 ms). Code blocks of 51+ lines are split into 50-line chunks (the
   cheapest first frame of the sizes measured): one layout with ~240k coloured runs took 21 s (`SetDrawingEffect`
-  per run grows with the runs already set); chunks highlight separately. Table data sits behind a pointer: a long
+  per run grows with the runs already set); the block is lexed as one (highlight.cpp `LexBegin`/`LexRange`, lazily
+  up to the chunk laid out), so a string or comment crossing a border keeps its colour. Table data sits behind a pointer: a long
   document has 200k blocks, and Block's size shows in its open time.
 - **Lexilla outside Scintilla**: `GetCharacterAndWidth` past the end must return width 1 (0 hangs).
 - **Office**: Windows preview handlers (Office's own previewers, what QuickLook uses) were tried and dropped:

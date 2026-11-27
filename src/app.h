@@ -52,6 +52,11 @@ const Lang* LangForName(std::wstring name);         // "python", "c++", "sh", ..
 // ---- highlight.cpp: Lexilla styling outside Scintilla, as UTF-16 ranges (R_Default left out)
 struct StyleRun { UINT32 start, len; Role role; };
 std::vector<StyleRun> Highlight(const std::wstring& code, const Lang* lang);
+// The same, lexed lazily: a long code block shown in parts lexes only as far as a part needs (continuing where it
+// stopped, so a string or comment open across a part's border keeps its colour). Ranges start at line starts.
+struct Lexing;
+std::shared_ptr<Lexing> LexBegin(const std::wstring& code, const Lang* lang);  // nullptr: nothing to colour
+std::vector<StyleRun> LexRange(Lexing&, UINT32 from, UINT32 to);  // runs in [from, to), relative to from
 
 // ---- window.cpp: the preview window
 struct Timing { double sel, load, ready, composed; const wchar_t* kind; };

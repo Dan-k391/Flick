@@ -8,6 +8,7 @@
 #include <wincrypt.h>
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 #include "md4c.h"
 
 using Microsoft::WRL::ComPtr;
@@ -33,7 +34,7 @@ struct Block {  // kept small: a long document has hundreds of thousands
     BlockKind kind;
     int level = 0, indent = 0, quote = 0;  // heading level, list depth, quote depth
     bool tight = false;                    // text directly in a tight list item: small gap after
-    UINT8 part = 0;                        // code split in chunks: 1 first, 2 middle, 3 last (0: whole)
+    UINT8 part = 0;                        // code split in chunks: 1 first, 2 middle, 3 last (0: whole); level: its number
     std::wstring bullet;
     Text text;
     std::unique_ptr<Table> tab;           // tables
@@ -62,6 +63,9 @@ ComPtr<ID2D1SolidColorBrush> g_link, g_dim, g_role[R_Count];  // drawing effects
 // Selection: a paragraph is (block << 32 | table cell, row-major); text comes from the parsed blocks, so copying
 // never needs layout, and positions stay valid when blocks are laid out again (resize, theme, pictures arriving).
 TextSel g_sel;
+// Code blocks in chunks: the block lexed as one (lazily, as far as the chunks laid out need), by its first chunk's
+// index; with each chunk's start in the block's text.
+std::unordered_map<size_t, std::pair<std::shared_ptr<Lexing>, std::vector<UINT32>>> g_lex;
 bool g_selOn;               // during a paint: something is selected
 D2D1_COLOR_F g_selColor;
 float g_x0, g_top;          // last paint: the column's left edge, the area's top
@@ -105,7 +109,6 @@ struct Parser {
     // A long code block becomes chunks of kCodeLines lines, each laid out (and coloured) like a block of its own:
     // one layout with tens of thousands of coloured runs took seconds (setting a run's colour isn't constant-time).
     // Copying joins the chunks with CRLF, the line break they were split at.
-    // shortcut: each chunk is highlighted on its own (a string or comment open across the split loses its colour).
     void Split() {
         Block whole = std::move(g_blocks.back());
         std::wstring_view s = whole.text.s;
@@ -116,7 +119,7 @@ struct Parser {
             size_t end = at;
             for (size_t k = 0; k < kCodeLines && end != s.npos; k++) end = s.find(L'\n', k ? end + 1 : at);  // its last line's end
             Block& c = g_blocks.emplace_back(Block{B_Code, whole.level, whole.indent, whole.quote});
-            c.src = whole.src, c.part = n ? 2 : 1;
+            c.src = whole.src, c.part = n ? 2 : 1, c.level = (int)n;
             if (!n) c.bullet = whole.bullet;
             c.text.s = s.substr(at, end == s.npos ? s.npos : end - at);
             if (end == s.npos) {
@@ -389,6 +392,22 @@ void TableRows(Block& b, float until) {
     b.h = t.rowY.back();
 }
 
+// A code chunk's colours, from its block lexed as one (a string or comment crossing a border keeps its colour).
+std::vector<StyleRun> ChunkRuns(const Block& b) {
+    size_t first = &b - g_blocks.data() - b.level;
+    auto [it, made] = g_lex.try_emplace(first);
+    auto& [lex, at] = it->second;
+    if (made) {
+        std::wstring all;
+        for (size_t i = first; i < g_blocks.size() && g_blocks[i].part && (i == first || g_blocks[i].part != 1); i++)
+            at.push_back((UINT32)all.size()), all += g_blocks[i].text.s, all += L'\n';
+        at.push_back((UINT32)all.size());
+        lex = LexBegin(all, LangForName(b.src));
+    }
+    if (!lex || (size_t)b.level + 1 >= at.size()) return {};
+    return LexRange(*lex, at[b.level], at[b.level + 1]);
+}
+
 void LayoutBlock(Block& b, float width, float until = INFINITY) {
     float w = width - b.indent * kIndent - b.quote * kQuote, before = 0;
     bool dim = b.quote > 0;
@@ -402,8 +421,9 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
         case B_Code:
             b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + CodeTop(b) + (b.part % 3 == 0 ? kCodePad : 0);
             b.after = b.part % 3 == 0 ? 14 : 0;  // chunks of one block: no gap between them
-            for (auto& r : Highlight(b.text.s, LangForName(b.src)))
-                b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, r.len});
+            for (auto& r : b.part ? ChunkRuns(b) : Highlight(b.text.s, LangForName(b.src)))
+                if (r.start < b.text.s.size())
+                    b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, std::min<UINT32>(r.len, (UINT32)b.text.s.size() - r.start)});
             break;
         case B_Image:
             if (!b.sized) b.sized = true, LoadImageBlock(b, 0);  // pixels are decoded when first drawn
@@ -421,13 +441,17 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
         case B_Table: {
             size_t cols = 0;
             for (auto& r : b.tab->rows) cols = std::max(cols, r.size());
-            // Widths from the first rows and, per column, the longest text of any row: they don't change as rows are
-            // laid out (a layout per column, not per row).
+            // Widths from the first rows and, per column, the three longest texts of any row: they don't change as rows are
+            // laid out (three layouts per column, not one per row).
             std::vector<float> natural(cols, 0);
-            std::vector<const Text*> longest(cols, nullptr);
+            std::vector<std::array<const Text*, 3>> longest(cols);
             for (auto& r : b.tab->rows)
-                for (size_t ci = 0; ci < r.size(); ci++)
-                    if (!longest[ci] || r[ci].s.size() > longest[ci]->s.size()) longest[ci] = &r[ci];
+                for (size_t ci = 0; ci < r.size(); ci++) {
+                    auto& top = longest[ci];
+                    if (top[2] && r[ci].s.size() <= top[2]->s.size()) continue;
+                    top[2] = &r[ci];
+                    for (int k = 2; k > 0 && (!top[k - 1] || top[k]->s.size() > top[k - 1]->s.size()); k--) std::swap(top[k], top[k - 1]);
+                }
             auto measure = [&](Text& c, size_t ci, bool head, float slack) {
                 LayoutText(c, g_fmtBody.Get(), 1e5f, dim);
                 if (head) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
@@ -438,10 +462,12 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
             size_t sample = std::min(b.tab->rows.size(), kSampleRows);
             for (size_t ri = 0; ri < sample; ri++)
                 for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) measure(b.tab->rows[ri][ci], ci, ri == 0, 1);
-            for (size_t ci = 0; ci < cols; ci++) {  // a copy: that row keeps no layout
-                Text t{longest[ci]->s, longest[ci]->runs};
-                measure(t, ci, false, 1.15f);  // as long, but wider letters ("r4990" vs "r1000"): some room
-            }
+            for (size_t ci = 0; ci < cols; ci++)
+                for (const Text* c : longest[ci])
+                    if (c) {  // a copy: that row keeps no layout
+                        Text t{c->s, c->runs};
+                        measure(t, ci, false, 1.15f);  // as long, but wider letters ("r4990" vs "r1000"): some room
+                    }
             float total = 0;
             for (float n : natural) total += n;
             float k = total > w ? w / total : 1;  // shrink every column alike when the table is too wide
@@ -572,6 +598,7 @@ void MdInit(IDWriteFactory* dw, const wchar_t* uiFont, const wchar_t* monoFont) 
 
 void MdClear() {
     std::vector<Block>().swap(g_blocks);
+    g_lex.clear();
     g_sel = {};
     g_heads.clear();
     g_laid = 0, g_width = -1;
