@@ -57,7 +57,8 @@ scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), benc
 - `scripts\shot.ps1 <file> [-Wheel n] [-Click x,y] [-Keys vk] [-Find text] [-Drag x1,y1,x2,y2] [-SelectAll] [-Copy] [-Window]`: `--show`, then Flick paints
   the frame into `build\shots\<name>.png` itself (`WM_FLICK_SHOT`; PrintWindow can return stale DWM frames, and
   misses the text view, a child window: `-Window`). Safe while the PC is in use. Arrays: `powershell -Command "& ..."`.
-  `-Copy` prints what Ctrl+C put on the clipboard, then puts the user's clipboard text back.
+  `-Copy` prints what Ctrl+C put on the clipboard and restores it, so it runs only when the clipboard is empty or
+  holds text only (else prints `skipped: ...`: files copied in Explorer can't be put back; don't work around it).
 - `--selftest` checks languages, CSV, Markdown, converters; samples: `make-samples.ps1` (video needs ffmpeg).
 
 Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after start ~35 ms):

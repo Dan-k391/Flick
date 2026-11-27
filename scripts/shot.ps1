@@ -5,7 +5,7 @@
 # -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...; within the double-click time: a double click).
 # -Find text: opens the text search, types text. -Drag x1,y1,x2,y2: left button down, moved, up (the child window
 # there gets it: the text view). -SelectAll: Ctrl+A. -Copy: Ctrl+C, then prints the clipboard text (CR LF tab
-# escaped) and puts back the text that was on the clipboard before.
+# escaped) and puts back what was there; only when the clipboard is empty or holds text only, else it skips.
 param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @(), [string]$Find,
       [int[]]$Drag = @(), [switch]$SelectAll, [switch]$Copy, [switch]$Window)
 $ErrorActionPreference = 'Stop'
@@ -28,6 +28,19 @@ public static class Shot {
   [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
   [DllImport("user32.dll")] public static extern IntPtr ChildWindowFromPointEx(IntPtr h, POINT p, uint f);
   [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref POINT p, uint n);
+  [DllImport("user32.dll")] static extern bool OpenClipboard(IntPtr h);
+  [DllImport("user32.dll")] static extern bool CloseClipboard();
+  [DllImport("user32.dll")] static extern bool EmptyClipboard();
+  [DllImport("user32.dll")] static extern uint EnumClipboardFormats(uint f);
+  // The clipboard's formats: -1 can't open, 0 empty, 1 text only (text, OEM text, Unicode text, locale), 2 anything else.
+  public static int ClipboardKind() {
+    if (!OpenClipboard(IntPtr.Zero)) return -1;
+    int kind = 0;
+    for (uint f = EnumClipboardFormats(0); f != 0; f = EnumClipboardFormats(f)) kind = Math.Max(kind, f == 1 || f == 7 || f == 13 || f == 16 ? 1 : 2);
+    CloseClipboard();
+    return kind;
+  }
+  public static void ClearClipboard() { if (OpenClipboard(IntPtr.Zero)) { EmptyClipboard(); CloseClipboard(); } }
   public static IntPtr Find(uint pid) {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); var s = new StringBuilder(64); GetClassName(h, s, 64);
@@ -69,12 +82,18 @@ if ($Drag.Count -ge 4) {  # WM_LBUTTONDOWN, WM_MOUSEMOVEs in 8 steps, WM_LBUTTON
     Start-Sleep -Milliseconds 200
 }
 if ($SelectAll) { [void][Shot]::SendMessage($h, 0x8011, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 200 }  # WM_FLICK_SELECTALL
-if ($Copy) {  # WM_COPY (what Ctrl+C does), the clipboard printed, then given back
-    $saved = Get-Clipboard -Raw
-    [void][Shot]::SendMessage($h, 0x301, [IntPtr]::Zero, [IntPtr]::Zero)
-    $got = Get-Clipboard -Raw
-    if ($null -ne $saved) { Set-Clipboard -Value $saved }
-    'clipboard: ' + ("$got" -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t')
+# WM_COPY (what Ctrl+C does), the clipboard printed, then given back. Only text can be given back: anything else on
+# the clipboard (files copied in Explorer, pictures, rich text) skips the test instead of being lost.
+if ($Copy) {
+    $kind = [Shot]::ClipboardKind()
+    if ($kind -ne 0 -and $kind -ne 1) { 'skipped: clipboard holds non-text data (or is busy)' }
+    else {
+        $saved = Get-Clipboard -Raw
+        [void][Shot]::SendMessage($h, 0x301, [IntPtr]::Zero, [IntPtr]::Zero)
+        $got = Get-Clipboard -Raw
+        if ($kind -eq 1) { Set-Clipboard -Value $saved } else { [Shot]::ClearClipboard() }
+        'clipboard: ' + ("$got" -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t')
+    }
 }
 if ($Find) {  # WM_FLICK_FIND, then the query as WM_CHARs
     [void][Shot]::PostMessage($h, 0x800D, [IntPtr]::Zero, [IntPtr]::Zero)
