@@ -178,6 +178,51 @@ if (-not (Test-Path "$dir\big.xlsx")) {
     } finally { $x.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($x) }
 }
 
+# Lecture notes like real course documents (bench: docx): shaded headings, a bordered table, display and inline
+# equations, pictures and plain text, three times over.
+if (-not (Test-Path "$dir\lecture.docx")) {
+    $w = New-Object -ComObject Word.Application
+    try {
+        $d = $w.Documents.Add()
+        $pic = (Resolve-Path "$dir\..\photo-1920.jpg").Path
+        function Para([string]$text, [int]$style) {
+            $r = $d.Paragraphs.Last.Range
+            $r.Text = $text; $r.Style = $style
+            $r.InsertParagraphAfter()
+            return $r
+        }
+        function Equation([string]$linear) {
+            $r = $d.Paragraphs.Last.Range
+            $r.Text = $linear
+            [void]$d.OMaths.Add($r)
+            $r.OMaths.Item(1).BuildUp()
+            $d.Paragraphs.Last.Range.InsertParagraphAfter()
+        }
+        $rho = [char]0x3C1
+        for ($n = 1; $n -le 3; $n++) {
+            (Para "L$n" -2).ParagraphFormat.Shading.BackgroundPatternColor = 0xFF6633  # BGR: 3366FF
+            (Para "Question Bank Problems" -3).ParagraphFormat.Shading.BackgroundPatternColor = 0x800080
+            [void](Para "A V3 rocket with a 500 kg initial mass that is 90% fuel exhausts fuel at a rate of 10 kg/s and a speed of 800 m/s relative to the rocket. It is launched from the edge of a 500 m tall vertical cliff at 45 m/s and 30 degrees above the horizontal." -1)
+            $r = $d.Paragraphs.Last.Range
+            [void]$d.InlineShapes.AddPicture($pic, $false, $true, $r)
+            $d.InlineShapes.Item($d.InlineShapes.Count).Width = 420
+            $d.InlineShapes.Item($d.InlineShapes.Count).Height = 236
+            $d.Paragraphs.Last.Range.InsertParagraphAfter()
+            [void](Para "Calculate the drag force of the rocket by:" -1)
+            Equation "F_d=1/2 $rho A C_D v_rel^2"
+            Equation "v_rel=v-v_wind,  x(t)=2/25+cos(3/4 $([char]0x221A)(218) t)/20"
+            $r = $d.Paragraphs.Last.Range
+            $tbl = $d.Tables.Add($r, 4, 4)
+            $tbl.Borders.Enable = 1
+            for ($y = 1; $y -le 4; $y++) { for ($x = 1; $x -le 4; $x++) { $tbl.Cell($y, $x).Range.Text = "R$y C$x" } }
+            $d.Content.InsertParagraphAfter()
+            foreach ($line in 1..20) { [void](Para "report val(rx, $line)  v=v0*vector(cos(theta0), sin(theta0))" -1) }
+        }
+        $d.SaveAs2("$dir\lecture.docx", 16)
+        $d.Close(0)
+    } finally { $w.Quit(); [void][Runtime.InteropServices.Marshal]::ReleaseComObject($w) }
+}
+
 if (-not (Test-Path "$dir\slides.pptx")) {
     $p = New-Object -ComObject PowerPoint.Application
     $pr = $p.Presentations.Add(0)
