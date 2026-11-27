@@ -839,7 +839,7 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
     auto& rowH = g->rowH;
     long long r = -1, c = -1;
     std::string type, value, drawingId, dim, sqref;
-    struct Cf { std::string ranges, op; int dxf, priority; std::vector<double> f; };
+    struct Cf { std::string ranges, op; int dxf, priority; std::vector<double> f; std::vector<std::array<long long, 4>> rects; };
     std::vector<Cf> cfs;  // conditional formats: "cellIs" rules against constants
     unsigned xf = 0;
     bool inValue = false;
@@ -937,20 +937,23 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
     // Conditional formats: the first matching rule (by priority) gives the number a derived style.
     std::stable_sort(cfs.begin(), cfs.end(), [](const Cf& p, const Cf& q) { return p.priority < q.priority; });
     std::erase_if(cfs, [&](const Cf& f) { return f.dxf < 0 || f.dxf >= (int)dxfs.size() || f.f.empty(); });
+    for (auto& f : cfs) {  // "A1:B9 D4" -> rows/columns, once (not per cell)
+        std::string_view rs = f.ranges;
+        for (size_t k = 0; k < rs.size();) {
+            size_t e = std::min(rs.find(' ', k), rs.size()), colon = std::min(rs.find(':', k), e);
+            long long r0, c0, r1, c1;
+            Ref(rs.substr(k, colon - k), r0, c0);
+            Ref(colon < e ? rs.substr(colon + 1, e - colon - 1) : rs.substr(k, e - k), r1, c1);
+            f.rects.push_back({r0, c0, r1, c1});
+            k = e + 1;
+        }
+    }
     std::map<std::pair<UINT16, int>, UINT16> derived;
     for (auto& v : s.vals)
         for (auto& f : cfs) {
             if (!v.num) break;
             bool in = false;
-            std::string_view rs = f.ranges;
-            for (size_t k = 0; k < rs.size() && !in;) {
-                size_t e = std::min(rs.find(' ', k), rs.size()), colon = std::min(rs.find(':', k), e);
-                long long r0, c0, r1, c1;
-                Ref(rs.substr(k, colon - k), r0, c0);
-                Ref(colon < e ? rs.substr(colon + 1, e - colon - 1) : rs.substr(k, e - k), r1, c1);
-                in = v.r >= r0 && v.r <= r1 && v.c >= c0 && v.c <= c1;
-                k = e + 1;
-            }
+            for (auto& [r0, c0, r1, c1] : f.rects) in |= v.r >= r0 && v.r <= r1 && v.c >= c0 && v.c <= c1;
             double a = f.f[0], b = f.f.size() > 1 ? f.f[1] : a, x = v.x;
             const std::string& op = f.op;
             bool hit = op == "lessThan" ? x < a : op == "lessThanOrEqual" ? x <= a : op == "greaterThan" ? x > a
