@@ -36,7 +36,7 @@ namespace {
 constexpr float kTitleH = 40, kPad = 16, kBtnH = 28, kCloseW = 46, kThumb = 256;
 constexpr size_t kMaxText = 2 << 20;  // larger files show their first 2 MB (SCI_SETTEXT ~2 ms/MB)
 
-enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font, K_Media };
+enum Kind { K_None, K_Text, K_Image, K_Info, K_Md, K_Pdf, K_Grid, K_Font, K_Media, K_Word };
 enum Hot { H_None, H_Open, H_Close, H_Find, H_FindPrev, H_FindNext };
 
 struct Palette {
@@ -649,7 +649,7 @@ LRESULT OnPdf(PdfMsg& m) {
         g_pdfFailed = g_pages.empty();
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
-                                : std::to_wstring(m.pageCount) + (PagesFor(g_path) && !HasExt(g_path, L" .docx .docm .dotx .dotm ") ? (m.pageCount == 1 ? L" slide" : L" slides")
+                                : std::to_wstring(m.pageCount) + (PagesFor(g_path) ? (m.pageCount == 1 ? L" slide" : L" slides")
                                                                                    : (m.pageCount == 1 ? L" page" : L" pages"));
         if (m.page == -1 && !g_pdfFailed) PlaceWindow();  // before page 1 is requested: rendered at the final width
         InvalidateRect(g_hwnd, nullptr, FALSE);
@@ -745,6 +745,9 @@ void PlaceWindow() {
             }
             break;
         case K_Md: cw = 1000 - chromeW, ch = 600 - chromeH; break;
+        case K_Word:  // the text column at 100%, as tall as the screen allows
+            cw = std::min(WordColumn() + 24, screenW * 0.85f - chromeW), ch = std::max(600.f, screenH * 0.85f) - chromeH;
+            break;
         case K_Grid: cw = (GridGet() && GridGet()->folder.empty() ? 1000 : 800) - chromeW,
                      ch = (GridGet() && GridGet()->folder.empty() ? 700 : 480) - chromeH; break;
         case K_Font: cw = 900 - chromeW, ch = 650 - chromeH; break;
@@ -1305,6 +1308,7 @@ void ClearContent() {
     g_bmp.Reset();
     g_info.clear();
     MdClear();
+    WordClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
     g_sideCurrent = -1, g_sideFocus = false;
@@ -1365,6 +1369,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
     else if (HasExt(path, kSheetExt) && LoadSheet(path)) g_kind = K_Grid;
+    else if (HasExt(path, L" .docx .docm .dotx .dotm ") && WordLoad(path, g_sub)) g_kind = K_Word;
     else if (PagesFor(path)) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, kDocExt) && LoadOffice(path)) g_kind = K_Md;
     else if (HasExt(path, L" .svg .svgz ") && LoadSvg(path)) g_kind = K_Image;
@@ -1782,6 +1787,7 @@ void Paint() {
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
         if (g_kind == K_Font) g_doc[1] = FontPaint(g_rt.Get(), doc, g_scroll[1], mc);
+        if (g_kind == K_Word) g_doc[1] = WordPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Grid && GridGet()) {
             if (GridGet()->sheet) doc.left = 0, doc.right = sz.width;  // edge to edge, like Excel
             D2D1_SIZE_F size = GridPaint(g_rt.Get(), doc, g_scroll[0], g_scroll[1], mc);
@@ -1812,7 +1818,7 @@ void Paint() {
     }
 }
 
-bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid || g_kind == K_Font; }
+bool Scrollable() { return g_kind == K_Md || g_kind == K_Pdf || g_kind == K_Grid || g_kind == K_Font || g_kind == K_Word; }
 
 // Visible extent of the document along an axis, in DIPs.
 float View(int axis) {
@@ -2169,6 +2175,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_GRID:
             return OnGrid((int)w, reinterpret_cast<GridData*>(l));
+        case WM_FLICK_WORD:
+            if (WordPicture(w, l) && g_kind == K_Word) InvalidateRect(h, nullptr, FALSE);
+            return 0;
         case WM_FLICK_INFO:
             OnInfo(reinterpret_cast<InfoJob*>(l));
             return 0;
@@ -2362,7 +2371,7 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     // them. ~2.5 ms on a visible Scintilla, so after the frame: until then the bars may be the last file's.
     if (sptr_t sw = Sci(SCI_GETSCROLLWIDTH); g_kind == K_Text) Sci(SCI_SETSCROLLWIDTH, sw + 1), Sci(SCI_SETSCROLLWIDTH, sw);
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
-             : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
+             : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Word ? L"word" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, path.c_str());
     if (g_openStale) {  // the default app may have changed since the label was remembered

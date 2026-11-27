@@ -1411,6 +1411,8 @@ std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub) {
     return Wide(md);
 }
 
+Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h) { return DecodePic(bytes, w, h); }
+
 std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale, const std::atomic<int>* gen, int mine) {
     if (Has(path, L" .xlsx .xlsm .xltx .xltm ")) return XlsxGrid(path, sheet, picScale, gen, mine);
     std::vector<std::wstring> tabs;

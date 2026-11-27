@@ -1,4 +1,4 @@
-// pptx slides and docx pages drawn for the PDF view. Slides: shapes, text, pictures, tables and backgrounds, with what a
+// pptx slides drawn for the PDF view. Slides: shapes, text, pictures, tables and backgrounds, with what a
 // slide inherits from its layout, master and theme (positions, text styles, colours, fonts). Opened on the PDF
 // worker (zip + XML, a few ms); each page is drawn with Direct2D + DirectWrite into a WIC bitmap at the width
 // the view asks for, so slides and their thumbnails take the same path as PDF pages.
@@ -8,53 +8,12 @@
 #include "xml.h"
 #include <shlwapi.h>
 #include <cmath>
-#include <map>
-#include <tuple>
 #include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 using D2D1::Matrix3x2F;
 
 namespace {
-
-// ---- a small DOM over the tag scanner (string_views into the zip member's text)
-struct Node {
-    std::string_view name, attrs;
-    std::string text;  // character data of <a:t>
-    std::vector<Node> kids;
-    const Node* operator[](std::string_view n) const {
-        for (auto& k : kids)
-            if (k.name == n) return &k;
-        return nullptr;
-    }
-    std::string_view A(std::string_view a) const { return Attr(attrs, a); }
-    double D(std::string_view a, double def) const {
-        std::string_view v = A(a);
-        return v.empty() ? def : atof(std::string(v).c_str());
-    }
-};
-const Node* At(const Node* n, std::initializer_list<std::string_view> path) {
-    for (auto p : path)
-        if (!n || !(n = (*n)[p])) return nullptr;
-    return n;
-}
-const Node* Top(const Node& root) { return root.kids.empty() ? nullptr : &root.kids[0]; }
-
-Node Parse(std::string_view xml) {
-    Node root;
-    std::vector<Node*> open{&root};  // parents only grow once their open child has closed: pointers stay valid
-    for (Xml x{xml}; int t = x.Next();) {
-        if (t == Xml::Text) {
-            if (open.back()->name == "t") x.cdata ? (void)open.back()->text.append(x.text) : AppendXml(open.back()->text, x.text);
-        } else if (x.close) {
-            if (open.size() > 1) open.pop_back();
-        } else {
-            open.back()->kids.push_back({x.name, x.attrs});
-            if (!x.empty) open.push_back(&open.back()->kids.back());
-        }
-    }
-    return root;
-}
 
 struct Part {
     Node root;
@@ -155,16 +114,6 @@ struct Xf {
     }
 };
 
-struct PageItem {  // docx: something laid out on a page (points)
-    ComPtr<IDWriteTextLayout> layout, bullet;  // text: drawn at origin, clipped to `clip` (a paragraph split over pages)
-    std::vector<std::pair<DWRITE_TEXT_RANGE, D2D1_COLOR_F>> colors;
-    D2D1_POINT_2F origin{}, bulletOrigin{};
-    D2D1_RECT_F clip{};
-    D2D1_COLOR_F bulletColor{0, 0, 0, 1};  // also the fill colour
-    std::wstring media;                    // picture: zip path, drawn into `clip`
-    bool fill = false, frame = false;      // table cell shading / border
-};
-
 struct TextBox {  // what a text body inherits, nearest first
     std::vector<const Node*> lst;  // lstStyle-like nodes holding lvlNpPr
     float ins[4] = {7.2f, 3.6f, 7.2f, 3.6f};  // left top right bottom, points
@@ -183,8 +132,6 @@ struct Pages {
     std::vector<std::wstring> slides;
     float w = 720, h = 405;  // points
     const Node* defaults = nullptr;  // presentation.xml defaultTextStyle
-    bool word = false;                 // docx: pages laid out in `doc`
-    std::vector<std::vector<PageItem>> doc;
 
     Part& Get(const std::wstring& name) {
         Part& p = parts[name];
@@ -895,478 +842,11 @@ struct Draw {
 }  // namespace
 
 
-// ---- docx: paragraphs and tables flowed onto pages at open (DirectWrite measures the lines), drawn per page.
-// Styles (docDefaults, paragraph/character styles with basedOn), numbering (bullets, numbers), inline pictures.
-// shortcut: no headers/footers, floating objects (anchored pictures flow inline), columns, text boxes, table
-// styles beyond borders, or widow control; a table row taller than a page is cut off.
-namespace {
-
-struct Doc {
-    Pages& d;
-    Part* doc = nullptr;
-    const Node *styles = nullptr, *numbering = nullptr;
-    std::wstring major = L"Calibri Light", minor = L"Calibri";
-    float W = 612, H = 792, ml = 72, mr = 72, mt = 72, mb = 72;
-    float y = 0;
-    std::map<std::pair<std::string, int>, int> counters;  // (numId, level) -> last number
-
-    const Node* Style(std::string_view id) {
-        if (styles)
-            for (auto& s : styles->kids)
-                if (s.name == "style" && s.A("styleId") == id) return &s;
-        return nullptr;
-    }
-    const Node* DefaultStyle(std::string_view type) {
-        if (styles)
-            for (auto& s : styles->kids)
-                if (s.name == "style" && s.A("type") == type && (s.A("default") == "1" || s.A("default") == "true")) return &s;
-        return nullptr;
-    }
-    // Property nodes of a style and the styles it is based on (nearest first).
-    void Chain(const Node* s, std::string_view prop, std::vector<const Node*>& out) {
-        for (int guard = 0; s && guard < 20; guard++) {
-            out.push_back((*s)[prop]);
-            const Node* based = (*s)["basedOn"];
-            s = based ? Style(based->A("val")) : nullptr;
-        }
-    }
-    std::wstring Font(const Node* rFonts) {
-        if (!rFonts) return minor;
-        std::string_view t = rFonts->A("asciiTheme");
-        if (!t.empty()) return t.starts_with("major") ? major : minor;
-        std::string_view f = rFonts->A("ascii");
-        return f.empty() ? minor : Wide(f);
-    }
-    static bool On(const Node* n) {
-        if (!n) return false;
-        std::string_view v = n->A("val");
-        return v.empty() || v == "1" || v == "true" || v == "on";
-    }
-
-    struct Block {  // one paragraph, measured
-        ComPtr<IDWriteTextLayout> layout, bullet;
-        std::vector<std::pair<DWRITE_TEXT_RANGE, D2D1_COLOR_F>> colors;
-        D2D1_COLOR_F bulletColor{0, 0, 0, 1};
-        float x = 0, bulletX = 0, before = 0, after = 0;
-        bool pageBefore = false, pageAfter = false;
-        std::vector<std::tuple<std::wstring, float, float>> pictures;  // zip path, width, height (points)
-        int align = 0;
-    };
-
-    Block Para(const Node& p, float width) {
-        Block b;
-        const Node* pPr = p["pPr"];
-        const Node* ps = pPr && (*pPr)["pStyle"] ? Style((*pPr)["pStyle"]->A("val")) : DefaultStyle("paragraph");
-        std::vector<const Node*> pp{pPr};
-        Chain(ps, "pPr", pp);
-        pp.push_back(At(styles, {"docDefaults", "pPrDefault", "pPr"}));
-        auto pc = [&](std::string_view n) -> const Node* {
-            for (auto x : pp)
-                if (const Node* k = x ? (*x)[n] : nullptr) return k;
-            return nullptr;
-        };
-        auto pattr = [&](std::string_view n, std::string_view a) -> std::string_view {  // first node whose child has the attribute
-            for (auto x : pp)
-                if (const Node* k = x ? (*x)[n] : nullptr; k && !k->A(a).empty()) return k->A(a);
-            return {};
-        };
-        std::vector<const Node*> paraRuns;
-        Chain(ps, "rPr", paraRuns);
-        paraRuns.push_back(At(styles, {"docDefaults", "rPrDefault", "rPr"}));
-
-        struct Run {
-            UINT32 start, len;
-            float size;
-            bool b, i, u, caps;
-            D2D1_COLOR_F color;
-            std::wstring font;
-        };
-        auto style = [&](const Node* rPr) {
-            std::vector<const Node*> rr{rPr};
-            if (const Node* rs = rPr ? (*rPr)["rStyle"] : nullptr) Chain(Style(rs->A("val")), "rPr", rr);
-            rr.insert(rr.end(), paraRuns.begin(), paraRuns.end());
-            auto rc = [&](std::string_view n) -> const Node* {
-                for (auto x : rr)
-                    if (const Node* k = x ? (*x)[n] : nullptr) return k;
-                return nullptr;
-            };
-            Run r{0, 0, Num(rc("sz") ? rc("sz")->A("val") : "", 22) / 2, On(rc("b")), On(rc("i")),
-                  rc("u") && rc("u")->A("val") != "none", On(rc("caps")), {0, 0, 0, 1}, Font(rc("rFonts"))};
-            if (const Node* c = rc("color"); c && c->A("val") != "auto" && !c->A("val").empty()) r.color = Rgb(c->A("val"));
-            return r;
-        };
-        std::wstring text;
-        std::vector<Run> runs;
-        auto add = [&](const std::wstring& w, const Node* rPr) {
-            Run r = style(rPr);
-            r.start = (UINT32)text.size(), r.len = (UINT32)w.size();
-            text += r.caps ? [&] { std::wstring u = w; CharUpperBuffW(u.data(), (DWORD)u.size()); return u; }() : w;
-            if (r.len) runs.push_back(r);
-        };
-        // Runs, also inside hyperlinks, fields, content controls and insertions.
-        auto walk = [&](auto& self, const Node& n) -> void {
-            for (auto& k : n.kids) {
-                if (k.name == "r") {
-                    const Node* rPr = k["rPr"];
-                    for (auto& c : k.kids) {
-                        if (c.name == "t") add(Wide(c.text), rPr);
-                        else if (c.name == "tab") add(L"\t", rPr);
-                        else if (c.name == "br" || c.name == "cr") {
-                            if (c.A("type") == "page") b.pageAfter = true;
-                            else add(L"\u2028", rPr);
-                        } else if (c.name == "noBreakHyphen") add(L"-", rPr);
-                        else if (c.name == "drawing" || c.name == "AlternateContent") {
-                            const Node* dr = c.name == "drawing" ? &c : At(&c, {"Choice", "drawing"});
-                            const Node* holder = dr ? (dr->kids.empty() ? nullptr : &dr->kids[0]) : nullptr;  // inline / anchor
-                            const Node* ext = holder ? (*holder)["extent"] : nullptr;
-                            const Node* blip = holder ? At(holder, {"graphic", "graphicData", "pic", "blipFill", "blip"}) : nullptr;
-                            if (ext && blip)
-                                if (auto it = doc->rels.find(std::string(blip->A("r:embed"))); it != doc->rels.end())
-                                    b.pictures.push_back({it->second, (float)ext->D("cx", 0) / 12700, (float)ext->D("cy", 0) / 12700});
-                        }
-                    }
-                } else if (k.name == "hyperlink" || k.name == "smartTag" || k.name == "sdt" || k.name == "sdtContent" ||
-                           k.name == "ins" || k.name == "fldSimple" || k.name == "customXml")
-                    self(self, k);
-            }
-        };
-        walk(walk, p);
-        b.pageBefore = On(pc("pageBreakBefore"));
-
-        // Indents (twips) and the list bullet or number.
-        float left = Num(pattr("ind", "left").empty() ? pattr("ind", "start") : pattr("ind", "left"), 0) / 20;
-        float hanging = Num(pattr("ind", "hanging"), 0) / 20, first = Num(pattr("ind", "firstLine"), 0) / 20;
-        std::wstring bullet;
-        if (const Node* numPr = pc("numPr")) {
-            std::string numId((*numPr)["numId"] ? (*numPr)["numId"]->A("val") : std::string_view{});
-            int ilvl = (*numPr)["ilvl"] ? (int)(*numPr)["ilvl"]->D("val", 0) : 0;
-            const Node* lvl = nullptr;
-            if (numbering && !numId.empty() && numId != "0")
-                for (auto& n : numbering->kids)
-                    if (n.name == "num" && n.A("numId") == numId && n["abstractNumId"])
-                        for (auto& a : numbering->kids)
-                            if (a.name == "abstractNum" && a.A("abstractNumId") == n["abstractNumId"]->A("val"))
-                                for (auto& l : a.kids)
-                                    if (l.name == "lvl" && (int)l.D("ilvl", 0) == ilvl) lvl = &l;
-            if (lvl) {
-                std::string_view fmt = (*lvl)["numFmt"] ? (*lvl)["numFmt"]->A("val") : "decimal";
-                std::wstring tmpl = (*lvl)["lvlText"] ? Wide(XmlText((*lvl)["lvlText"]->A("val"))) : L"%1.";
-                for (auto& [key, v] : counters)
-                    if (key.first == numId && key.second > ilvl) v = 0;
-                int& n = counters[{numId, ilvl}];
-                n = n ? n + 1 : (*lvl)["start"] ? (int)(*lvl)["start"]->D("val", 1) : 1;
-                if (fmt == "bullet") bullet = tmpl.empty() || tmpl[0] < 0x20 || tmpl[0] >= 0xF000 ? L"\u2022" : tmpl;
-                else if (fmt != "none") {
-                    for (size_t k; (k = tmpl.find(L'%')) != tmpl.npos && k + 1 < tmpl.size();) {
-                        int which = tmpl[k + 1] - L'1';
-                        int v = which == ilvl ? n : std::max(1, counters[{numId, which}]);
-                        std::wstring s = fmt == "lowerLetter" ? std::wstring(1, wchar_t(L'a' + (v - 1) % 26))
-                                         : fmt == "upperLetter" ? std::wstring(1, wchar_t(L'A' + (v - 1) % 26))
-                                                                : std::to_wstring(v);
-                        tmpl.replace(k, 2, s);
-                    }
-                    bullet = tmpl;
-                }
-                if (const Node* ind = At(lvl, {"pPr", "ind"}); ind && !At(pPr, {"ind"})) {  // the paragraph's own indent wins
-                    left = Num(ind->A("left").empty() ? ind->A("start") : ind->A("left"), left * 20) / 20;
-                    hanging = Num(ind->A("hanging"), hanging * 20) / 20;
-                }
-            }
-        }
-        b.x = left;
-        Run base = runs.empty() ? style(At(pPr, {"rPr"})) : runs[0];
-        float maxSize = base.size;
-        for (auto& r : runs) maxSize = std::max(maxSize, r.size);
-
-        // Spacing (twips); line: 240ths of single with lineRule auto, else points.
-        b.before = Num(pattr("spacing", "before"), 0) / 20, b.after = Num(pattr("spacing", "after"), 0) / 20;
-        float line = maxSize * 1.17f;
-        if (std::string_view l = pattr("spacing", "line"); !l.empty()) {
-            std::string_view rule = pattr("spacing", "lineRule");
-            line = rule.empty() || rule == "auto" ? line * Num(l, 240) / 240 : rule == "exact" ? Num(l, 240) / 20 : std::max(line, Num(l, 240) / 20);
-        }
-        std::string_view jc = pc("jc") ? pc("jc")->A("val") : "";
-        b.align = jc == "center" ? 1 : jc == "right" || jc == "end" ? 2 : 0;
-
-        IDWriteFactory* dw = DW();
-        ComPtr<IDWriteTextFormat> fmt;
-        if (FAILED(dw->CreateTextFormat(base.font.c_str(), nullptr, base.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                                        base.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-                                        base.size, L"", &fmt)))
-            return b;
-        fmt->SetTextAlignment(b.align == 1 ? DWRITE_TEXT_ALIGNMENT_CENTER : b.align == 2 ? DWRITE_TEXT_ALIGNMENT_TRAILING
-                              : jc == "both" || jc == "distribute" ? DWRITE_TEXT_ALIGNMENT_JUSTIFIED : DWRITE_TEXT_ALIGNMENT_LEADING);
-        fmt->SetIncrementalTabStop(36);  // Word's default tab stops: every half inch
-        // shortcut: a first-line indent is approximated by leading spaces' worth of width (DirectWrite has no per-line indent).
-        if (first > 0 && bullet.empty()) {
-            UINT32 pad = (UINT32)std::max(1L, std::lround(first / (base.size * 0.25f)));  // a space is about 1/4 em
-            text.insert(0, pad, L' ');
-            for (auto& r : runs) r.start += pad;
-        }
-        if (FAILED(dw->CreateTextLayout(text.c_str(), (UINT32)text.size(), fmt.Get(), std::max(1.f, width - left - Num(pattr("ind", "right"), 0) / 20),
-                                        1e6f, &b.layout)))
-            return b;
-        for (auto& r : runs) {
-            DWRITE_TEXT_RANGE rg{r.start, r.len};
-            b.layout->SetFontSize(r.size, rg);
-            b.layout->SetFontWeight(r.b ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL, rg);
-            b.layout->SetFontStyle(r.i ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, rg);
-            b.layout->SetUnderline(r.u, rg);
-            b.layout->SetFontFamilyName(r.font.c_str(), rg);
-            b.colors.push_back({rg, r.color});
-        }
-        b.layout->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.8f);
-        if (!bullet.empty() && !text.empty()) {
-            ComPtr<IDWriteTextFormat> bf;
-            dw->CreateTextFormat(base.font.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                                 DWRITE_FONT_STRETCH_NORMAL, base.size, L"", &bf);
-            if (bf) {
-                bf->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
-                dw->CreateTextLayout(bullet.c_str(), (UINT32)bullet.size(), bf.Get(), 1e4f, 1e4f, &b.bullet);
-                if (b.bullet) b.bullet->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.8f);
-                b.bulletX = left - (hanging ? hanging : 18), b.bulletColor = base.color;
-            }
-        }
-        return b;
-    }
-
-    std::vector<PageItem>& Page() { return d.doc.back(); }
-    void NewPage() { d.doc.emplace_back(), y = mt; }
-
-    // A paragraph onto the pages, split between lines where a page ends.
-    void Flow(Block& b, float x0, float width) {
-        if (b.pageBefore && y > mt) NewPage();
-        if (y > mt) y += b.before;
-        for (auto& [path, w, h] : b.pictures) {
-            float s = std::min({1.f, width / std::max(w, 1.f), (H - mt - mb) / std::max(h, 1.f)});
-            if (y + h * s > H - mb && y > mt) NewPage();
-            float px = x0 + (b.align == 1 ? (width - w * s) / 2 : b.align == 2 ? width - w * s : b.x);
-            PageItem it;
-            it.media = path, it.clip = {px, y, px + w * s, y + h * s};
-            Page().push_back(std::move(it));
-            y += h * s;
-        }
-        if (!b.layout) return;
-        std::vector<DWRITE_LINE_METRICS> lines(64);
-        UINT32 n = 0;
-        if (b.layout->GetLineMetrics(lines.data(), (UINT32)lines.size(), &n) == E_NOT_SUFFICIENT_BUFFER)
-            lines.resize(n), b.layout->GetLineMetrics(lines.data(), n, &n);
-        if (b.pictures.size() && n == 1 && lines[0].length <= 1) n = 0;  // a picture's own paragraph: no empty line under it
-        float top = 0;  // layout position of the chunk's first line
-        UINT32 k = 0;
-        while (k < n) {
-            float h = 0;
-            UINT32 j = k;
-            while (j < n && (y + h + lines[j].height <= H - mb || (j == k && y <= mt))) h += lines[j++].height;
-            if (j == k) {
-                NewPage();
-                continue;
-            }
-            PageItem it;
-            it.layout = b.layout, it.colors = b.colors, it.origin = {x0 + b.x, y - top};
-            it.clip = {x0 - 2 * 72, y, x0 + width + 2 * 72, y + h};
-            if (k == 0 && b.bullet) it.bullet = b.bullet, it.bulletOrigin = {x0 + b.bulletX, y}, it.bulletColor = b.bulletColor;
-            Page().push_back(std::move(it));
-            y += h, top += h, k = j;
-            if (k < n) NewPage();
-        }
-        y += b.after;
-        if (b.pageAfter) NewPage();
-    }
-
-    // Tables: rows kept whole; columns from tblGrid; borders when the table or its style has them.
-    void Table(const Node& tbl, float x0, float width) {
-        std::vector<float> cols{0};
-        if (const Node* g = tbl["tblGrid"])
-            for (auto& c : g->kids)
-                if (c.name == "gridCol") cols.push_back(cols.back() + Num(c.A("w"), 0) / 20);
-        if (cols.size() < 2) return;
-        if (cols.back() > width) for (auto& c : cols) c *= width / cols.back();
-        const Node* pr = tbl["tblPr"];
-        const Node* ts = pr && (*pr)["tblStyle"] ? Style((*pr)["tblStyle"]->A("val")) : nullptr;
-        const Node* borders = pr ? (*pr)["tblBorders"] : nullptr;
-        for (const Node* s = ts; !borders && s; s = (*s)["basedOn"] ? Style((*s)["basedOn"]->A("val")) : nullptr)
-            borders = At(s, {"tblPr", "tblBorders"});
-        bool lines = borders && (*borders)["insideH"] && (*borders)["insideH"]->A("val") != "none" && (*borders)["insideH"]->A("val") != "nil";
-        bool box = borders && (*borders)["top"] && (*borders)["top"]->A("val") != "none" && (*borders)["top"]->A("val") != "nil";
-        if (y > mt) y += 4;
-        for (auto& tr : tbl.kids) {
-            if (tr.name != "tr") continue;
-            struct Cell { float x, w; std::vector<Block> paras; float h; D2D1_COLOR_F fill; bool filled; };
-            std::vector<Cell> cells;
-            size_t c = 0;
-            for (auto& tc : tr.kids) {
-                if (tc.name != "tc" || c + 1 >= cols.size()) continue;
-                const Node* tcPr = tc["tcPr"];
-                size_t span = tcPr && (*tcPr)["gridSpan"] ? std::max(1, (int)(*tcPr)["gridSpan"]->D("val", 1)) : 1;
-                Cell cell{cols[c], cols[std::min(c + span, cols.size() - 1)] - cols[c], {}, 0, {}, false};
-                if (const Node* shd = tcPr ? (*tcPr)["shd"] : nullptr; shd && !shd->A("fill").empty() && shd->A("fill") != "auto")
-                    cell.fill = Rgb(shd->A("fill")), cell.filled = true;
-                bool merged = tcPr && (*tcPr)["vMerge"] && (*tcPr)["vMerge"]->A("val") != "restart";
-                if (!merged)
-                    for (auto& p : tc.kids)
-                        if (p.name == "p") {
-                            cell.paras.push_back(Para(p, cell.w - 10.8f));
-                            DWRITE_TEXT_METRICS m{};
-                            if (cell.paras.back().layout) cell.paras.back().layout->GetMetrics(&m);
-                            cell.h += (cell.paras.size() > 1 ? cell.paras.back().before : 0) + m.height + cell.paras.back().after;
-                        }
-                cells.push_back(std::move(cell));
-                c += span;
-            }
-            float rowH = std::max(Num(At(&tr, {"trPr", "trHeight"}) ? At(&tr, {"trPr", "trHeight"})->A("val") : "", 0) / 20, 14.f);
-            for (auto& cell : cells) rowH = std::max(rowH, cell.h + 2);
-            if (y + rowH > H - mb && y > mt) NewPage();
-            for (auto& cell : cells) {
-                D2D1_RECT_F r{x0 + cell.x, y, x0 + cell.x + cell.w, y + rowH};
-                if (cell.filled) {
-                    PageItem f;
-                    f.fill = true, f.clip = r, f.bulletColor = cell.fill;
-                    Page().push_back(std::move(f));
-                }
-                if (lines || box) {
-                    PageItem f;
-                    f.frame = true, f.clip = r;
-                    Page().push_back(std::move(f));
-                }
-                float cy = y + 1;
-                for (size_t i = 0; i < cell.paras.size(); i++) {
-                    Block& b = cell.paras[i];
-                    if (!b.layout) continue;
-                    if (i) cy += b.before;
-                    DWRITE_TEXT_METRICS m{};
-                    b.layout->GetMetrics(&m);
-                    PageItem it;
-                    it.layout = b.layout, it.colors = b.colors, it.origin = {r.left + 5.4f + b.x, cy};
-                    it.clip = {r.left, cy, r.right, cy + m.height};
-                    if (b.bullet) it.bullet = b.bullet, it.bulletOrigin = {r.left + 5.4f + b.bulletX, cy}, it.bulletColor = b.bulletColor;
-                    Page().push_back(std::move(it));
-                    cy += m.height + b.after;
-                }
-            }
-            y += rowH;
-        }
-        y += 8;
-    }
-
-    void Body(const Node& body) {
-        for (auto& k : body.kids) {
-            if (k.name == "p") {
-                Block b = Para(k, W - ml - mr);
-                Flow(b, ml, W - ml - mr);
-                if (const Node* sect = At(&k, {"pPr", "sectPr"}); sect && (!(*sect)["type"] || (*sect)["type"]->A("val") != "continuous"))
-                    NewPage();
-            } else if (k.name == "tbl") Table(k, ml, W - ml - mr);
-            else if (k.name == "sdt") {
-                if (const Node* c = k["sdtContent"]) Body(*c);
-            }
-        }
-    }
-};
-
-}  // namespace
-
-bool OpenDocx(Pages& d) {
-    auto want = [](std::wstring_view n) -> size_t {
-        return n == L"word/document.xml" || n == L"word/styles.xml" || n == L"word/numbering.xml" ||
-                       n == L"word/_rels/document.xml.rels" || (n.starts_with(L"word/theme/") && n.ends_with(L".xml"))
-                   ? kMaxXml : 0;
-    };
-    if (!ArchiveReadMembers(d.path, want, d.m)) return false;
-    Doc doc{d};
-    doc.doc = &d.Get(L"word/document.xml");
-    const Node* body = At(Top(doc.doc->root), {"body"});
-    if (!body) return false;
-    doc.styles = Top(d.Get(L"word/styles.xml").root);
-    doc.numbering = Top(d.Get(L"word/numbering.xml").root);
-    for (auto& [name, data] : d.m)
-        if (name.starts_with(L"word/theme/")) {
-            const Node* el = At(Top(d.Get(name).root), {"themeElements", "fontScheme"});
-            if (const Node* f = At(el, {"majorFont", "latin"})) doc.major = Wide(f->A("typeface"));
-            if (const Node* f = At(el, {"minorFont", "latin"})) doc.minor = Wide(f->A("typeface"));
-            break;
-        }
-    if (const Node* sect = (*body)["sectPr"]) {  // page size and margins (twips)
-        if (const Node* sz = (*sect)["pgSz"]) doc.W = Num(sz->A("w"), 12240) / 20, doc.H = Num(sz->A("h"), 15840) / 20;
-        if (const Node* m = (*sect)["pgMar"])
-            doc.ml = Num(m->A("left"), 1440) / 20, doc.mr = Num(m->A("right"), 1440) / 20, doc.mt = Num(m->A("top"), 1440) / 20,
-            doc.mb = Num(m->A("bottom"), 1440) / 20;
-    }
-    doc.W = std::max(doc.W, doc.ml + doc.mr + 72), doc.H = std::max(doc.H, doc.mt + doc.mb + 72);
-    d.word = true, d.w = doc.W, d.h = doc.H;
-    doc.NewPage();
-    doc.Body(*body);
-    while (d.doc.size() > 1 && d.doc.back().empty()) d.doc.pop_back();
-    return true;
-}
-
-namespace {
-
-void DrawDoc(Pages& d, int index, ID2D1RenderTarget* rt, IWICImagingFactory* wic, float scale) {
-    auto& items = d.doc[index];
-    std::unordered_set<std::wstring> want;
-    for (auto& it : items)
-        if (!it.media.empty()) want.insert(it.media);
-    std::vector<std::pair<std::wstring, std::string>> media;
-    if (!want.empty())
-        ArchiveReadMembers(d.path, [&](std::wstring_view n) -> size_t { return want.count(std::wstring(n)) ? 64 << 20 : 0; }, media);
-    ComPtr<ID2D1SolidColorBrush> brush;
-    rt->CreateSolidColorBrush({0, 0, 0, 1}, &brush);
-    for (auto& it : items) {
-        if (it.fill) {
-            brush->SetColor(it.bulletColor);
-            rt->FillRectangle(it.clip, brush.Get());
-        } else if (it.frame) {
-            brush->SetColor({0, 0, 0, 1});
-            rt->DrawRectangle(it.clip, brush.Get(), 0.5f);
-        } else if (!it.media.empty()) {
-            for (auto& [n, bytes] : media) {
-                if (n != it.media) continue;
-                ComPtr<IStream> s;
-                ComPtr<IWICBitmapDecoder> dec;
-                ComPtr<IWICBitmapFrameDecode> frame;
-                ComPtr<IWICBitmapScaler> scaler;
-                ComPtr<IWICFormatConverter> conv;
-                ComPtr<ID2D1Bitmap> bmp;
-                s.Attach(SHCreateMemStream((const BYTE*)bytes.data(), (UINT)bytes.size()));
-                UINT w = std::max(1u, (UINT)std::lround((it.clip.right - it.clip.left) * scale)),
-                     h = std::max(1u, (UINT)std::lround((it.clip.bottom - it.clip.top) * scale)), fw = 0, fh = 0;
-                if (!s || FAILED(wic->CreateDecoderFromStream(s.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec)) ||
-                    FAILED(dec->GetFrame(0, &frame)))
-                    break;
-                IWICBitmapSource* src = frame.Get();
-                frame->GetSize(&fw, &fh);
-                if (fw > w && fh > h && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
-                    SUCCEEDED(scaler->Initialize(frame.Get(), w, h, WICBitmapInterpolationModeFant)))
-                    src = scaler.Get();
-                if (SUCCEEDED(wic->CreateFormatConverter(&conv)) &&
-                    SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)) &&
-                    SUCCEEDED(rt->CreateBitmapFromWicBitmap(conv.Get(), &bmp)))
-                    rt->DrawBitmap(bmp.Get(), it.clip, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
-                break;
-            }
-        } else if (it.layout) {
-            for (auto& [rg, c] : it.colors) {
-                ComPtr<ID2D1SolidColorBrush> b;
-                rt->CreateSolidColorBrush(c, &b);
-                it.layout->SetDrawingEffect(b.Get(), rg);
-            }
-            brush->SetColor({0, 0, 0, 1});
-            rt->PushAxisAlignedClip(it.clip, D2D1_ANTIALIAS_MODE_ALIASED);
-            rt->DrawTextLayout(it.origin, it.layout.Get(), brush.Get());
-            rt->PopAxisAlignedClip();
-            if (it.bullet) brush->SetColor(it.bulletColor), rt->DrawTextLayout(it.bulletOrigin, it.bullet.Get(), brush.Get());
-        }
-    }
-}
-
-}  // namespace
-
 void PagesFree::operator()(Pages* p) const { delete p; }
 
 bool PagesFor(const std::wstring& path) {
     const wchar_t* e = PathFindExtensionW(path.c_str());
-    for (const wchar_t* x : {L".pptx", L".pptm", L".potx", L".potm", L".ppsx", L".ppsm", L".docx", L".docm", L".dotx", L".dotm"})
+    for (const wchar_t* x : {L".pptx", L".pptm", L".potx", L".potm", L".ppsx", L".ppsm"})
         if (!_wcsicmp(e, x)) return true;
     return false;
 }
@@ -1374,8 +854,6 @@ bool PagesFor(const std::wstring& path) {
 PagesPtr PagesOpen(const std::wstring& path) {
     PagesPtr d(new Pages);
     d->path = path;
-    const wchar_t* ext = PathFindExtensionW(path.c_str());
-    if (!_wcsnicmp(ext, L".do", 3)) return OpenDocx(*d) ? std::move(d) : nullptr;
     auto want = [](std::wstring_view n) -> size_t {
         if (!n.starts_with(L"ppt/") || !(n.ends_with(L".xml") || n.ends_with(L".rels"))) return 0;
         for (const wchar_t* skip : {L"ppt/notes", L"ppt/handout", L"ppt/charts", L"ppt/diagrams", L"ppt/embeddings", L"ppt/comments"})
@@ -1395,10 +873,10 @@ PagesPtr PagesOpen(const std::wstring& path) {
     return d;
 }
 
-std::vector<std::pair<float, float>> PagesSizes(const Pages& d) { return {d.word ? d.doc.size() : d.slides.size(), {d.w, d.h}}; }
+std::vector<std::pair<float, float>> PagesSizes(const Pages& d) { return {d.slides.size(), {d.w, d.h}}; }
 
 ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2d, IWICImagingFactory* wic) {
-    if (index < 0 || (size_t)index >= (d.word ? d.doc.size() : d.slides.size()) || !width) return nullptr;
+    if (index < 0 || (size_t)index >= d.slides.size() || !width) return nullptr;
     UINT height = std::max(1u, (UINT)std::lround(width * d.h / d.w));
     ComPtr<IWICBitmap> bmp;
     ComPtr<ID2D1RenderTarget> rt;
@@ -1411,13 +889,6 @@ ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2
     rt->SetDpi(96, 96);
     rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     float scale = width / d.w;
-    if (d.word) {
-        rt->BeginDraw();
-        rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
-        rt->SetTransform(Matrix3x2F::Scale(scale, scale));
-        DrawDoc(d, index, rt.Get(), wic, scale);
-        return SUCCEEDED(rt->EndDraw()) ? bmp : nullptr;
-    }
     Draw draw{d, rt.Get(), wic, scale, Matrix3x2F::Scale(scale, scale), &d.Get(d.slides[index])};
     rt->BeginDraw();
     rt->Clear(D2D1::ColorF(D2D1::ColorF::White));

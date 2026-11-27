@@ -146,6 +146,51 @@ std::wstring Norm(std::wstring p) {
     return p;
 }
 
+// ---- a small DOM over the scanner (string_views into the XML text, which must outlive it)
+struct Node {
+    std::string_view name, attrs;
+    std::string text;  // character data of <t> (w:t, a:t, m:t)
+    std::vector<Node> kids;
+    const Node* operator[](std::string_view n) const {
+        for (auto& k : kids)
+            if (k.name == n) return &k;
+        return nullptr;
+    }
+    std::string_view A(std::string_view a) const { return Attr(attrs, a); }
+    double D(std::string_view a, double def) const {
+        std::string_view v = A(a);
+        return v.empty() ? def : atof(std::string(v).c_str());
+    }
+};
+const Node* At(const Node* n, std::initializer_list<std::string_view> path) {
+    for (auto p : path)
+        if (!n || !(n = (*n)[p])) return nullptr;
+    return n;
+}
+const Node* Top(const Node& root) { return root.kids.empty() ? nullptr : &root.kids[0]; }
+
+// The children of the element `x` has just opened (none for an empty one), up to its end tag.
+void ParseKids(Xml& x, Node& n) {
+    if (x.empty) return;
+    std::vector<Node*> open{&n};  // parents only grow once their open child has closed: pointers stay valid
+    for (int t; !open.empty() && (t = x.Next());) {
+        if (t == Xml::Text) {
+            if (open.back()->name == "t") x.cdata ? (void)open.back()->text.append(x.text) : AppendXml(open.back()->text, x.text);
+        } else if (x.close) {
+            open.pop_back();
+        } else {
+            open.back()->kids.push_back({x.name, x.attrs});
+            if (!x.empty) open.push_back(&open.back()->kids.back());
+        }
+    }
+}
+Node Parse(std::string_view xml) {
+    Node root;
+    Xml x{xml};
+    ParseKids(x, root);
+    return root;
+}
+
 // Relationship id -> target path inside the zip (relative targets resolved against `dir`, e.g. L"ppt/").
 std::unordered_map<std::string, std::wstring> Rels(std::string_view xml, const std::wstring& dir) {
     std::unordered_map<std::string, std::wstring> r;

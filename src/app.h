@@ -29,6 +29,7 @@ enum : UINT {
     WM_FLICK_FIND,                 // Ctrl+F in Explorer while a text preview is open
     WM_FLICK_SUBS,                 // sent by the poster worker (wParam = gen, lParam = std::vector<SubCue>*)
     WM_FLICK_SHOT,                 // scripts/shot.ps1: save the frame as Paint draws it to %FLICK_SHOT% (PNG)
+    WM_FLICK_WORD,                 // posted by the docx picture worker (wParam = gen, lParam = its message)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -80,7 +81,7 @@ using PagesPtr = std::unique_ptr<Pages, PagesFree>;
 PagesPtr PagesOpen(const std::wstring& path);                   // nullptr: not a readable deck
 std::vector<std::pair<float, float>> PagesSizes(const Pages&);  // points
 Microsoft::WRL::ComPtr<IWICBitmap> PagesRender(Pages&, int index, UINT width, ID2D1Factory*, IWICImagingFactory*);
-bool PagesFor(const std::wstring& path);                        // a file pages.cpp draws (pptx, docx)
+bool PagesFor(const std::wstring& path);                        // a file pages.cpp draws (pptx)
 
 // ---- markdown.cpp: parsed into blocks, laid out lazily with DirectWrite
 struct MdColors {
@@ -96,6 +97,14 @@ size_t MdHeadingCount();  // H1-H3, for the contents sidebar
 const std::wstring& MdHeadingText(size_t i);
 int MdHeadingLevel(size_t i);
 float MdHeadingY(size_t i, bool layout);  // -1: not laid out yet (and layout == false)  // --selftest: one "<kind><level><bullet>:<text>|" per block
+
+// ---- word.cpp: docx as one continuous column (reading view), parsed and laid out as far as it is scrolled
+bool WordLoad(const std::wstring& path, std::wstring& sub);
+void WordClear();
+float WordColumn();  // the document's text width at 100%, DIPs
+float WordPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
+bool WordPicture(WPARAM gen, LPARAM msg);  // WM_FLICK_WORD: true = repaint
+std::wstring WordSelfTest();  // "" = ok
 
 // ---- grid.cpp: table view for CSV/TSV and archive listings
 // Sheets: an Excel cell format, resolved. Colours 0xFFRRGGBB; 0 = automatic (text, borders) / none (fill).
@@ -180,6 +189,8 @@ std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
 std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale = 0,
                                        const std::atomic<int>* gen = nullptr, int mine = 0);
 std::wstring OfficeSelfTest();  // "" = ok
+// A picture (PNG, JPEG, ...) decoded and scaled to w x h pixels; null if WIC can't read it. Any thread.
+Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w, UINT h);
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)
 struct MediaState {
