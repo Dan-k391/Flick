@@ -17,6 +17,7 @@ press **Space**; **Space**/**Esc** closes.
   doc/ppt/odt/odp as text), audio/video with playback, seeking and subtitles (`name.srt`/`.vtt`/`name.<lang>.srt` beside the video), CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
   jar, apk, whl…) and folders as trees, fonts as a specimen, exe/dll/msi details, anything else: thumbnail + info.
 - Keys: Space opens/closes, arrows follow the Explorer selection, Esc closes, Ctrl+F finds in text.
+- Mouse selection + Ctrl+A/Ctrl+C (and a right-click Copy/Select all) in text, docx, sheets/CSV and pptx slides.
 - Tray: Disable, Start at sign-in, Quit. Archives use Windows' own libarchive (`archiveint.dll`).
 - Third-party licenses: `third_party/*/License.txt`, `third_party/md4c/LICENSE.md`, `third_party/lunasvg/`.
 
@@ -53,9 +54,10 @@ scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), benc
 ## Speed test
 - `scripts\bench.ps1`: in-process, each sample 20×, median `ready` (painted) / `on-screen` (after `DwmFlush`).
 - `scripts\e2e.ps1 [-Shots]`: real Explorer + SendKeys. **Never while someone uses the PC.**
-- `scripts\shot.ps1 <file> [-Wheel n] [-Click x,y] [-Keys vk] [-Find text] [-Window]`: `--show`, then Flick paints
+- `scripts\shot.ps1 <file> [-Wheel n] [-Click x,y] [-Keys vk] [-Find text] [-Drag x1,y1,x2,y2] [-SelectAll] [-Copy] [-Window]`: `--show`, then Flick paints
   the frame into `build\shots\<name>.png` itself (`WM_FLICK_SHOT`; PrintWindow can return stale DWM frames, and
   misses the text view, a child window: `-Window`). Safe while the PC is in use. Arrays: `powershell -Command "& ..."`.
+  `-Copy` prints what Ctrl+C put on the clipboard, then puts the user's clipboard text back.
 - `--selftest` checks languages, CSV, Markdown, converters; samples: `make-samples.ps1` (video needs ffmpeg).
 
 Typical on-screen medians (e2e add ~2.5 ms Explorer lookup; first press after start ~35 ms):
@@ -93,6 +95,13 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 - **Find (Ctrl+F)**: the preview doesn't have the keyboard, so the hook swallows Ctrl+F in Explorer and the
   window takes the foreground with a synthetic Alt (`SendInput`; `SC_KEYMENU` ignored); Esc gives it back.
   The field is drawn in the title bar (a child over Scintilla would be another window).
+- **Selection / Ctrl+C**: selecting needs a click, and a click activates the preview (Explorer stays the source:
+  no hide), so Ctrl+A/Ctrl+C arrive at `PreviewKey` like Esc/Space after a click; the hook is untouched. While
+  Explorer has the keyboard Ctrl+C stays Explorer's (copies the file). Esc closes (doesn't clear first). docx: a
+  position is (paragraph number in document order, `Item::leaf`, index): stable across re-layouts; Ctrl+A over a
+  document not laid out to the end copies from the XML (`NodeBlock`). pptx: the worker hands each drawn
+  paragraph's layout (drawing effects cleared: no worker brushes on the UI thread) + transform with the page;
+  highlights are an overlay. Sheets keep the selection when the worker's full copy of the same tab arrives.
 - **Images**: JPEG cost is entropy decoding; decode to the window size (DCT scaling for ≥2×), re-decode after
   resize and when zoom passes the decoded size (`Sharpen`, UI thread). EXIF orientation via a transform.
   GIF: frames composed on a canvas per disposal (0/1 keep, 2 clear, 3 restore) on a timer.
@@ -157,5 +166,5 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 eml/CAD via preview handlers; charts/SmartArt (placeholder box), docx headers/footers/footnote bodies/columns/
 explicit tab stops/floating positions/table style conditional formats/EMF pictures, odt/odp/doc/ppt as pages, sheet charts (placeholder box)/zoom/rich-text runs/other conditional formats/[Red] and fractions in
 number formats, ods/xls formatting, .doc headings/tables, xlsb; HTML (WebView2, heavy); PSD/RAW/EPUB/3D; video in a helper process;
-Markdown links/raw HTML/find; PDF zoom/text selection/find; sidebar toggle; progressive >10 MP images;
+Markdown links/raw HTML/find/selection; PDF zoom/text selection/find; selection across slides, Shift+click/keyboard selection; sidebar toggle; progressive >10 MP images;
 SVG zoom re-render; APNG/animated WebP; HEIC/AVIF need Store codecs; multi-selection.
