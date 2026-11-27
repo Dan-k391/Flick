@@ -56,15 +56,6 @@ Node Parse(std::string_view xml) {
     return root;
 }
 
-// "ppt/slides/../slideLayouts/a.xml" -> "ppt/slideLayouts/a.xml"
-std::wstring Norm(std::wstring p) {
-    for (size_t k; (k = p.find(L"/../")) != p.npos;) {
-        size_t s = k ? p.rfind(L'/', k - 1) : p.npos, from = s == p.npos ? 0 : s + 1;
-        p.erase(from, k + 4 - from);
-    }
-    return p;
-}
-
 struct Part {
     Node root;
     std::unordered_map<std::string, std::wstring> rels;
@@ -203,7 +194,6 @@ struct Pages {
             size_t slash = name.rfind(L'/');
             std::wstring dir = name.substr(0, slash + 1);
             p.rels = Rels(Member(m, dir + L"_rels/" + name.substr(slash + 1) + L".rels"), dir);
-            for (auto& [id, t] : p.rels) t = Norm(t);
         }
         return p;
     }

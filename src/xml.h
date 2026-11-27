@@ -137,13 +137,22 @@ std::string_view Member(const Members& m, std::wstring_view name) {
         if (n == name) return d;
     return {};
 }
+// "ppt/slides/../slideLayouts/a.xml" -> "ppt/slideLayouts/a.xml"
+std::wstring Norm(std::wstring p) {
+    for (size_t k; (k = p.find(L"/../")) != p.npos;) {
+        size_t s = k ? p.rfind(L'/', k - 1) : p.npos, from = s == p.npos ? 0 : s + 1;
+        p.erase(from, k + 4 - from);
+    }
+    return p;
+}
+
 // Relationship id -> target path inside the zip (relative targets resolved against `dir`, e.g. L"ppt/").
 std::unordered_map<std::string, std::wstring> Rels(std::string_view xml, const std::wstring& dir) {
     std::unordered_map<std::string, std::wstring> r;
     for (Xml x{xml}; int t = x.Next();)
         if (t == Xml::Tag && !x.close && x.name == "Relationship") {
             std::wstring target = Wide(XmlText(Attr(x.attrs, "Target")));
-            r[std::string(Attr(x.attrs, "Id"))] = target.starts_with(L'/') ? target.substr(1) : dir + target;
+            r[std::string(Attr(x.attrs, "Id"))] = target.starts_with(L'/') ? target.substr(1) : Norm(dir + target);
         }
     return r;
 }
