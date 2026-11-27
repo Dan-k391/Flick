@@ -13,7 +13,8 @@ press **Space**; **Space**/**Esc** closes.
 ## What it does (README keeps one line of this)
 - Previews: code/text (Lexilla, 100+ languages, Ctrl+F find), Markdown (+ ipynb, AsciiDoc, rst), images (WIC: JPEG,
   PNG, animated GIF, BMP, TIFF, WebP, ICO; HEIC/AVIF with Store codecs; wheel zoom + pan), SVG/SVGZ, PDF (all
-  pages, thumbnails), audio/video with playback, seeking and subtitles (`name.srt`/`.vtt`/`name.<lang>.srt` beside the video), CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
+  pages, thumbnails), Office without Office installed (docx reading view with math, xlsx/xls/ods sheets, pptx slides;
+  doc/ppt/odt/odp as text), audio/video with playback, seeking and subtitles (`name.srt`/`.vtt`/`name.<lang>.srt` beside the video), CSV/TSV, archives (zip, 7z, rar, tar.*, cab, iso,
   jar, apk, whl…) and folders as trees, fonts as a specimen, exe/dll/msi details, anything else: thumbnail + info.
 - Keys: Space opens/closes, arrows follow the Explorer selection, Esc closes, Ctrl+F finds in text.
 - Tray: Disable, Start at sign-in, Quit. Archives use Windows' own libarchive (`archiveint.dll`).

@@ -4,7 +4,7 @@ Quick Look for Windows 11. Select a file in Explorer, press **Space**: it's on s
 
 ![Flick demo](docs/demo.gif)
 
-Code, Markdown, images, PDF, video, audio, CSV, archives, folders, fonts, programs.
+Code, Markdown, images, PDF, Word, Excel, PowerPoint, video, audio, CSV, archives, folders, fonts, programs.
 Native C++, ~25 MB RAM, no dependencies.
 
 **[Download Flick.exe](https://github.com/Dan-k391/Flick/releases/latest)**, run it, press Space.
