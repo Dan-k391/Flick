@@ -24,16 +24,19 @@ struct Text {
     std::vector<D2D1_RECT_F> codeRects;  // inline-code backgrounds, layout coordinates
 };
 enum BlockKind { B_Para, B_Head, B_Code, B_Rule, B_Table, B_Image };
-struct Block {
+struct Table {
+    std::vector<std::vector<Text>> rows;  // rows[0] is the header
+    std::vector<float> colX, rowY;        // cell edges relative to the block origin; rowY: rows laid out so far
+    size_t live0 = 0, live1 = 0;          // rows that may hold cell layouts (the rest were released or never made)
+};
+struct Block {  // kept small: a long document has hundreds of thousands
     BlockKind kind;
     int level = 0, indent = 0, quote = 0;  // heading level, list depth, quote depth
     bool tight = false;                    // text directly in a tight list item: small gap after
-    int part = 0;                          // code split in chunks: 1 first, 2 middle, 3 last (0: whole)
+    UINT8 part = 0;                        // code split in chunks: 1 first, 2 middle, 3 last (0: whole)
     std::wstring bullet;
     Text text;
-    std::vector<std::vector<Text>> rows;  // tables; rows[0] is the header
-    std::vector<float> colX, rowY;        // tables: cell edges relative to the block origin; rowY: rows laid out so far
-    size_t live0 = 0, live1 = 0;          // tables: rows that may hold cell layouts (the rest were released or never made)
+    std::unique_ptr<Table> tab;           // tables
     std::wstring src;                     // images: path or data: URI; code: language
     ComPtr<ID2D1Bitmap> bmp;              // images, decoded on first layout
     bool sized = false, tried = false;
@@ -97,7 +100,7 @@ struct Parser {
         Block& b = g_blocks.back();
         while (b.kind == B_Code && !b.text.s.empty() && b.text.s.back() == L'\n') b.text.s.pop_back();
         if (b.kind == B_Para && b.text.s.empty() && b.bullet.empty()) g_blocks.pop_back();  // e.g. an HTML block
-        if (b.kind == B_Code) Split();
+        else if (b.kind == B_Code) Split();
     }
     // A long code block becomes chunks of kCodeLines lines, each laid out (and coloured) like a block of its own:
     // one layout with tens of thousands of coloured runs took seconds (setting a run's colour isn't constant-time).
@@ -134,7 +137,7 @@ struct Parser {
     Text& Target() {  // tight list items have no paragraph block: start one on first text
         if (!open) Start(B_Para), g_blocks.back().tight = !lists.empty();
         Block& b = g_blocks.back();
-        return table ? b.rows.back().back() : b.text;
+        return table ? b.tab->rows.back().back() : b.text;
     }
 };
 
@@ -163,10 +166,10 @@ int EnterBlock(MD_BLOCKTYPE type, void* d, void* user) {
         }
         case MD_BLOCK_HTML:
         case MD_BLOCK_P: p.Start(B_Para); break;
-        case MD_BLOCK_TABLE: p.Start(B_Table), p.table = true; break;
-        case MD_BLOCK_TR: g_blocks.back().rows.emplace_back(); break;
+        case MD_BLOCK_TABLE: p.Start(B_Table), g_blocks.back().tab = std::make_unique<Table>(), p.table = true; break;
+        case MD_BLOCK_TR: g_blocks.back().tab->rows.emplace_back(); break;
         case MD_BLOCK_TH:
-        case MD_BLOCK_TD: g_blocks.back().rows.back().emplace_back().align = static_cast<MD_BLOCK_TD_DETAIL*>(d)->align; break;
+        case MD_BLOCK_TD: g_blocks.back().tab->rows.back().emplace_back().align = static_cast<MD_BLOCK_TD_DETAIL*>(d)->align; break;
         default: break;
     }
     return 0;
@@ -354,8 +357,8 @@ void LoadImageBlock(Block& b, UINT px) {
 
 // A table cell's layout at its column's width (made again after it was released).
 Text& Cell(Block& b, size_t ri, size_t ci) {
-    Text& c = b.rows[ri][ci];
-    float w = b.colX[ci + 1] - b.colX[ci] - 2 * kCellPadX;
+    Text& c = b.tab->rows[ri][ci];
+    float w = b.tab->colX[ci + 1] - b.tab->colX[ci] - 2 * kCellPadX;
     if (!c.layout) {
         LayoutText(c, g_fmtBody.Get(), w, b.quote > 0);
         if (ri == 0) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
@@ -363,23 +366,23 @@ Text& Cell(Block& b, size_t ri, size_t ci) {
     return c;
 }
 
-bool Open(const Block& b) { return b.kind == B_Table && b.rowY.size() <= b.rows.size(); }  // rows still to lay out
+bool Open(const Block& b) { return b.kind == B_Table && b.tab->rowY.size() <= b.tab->rows.size(); }  // rows still to lay out
 
 // Lays out rows until the table is `until` tall. Rows laid out without a limit (a jump past the table) keep no layouts.
 void TableRows(Block& b, float until) {
-    while (Open(b) && b.rowY.back() < until) {
-        size_t ri = b.rowY.size() - 1;
+    while (Open(b) && b.tab->rowY.back() < until) {
+        size_t ri = b.tab->rowY.size() - 1;
         float rh = 0;
-        for (size_t ci = 0; ci < b.rows[ri].size(); ci++) {
+        for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) {
             DWRITE_TEXT_METRICS m{};
             Cell(b, ri, ci).layout->GetMetrics(&m);
             rh = std::max(rh, m.height);
-            if (until == INFINITY && ri >= b.live1) b.rows[ri][ci].layout.Reset();
+            if (until == INFINITY && ri >= b.tab->live1) b.tab->rows[ri][ci].layout.Reset();
         }
-        if (until != INFINITY) b.live1 = std::max(b.live1, ri + 1);
-        b.rowY.push_back(b.rowY.back() + std::ceil(rh) + 2 * kCellPadY);
+        if (until != INFINITY) b.tab->live1 = std::max(b.tab->live1, ri + 1);
+        b.tab->rowY.push_back(b.tab->rowY.back() + std::ceil(rh) + 2 * kCellPadY);
     }
-    b.h = b.rowY.back();
+    b.h = b.tab->rowY.back();
 }
 
 void LayoutBlock(Block& b, float width, float until = INFINITY) {
@@ -413,11 +416,11 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
         case B_Rule: b.h = 2, before = 10, b.after = 22; break;
         case B_Table: {
             size_t cols = 0;
-            for (auto& r : b.rows) cols = std::max(cols, r.size());
+            for (auto& r : b.tab->rows) cols = std::max(cols, r.size());
             std::vector<float> natural(cols, 0);  // from the first rows: the widths don't change as more rows are laid out
-            for (size_t ri = 0; ri < std::min(b.rows.size(), kSampleRows); ri++)
-                for (size_t ci = 0; ci < b.rows[ri].size(); ci++) {
-                    Text& c = b.rows[ri][ci];
+            for (size_t ri = 0; ri < std::min(b.tab->rows.size(), kSampleRows); ri++)
+                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++) {
+                    Text& c = b.tab->rows[ri][ci];
                     LayoutText(c, g_fmtBody.Get(), 1e5f, dim);
                     if (ri == 0) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
                     DWRITE_TEXT_METRICS m{};
@@ -427,9 +430,9 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
             float total = 0;
             for (float n : natural) total += n;
             float k = total > w ? w / total : 1;  // shrink every column alike when the table is too wide
-            b.colX.assign(1, 0);
-            for (float n : natural) b.colX.push_back(b.colX.back() + std::floor(std::max(48.f, n * k)));
-            b.rowY.assign(1, 0), b.live0 = 0, b.live1 = std::min(b.rows.size(), kSampleRows);
+            b.tab->colX.assign(1, 0);
+            for (float n : natural) b.tab->colX.push_back(b.tab->colX.back() + std::floor(std::max(48.f, n * k)));
+            b.tab->rowY.assign(1, 0), b.tab->live0 = 0, b.tab->live1 = std::min(b.tab->rows.size(), kSampleRows);
             b.h = 0, b.after = 14;  // rows: TableRows, below
             break;
         }
@@ -503,25 +506,25 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             }
             break;
         case B_Table: {
-            if (b.rowY.size() < 2) break;
+            if (b.tab->rowY.size() < 2) break;
             fill->SetColor(c.codeBg);
-            rt->FillRectangle({x, y, x + b.colX.back(), y + b.rowY[1]}, fill);
+            rt->FillRectangle({x, y, x + b.tab->colX.back(), y + b.tab->rowY[1]}, fill);
             fill->SetColor(c.rule);
-            for (float cx : b.colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
+            for (float cx : b.tab->colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
             // Only the rows in view (a long table: thousands of rows off screen); layouts far from them are released.
-            auto row = [&](float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(b.rowY.begin(), b.rowY.end(), v) - b.rowY.begin() - 1); };
-            size_t laid = b.rowY.size() - 1, r0 = std::min(laid, row(top - y)), r1 = std::min(laid, row(bottom - y) + 1), k = 0;
+            auto row = [&](float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(b.tab->rowY.begin(), b.tab->rowY.end(), v) - b.tab->rowY.begin() - 1); };
+            size_t laid = b.tab->rowY.size() - 1, r0 = std::min(laid, row(top - y)), r1 = std::min(laid, row(bottom - y) + 1), k = 0;
             size_t keep0 = r0 > kKeepRows ? r0 - kKeepRows : 0, keep1 = std::min(laid, r1 + kKeepRows);
-            for (size_t ri = b.live0; ri < std::min(b.live1, laid); ri++)
+            for (size_t ri = b.tab->live0; ri < std::min(b.tab->live1, laid); ri++)
                 if (ri < keep0 || ri >= keep1)
-                    for (auto& cell : b.rows[ri]) cell.layout.Reset();
-            b.live0 = keep0, b.live1 = b.live1 > laid ? std::max(keep1, b.live1) : keep1;  // unlaid sample rows: later
-            for (size_t ri = r0; ri <= r1 && ri < b.rowY.size(); ri++)
-                rt->FillRectangle({x, y + b.rowY[ri], x + b.colX.back() + 1, y + b.rowY[ri] + 1}, fill);
-            for (size_t ri = 0; ri < r0; ri++) k += b.rows[ri].size();
+                    for (auto& cell : b.tab->rows[ri]) cell.layout.Reset();
+            b.tab->live0 = keep0, b.tab->live1 = b.tab->live1 > laid ? std::max(keep1, b.tab->live1) : keep1;  // unlaid sample rows: later
+            for (size_t ri = r0; ri <= r1 && ri < b.tab->rowY.size(); ri++)
+                rt->FillRectangle({x, y + b.tab->rowY[ri], x + b.tab->colX.back() + 1, y + b.tab->rowY[ri] + 1}, fill);
+            for (size_t ri = 0; ri < r0; ri++) k += b.tab->rows[ri].size();
             for (size_t ri = r0; ri < r1; ri++)
-                for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++)
-                    DrawRich(rt, Cell(b, ri, ci), unit + k, x + b.colX[ci] + kCellPadX, y + b.rowY[ri] + kCellPadY, text, fill, c);
+                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++, k++)
+                    DrawRich(rt, Cell(b, ri, ci), unit + k, x + b.tab->colX[ci] + kCellPadX, y + b.tab->rowY[ri] + kCellPadY, text, fill, c);
             break;
         }
     }
@@ -615,7 +618,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
         if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
     }
     float h = g_laidH + 24;  // bottom padding; estimates until all is laid out: a table's rows at their average so far
-    if (const Block* t = g_laid ? &g_blocks[g_laid - 1] : nullptr; t && Open(*t)) h += t->h / std::max<size_t>(1, t->rowY.size() - 1) * (t->rows.size() + 1 - t->rowY.size());
+    if (const Block* t = g_laid ? &g_blocks[g_laid - 1] : nullptr; t && Open(*t)) h += t->h / std::max<size_t>(1, t->tab->rowY.size() - 1) * (t->tab->rows.size() + 1 - t->tab->rowY.size());
     return g_laid == g_blocks.size() ? h : h * g_blocks.size() / std::max<size_t>(g_laid, 1);
 }
 
@@ -630,7 +633,7 @@ std::wstring MdOutline() {
 }
 
 bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
-    auto texty = [](const Block& b) { return (b.kind == B_Para || b.kind == B_Head || b.kind == B_Code || b.kind == B_Table) && !(b.kind == B_Table && b.rows.empty()); };
+    auto texty = [](const Block& b) { return (b.kind == B_Para || b.kind == B_Head || b.kind == B_Code || b.kind == B_Table) && !(b.kind == B_Table && b.tab->rows.empty()); };
     if (!g_laid) return clicks ? (g_sel = {}, false) : false;
     size_t k = std::upper_bound(g_blocks.begin(), g_blocks.begin() + g_laid, pt.y - g_top + scroll,
                                 [](float v, const Block& b) { return v < b.y; }) - g_blocks.begin();
@@ -649,14 +652,14 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
     UINT32 cell = 0;
     if (b.kind == B_Table) {  // the cell under the point (the nearest in its row)
         auto at = [](const std::vector<float>& e, float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(e.begin(), e.end(), v) - e.begin() - 1); };
-        if (b.rowY.size() < 2) return false;
-        size_t ri = std::min(at(b.rowY, pt.y - oy), b.rowY.size() - 2);  // laid out rows only
-        while (ri > 0 && b.rows[ri].empty()) ri--;
-        if (b.rows[ri].empty()) return false;
-        size_t ci = std::min(at(b.colX, pt.x - ox), b.rows[ri].size() - 1);
-        for (size_t r = 0; r < ri; r++) cell += (UINT32)b.rows[r].size();
+        if (b.tab->rowY.size() < 2) return false;
+        size_t ri = std::min(at(b.tab->rowY, pt.y - oy), b.tab->rowY.size() - 2);  // laid out rows only
+        while (ri > 0 && b.tab->rows[ri].empty()) ri--;
+        if (b.tab->rows[ri].empty()) return false;
+        size_t ci = std::min(at(b.tab->colX, pt.x - ox), b.tab->rows[ri].size() - 1);
+        for (size_t r = 0; r < ri; r++) cell += (UINT32)b.tab->rows[r].size();
         cell += (UINT32)ci, t = &Cell(b, ri, ci);
-        ox += b.colX[ci] + kCellPadX, oy += b.rowY[ri] + kCellPadY;
+        ox += b.tab->colX[ci] + kCellPadX, oy += b.tab->rowY[ri] + kCellPadY;
     } else if (b.kind == B_Code) ox += kCodePad, oy += CodeTop(b);
     if (!t->layout) return false;
     if (clicks) g_sel.unit = std::min(clicks, 3);
@@ -684,10 +687,10 @@ std::wstring MdCopy(const TextSel& sel) {
         UINT64 unit = (UINT64)i << 32;
         UINT32 from, to;
         if (b.kind == B_Table) {
-            for (size_t ri = 0, k = 0; ri < b.rows.size(); ri++) {
-                for (size_t ci = 0; ci < b.rows[ri].size(); ci++, k++) {
+            for (size_t ri = 0, k = 0; ri < b.tab->rows.size(); ri++) {
+                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++, k++) {
                     if (ci) o.Sep(L"\t");
-                    if (sel.Span(unit + k, (UINT32)b.rows[ri][ci].s.size(), from, to)) o.Put(Plain(b.rows[ri][ci].s, from, to));
+                    if (sel.Span(unit + k, (UINT32)b.tab->rows[ri][ci].s.size(), from, to)) o.Put(Plain(b.tab->rows[ri][ci].s, from, to));
                 }
                 o.Sep(L"\r\n");
             }
