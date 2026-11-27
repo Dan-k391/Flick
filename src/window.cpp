@@ -131,6 +131,7 @@ float g_subSize, g_subW;  // font size and wrap width of g_subLayout
 std::atomic<int> g_gridGen;
 std::atomic<int> g_sizeGen;  // folder-size worker
 bool g_gridFolder;           // the tree being listed is a folder (its size gets counted)
+bool g_gridSheet;            // the worker completes a sheet (all rows, pictures)
 bool g_gridPending;
 
 // Sidebar for Markdown (contents) and PDF (page thumbnails), when the window is wide enough.
@@ -788,12 +789,15 @@ bool LoadCsv(const std::wstring& path) {
 constexpr wchar_t kSheetExt[] = L" .xlsx .xlsm .xltx .xltm .xls .xlt .ods .ots ";
 constexpr wchar_t kDocExt[] = L" .docx .docm .dotx .dotm .doc .dot .odt .ott .pptx .pptm .potx .potm .ppsx .ppsm .ppt .pps .pot .odp .otp ";
 
+void StartSheetWorker(const std::wstring& path, int sheet);
 // Excel/Calc: a sheet (the active one first; tabs switch) into the grid; Word/PowerPoint/Writer/Impress as
-// Markdown (office.cpp).
+// Markdown (office.cpp). Big sheets show their first rows; a worker brings the rest and the pictures.
 bool LoadSheet(const std::wstring& path, int sheet = -1) {
     auto g = OfficeToGrid(path, sheet);
     if (!g) return false;
     g_sub = g->sub;
+    g_gridSheet = false, ++g_gridGen;
+    if (g->more) StartSheetWorker(path, g->tab);
     GridSet(std::move(g));
     return true;
 }
@@ -810,19 +814,30 @@ struct GridJob {
     std::wstring path;
     int gen;
     bool folder;
+    int sheet = -1;  // >= 0: complete this sheet of a workbook
+    float scale = 1;
 };
 
 DWORD WINAPI GridThread(void* p) {
     std::unique_ptr<GridJob> job(static_cast<GridJob*>(p));
-    GridData* g = (job->folder ? GridReadFolder(job->path, g_gridGen, job->gen) : GridReadArchive(job->path, g_gridGen, job->gen)).release();
+    GridData* g;
+    if (job->sheet >= 0) {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // WIC for the pictures
+        g = OfficeToGrid(job->path, job->sheet, job->scale, &g_gridGen, job->gen).release();
+    } else g = (job->folder ? GridReadFolder(job->path, g_gridGen, job->gen) : GridReadArchive(job->path, g_gridGen, job->gen)).release();
     if (!SendMessageW(g_hwnd, WM_FLICK_GRID, job->gen, (LPARAM)g)) delete g;  // reply 1: the UI took it
     return 0;
+}
+
+void StartSheetWorker(const std::wstring& path, int sheet) {
+    g_gridSheet = true;
+    CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, g_gridGen, false, sheet, g_dpi / 96.f}, 0, nullptr));
 }
 
 // Archive or folder contents as a tree, listed on a worker thread.
 void LoadTree(const std::wstring& path, bool folder) {
     g_gridPending = true;
-    g_gridFolder = folder;
+    g_gridFolder = folder, g_gridSheet = false;
     g_sub = L"reading…";
     CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen, folder}, 0, nullptr));
 }
@@ -910,7 +925,7 @@ LRESULT OnGrid(int gen, GridData* g) {
     if (gen != g_gridGen || g_kind != K_Grid) return 0;
     g_gridPending = false;
     InvalidateRect(g_hwnd, nullptr, FALSE);
-    if (!g) return ShowInfo(), 0;  // not readable as an archive
+    if (!g) return g_gridSheet ? 0 : (ShowInfo(), 0);  // not readable as an archive (a sheet keeps its first rows)
     g_sub = g->sub;
     if (g_gridFolder) {  // count the whole folder's size in the background
         auto* job = new std::pair<std::wstring, SizeJob>{g_path, SizeJob{++g_sizeGen}};
@@ -1294,6 +1309,7 @@ void ClearContent() {
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
     g_sideCurrent = -1, g_sideFocus = false;
     GridSet(nullptr);
+    ++g_gridGen;  // a worker still reading stops
     FontClear();
     MediaClose();
     MediaScrubStop();
@@ -1957,6 +1973,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};  // wheel positions are in screen coordinates
                 ScreenToClient(h, &pt);
                 if (m == WM_MOUSEWHEEL && Dip(pt.x) < SideW()) return ScrollBy(2, -d), 0;  // over the sidebar
+                if (g_kind == K_Grid && GridTabWheel({Dip(pt.x), Dip(pt.y)}, d)) return InvalidateRect(h, nullptr, FALSE), 0;
                 ScrollBy(sideways ? 0 : 1, m == WM_MOUSEHWHEEL ? d : -d);
             }
             return 0;
@@ -2001,8 +2018,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else if (in(g_playRc) || (g_mediaVideo && pt.y > kTitleH)) MediaToggle(), InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
-            if (int tab; g_kind == K_Grid && (tab = GridTabAt({Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))})) >= 0) {
-                if (tab != GridGet()->tab && LoadSheet(g_path, tab)) g_scroll[0] = g_scroll[1] = 0, InvalidateRect(h, nullptr, FALSE);
+            if (int tab; g_kind == K_Grid && (tab = GridTabAt({Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))})) != -1) {
+                if (tab == -2) InvalidateRect(h, nullptr, FALSE);  // a tab-strip arrow
+                else if (tab != GridGet()->tab && LoadSheet(g_path, tab)) g_scroll[0] = g_scroll[1] = 0, InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
             if (g_kind == K_Grid && OnBar(l) < 0) {  // trees: click a folder to expand/collapse it

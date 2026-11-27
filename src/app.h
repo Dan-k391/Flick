@@ -1,5 +1,6 @@
 #pragma once
 #include <windows.h>
+#include <array>
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -97,6 +98,20 @@ int MdHeadingLevel(size_t i);
 float MdHeadingY(size_t i, bool layout);  // -1: not laid out yet (and layout == false)  // --selftest: one "<kind><level><bullet>:<text>|" per block
 
 // ---- grid.cpp: table view for CSV/TSV and archive listings
+// Sheets: an Excel cell format, resolved. Colours 0xFFRRGGBB; 0 = automatic (text, borders) / none (fill).
+struct SheetStyle {
+    std::wstring font = L"Calibri";
+    float size = 11 * 96 / 72.f;  // DIPs
+    bool bold = false, italic = false, underline = false, strike = false, wrap = false;
+    UINT32 color = 0, fill = 0;
+    UINT32 border[4] = {};        // left, top, right, bottom
+    UINT8 line[4] = {};           // 0 none, 1 thin, 2 medium, 3 thick, 4 double, 5 dashed/dotted
+    UINT8 h = 0, v = 2, indent = 0;  // h: 0 general, 1 left, 2 centre, 3 right; v: 0 top, 1 centre, 2 bottom
+};
+struct SheetPic {
+    D2D1_RECT_F rc;                           // DIPs from A1's top-left corner
+    Microsoft::WRL::ComPtr<IWICBitmap> wic;   // decoded at drawn size; null: chart or undecodable (placeholder)
+};
 struct GridData {
     std::wstring text;                             // all cell text
     std::vector<std::pair<UINT32, UINT32>> cells;  // (offset, length) into text, row-major
@@ -111,6 +126,15 @@ struct GridData {
     std::vector<bool> num;                         // sheets, per cell: right-aligned (numbers, dates)
     std::vector<std::wstring> tabs;                // sheets: names
     int tab = 0;                                   // sheets: the one shown
+    std::vector<SheetStyle> styles = std::vector<SheetStyle>(1);  // sheets: cell formats
+    std::vector<UINT16> xf;                        // sheets, per cell: index into styles
+    std::vector<float> colW, rowH;                 // sheets: DIPs (0 = hidden); empty: from the text / default
+    float defColW = 64, defRowH = 20;
+    std::vector<std::array<UINT32, 4>> merges;     // sheets: first row, first column, last row, last column
+    std::vector<SheetPic> pics;
+    UINT32 frozenRows = 0, frozenCols = 0;
+    bool gridLines = true;
+    bool more = false;  // sheets: first rows only, or pictures to decode: OfficeToGrid on a worker completes it
     size_t Rows() const { return cols ? cells.size() / cols : 0; }
 };
 void GridInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* iconFont);
@@ -125,7 +149,9 @@ void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);
 bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt);  // toggles a folder row
-int GridTabAt(D2D1_POINT_2F pt);  // sheets: tab under the point, -1 none
+int GridTabAt(D2D1_POINT_2F pt);  // sheets: tab under the point, -1 none, -2 a tab-strip arrow (scrolled)
+bool GridTabWheel(D2D1_POINT_2F pt, float delta);  // sheets: wheel over the tab strip scrolls it
+float GridDigitWidth(const std::wstring& font, float size);  // widest digit in whole DIPs (Excel's column unit); any thread
 size_t GridShownRows();  // body rows visible (--selftest)
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
@@ -149,7 +175,10 @@ std::wstring RstToMarkdown(const std::wstring& text);
 // ---- office.cpp: Word/PowerPoint documents as Markdown, Excel/Calc sheets as CSV ("" if not readable);
 // sub = title-bar details
 std::wstring OfficeToMarkdown(const std::wstring& path, std::wstring& sub);
-std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet);  // sheet -1: the active one
+// sheet -1: the active one. picScale 0: the open path (first rows, no pictures; `more` asks for a worker that
+// calls again with the window's pixels per DIP; it gives up once `gen` moves on from `mine`).
+std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, float picScale = 0,
+                                       const std::atomic<int>* gen = nullptr, int mine = 0);
 std::wstring OfficeSelfTest();  // "" = ok
 
 // ---- media.cpp: audio/video playback (Media Foundation, CPU decoding)

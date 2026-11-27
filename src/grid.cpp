@@ -7,6 +7,8 @@
 #include <cmath>
 #include <ctime>
 #include <functional>
+#include <map>
+#include <unordered_map>
 
 using Microsoft::WRL::ComPtr;
 
@@ -16,7 +18,16 @@ constexpr float kRowH = 28, kCellPad = 10, kIndent = 18, kIconW = 22, kChevronW 
 
 IDWriteFactory* g_dw;
 ComPtr<IDWriteTextFormat> g_fmtCell, g_fmtCellR, g_fmtHead, g_fmtHeadR, g_fmtIcon, g_fmtChevron, g_fmtCenter;
-std::vector<D2D1_RECT_F> g_tabRc;  // sheets: tab rectangles as last painted
+std::vector<D2D1_RECT_F> g_tabRc;  // sheets: tab rectangles as last painted (clipped to the strip)
+D2D1_RECT_F g_tabStrip, g_tabPrev, g_tabNext;  // sheets: the tab strip, its arrow buttons (empty: all tabs fit)
+float g_tabScroll, g_tabMax;
+bool g_tabReveal;  // scroll the active tab into view on the next paint
+std::vector<float> g_rowY;  // sheets: row edges
+std::unordered_map<UINT64, UINT32> g_mergeAt;  // sheets: cell (row << 32 | column) inside a merge -> merge index
+std::vector<IDWriteTextFormat*> g_styleFmt;     // sheets: per style, from g_fonts
+std::map<std::wstring, ComPtr<IDWriteTextFormat>> g_fonts;  // family|size|bold|italic, kept across previews
+std::vector<ComPtr<ID2D1Bitmap>> g_picBmp;
+ComPtr<ID2D1StrokeStyle> g_dash;
 float g_charW = 7;  // average character width of the cell font, for column sizing
 std::unique_ptr<GridData> g_grid;
 std::vector<float> g_colX;  // column edges
@@ -382,6 +393,24 @@ void GridSet(std::unique_ptr<GridData> g) {
     if (!g_open.empty() && g_grid->folder[0] && std::count(g_grid->indent.begin(), g_grid->indent.end(), 0) == 1)
         g_open[0] = true;
     Rebuild();
+    const GridData& d = *g_grid;
+    if (d.sheet) {
+        g_rowY.assign(1, 0);
+        for (size_t r = 0, n = std::max(d.Rows(), d.rowH.size()); r < n; r++) g_rowY.push_back(g_rowY.back() + (r < d.rowH.size() ? d.rowH[r] : d.defRowH));
+        g_mergeAt.clear();
+        for (UINT32 k = 0; k < d.merges.size(); k++)
+            for (UINT64 r = d.merges[k][0]; r <= d.merges[k][2] && g_mergeAt.size() < 1000000; r++)
+                for (UINT64 c = d.merges[k][1]; c <= d.merges[k][3] && c < d.cols + 64; c++) g_mergeAt[r << 32 | c] = k;
+        g_styleFmt.assign(d.styles.size(), nullptr);
+        g_picBmp.assign(d.pics.size(), nullptr);
+        g_tabReveal = true;
+        if (!d.colW.empty()) {
+            g_colX.push_back(0);
+            for (size_t c = 0, n = std::max<size_t>(d.cols, d.colW.size()); c < n; c++)
+                g_colX.push_back(g_colX.back() + (c < d.colW.size() ? d.colW[c] : d.defColW));
+            return;
+        }
+    }
     std::vector<size_t> chars(g_grid->cols, 0);
     for (size_t r = 0, n = std::min<size_t>(g_grid->Rows(), 1000); r < n; r++)
         for (size_t c = 0; c < g_grid->cols; c++) chars[c] = std::max(chars[c], Cell(*g_grid, r, c).size());
@@ -417,98 +446,343 @@ bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt) {
     return true;
 }
 
-// Spreadsheets as Excel shows them: column letters, row numbers, gridlines past the data, sheet tabs below.
+// ---- sheets: geometry in DIPs from A1's top-left corner; past the grid's extent, default sizes
+namespace {
+float ColX(const GridData& g, size_t c) { return c < g_colX.size() ? g_colX[c] : g_colX.back() + (c - (g_colX.size() - 1)) * g.defColW; }
+float RowY(const GridData& g, size_t r) { return r < g_rowY.size() ? g_rowY[r] : g_rowY.back() + (r - (g_rowY.size() - 1)) * g.defRowH; }
+size_t At(const std::vector<float>& edges, float def, float v) {  // index of the column/row containing v
+    if (v >= edges.back()) return edges.size() - 1 + (size_t)((v - edges.back()) / std::max(def, 1.f));
+    return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(edges.begin(), edges.end(), v) - edges.begin() - 1);
+}
+D2D1_COLOR_F Rgb(UINT32 c, float a = 1) { return {(c >> 16 & 255) / 255.f, (c >> 8 & 255) / 255.f, (c & 255) / 255.f, a}; }
+
+IDWriteTextFormat* StyleFormat(const GridData& g, size_t i) {
+    if (g_styleFmt[i]) return g_styleFmt[i];
+    const SheetStyle& s = g.styles[i];
+    float size = s.size >= 1 ? s.size : 11 * 96 / 72.f;
+    std::wstring key = s.font + L"|" + std::to_wstring(std::lround(size * 100)) + (s.bold ? L"b" : L"") + (s.italic ? L"i" : L"");
+    ComPtr<IDWriteTextFormat>& f = g_fonts[key];
+    if (!f) g_dw->CreateTextFormat(s.font.c_str(), nullptr, s.bold ? DWRITE_FONT_WEIGHT_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
+                                   s.italic ? DWRITE_FONT_STYLE_ITALIC : DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"", &f);
+    return g_styleFmt[i] = f ? f.Get() : g_fmtCell.Get();
+}
+}  // namespace
+
+// Spreadsheets as Excel shows them: column letters, row numbers, cells with their formats (fills, borders, fonts,
+// alignment, wrapping, merges, text running over empty neighbours), pictures, frozen panes, sheet tabs below.
+// Cells without a fill show the window; automatic (and black) text and borders take the theme's text colour.
 D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx, float sy, const MdColors& c) {
-    constexpr float kRow = 22, kHead = 22, kTabH = 30, kDefCol = 64;
+    constexpr float kHead = 22, kTabH = 30, kArrowW = 28;
     const GridData& g = *g_grid;
+    bool dark = c.text.r > 0.5f;
     ComPtr<ID2D1SolidColorBrush> text, fill, line;
     rt->CreateSolidColorBrush(c.text, &text);
     rt->CreateSolidColorBrush(c.codeBg, &fill);
     rt->CreateSolidColorBrush(c.rule, &line);
+    if (!g_dash) {
+        ComPtr<ID2D1Factory> f;
+        rt->GetFactory(&f);
+        f->CreateStrokeStyle(D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                                                         D2D1_LINE_JOIN_MITER, 10, D2D1_DASH_STYLE_DASH), nullptr, 0, &g_dash);
+    }
     size_t rows = g.Rows();
-    float headW = std::max(40.f, std::to_wstring(rows + 100).size() * g_charW + 16);
-    float x0 = area.left + headW, y0 = area.top + kHead, bottom = area.bottom - kTabH;
-    auto colX = [&](size_t i) { return i <= g.cols ? g_colX[i] : g_colX[g.cols] + (i - g.cols) * kDefCol; };
+    float y0 = area.top + kHead, bottom = area.bottom - kTabH;
+    size_t lastRow = At(g_rowY, g.defRowH, sy + bottom - y0) + 1;
+    float headW = std::max(40.f, std::to_wstring(lastRow).size() * g_charW + 16), x0 = area.left + headW;
+    auto cellText = [&](size_t r, size_t col) { return r < rows && col < g.cols ? Cell(g, r, col) : std::wstring_view{}; };
+    auto styleAt = [&](size_t r, size_t col) -> size_t { return r < rows && col < g.cols && !g.xf.empty() ? g.xf[r * g.cols + col] : 0; };
+    auto mergeAt = [&](size_t r, size_t col) -> const std::array<UINT32, 4>* {
+        if (g_mergeAt.empty()) return nullptr;
+        auto it = g_mergeAt.find((UINT64)r << 32 | col);
+        return it == g_mergeAt.end() ? nullptr : &g.merges[it->second];
+    };
+    auto empty = [&](size_t r, size_t col) { return cellText(r, col).empty() && !mergeAt(r, col); };
+    // White fills in dark mode are the sheet's "no gridlines" look, not meant as white blocks.
+    auto fillOf = [&](const SheetStyle& s) { return dark && (s.fill & 0xFFFFFF) == 0xFFFFFF ? 0 : s.fill; };
+    D2D1_COLOR_F autoLine = dark ? D2D1_COLOR_F{c.text.r, c.text.g, c.text.b, 0.7f} : D2D1_COLOR_F{0, 0, 0, 1};
+    // Automatic: unset, or (dark mode) so dark it would vanish on the dark window, like theme text with a tint.
+    auto automatic = [&](UINT32 col) {
+        return !(col & 0xFFFFFF) || (dark && 0.3 * (col >> 16 & 255) + 0.59 * (col >> 8 & 255) + 0.11 * (col & 255) < 70);
+    };
+
+    // Frozen panes: columns/rows before the split stay put (unless they don't leave room for the rest).
+    size_t fc = g.frozenCols, fr = g.frozenRows;
+    if (x0 + ColX(g, fc) > area.right - 100) fc = 0;
+    if (y0 + RowY(g, fr) > bottom - 60) fr = 0;
+    float fx = ColX(g, fc), fy = RowY(g, fr);
+    struct Span { bool on; float lo, hi, d; size_t i0, i1; };  // screen range, offset, cells
+    auto span = [&](bool scrolled, size_t frozen, float f, float origin, float end, float scroll, const std::vector<float>& edges, float def) {
+        Span s{scrolled || frozen, scrolled ? origin + f : origin, scrolled ? end : std::min(end, origin + f), origin - (scrolled ? scroll : 0)};
+        s.on = s.on && s.hi > s.lo;
+        s.i0 = scrolled ? At(edges, def, f + scroll) : 0;
+        s.i1 = scrolled ? At(edges, def, s.hi - s.d) + 1 : frozen;
+        return s;
+    };
+    Span xs[2] = {span(false, fc, fx, x0, area.right, sx, g_colX, g.defColW), span(true, fc, fx, x0, area.right, sx, g_colX, g.defColW)};
+    Span ys[2] = {span(false, fr, fy, y0, bottom, sy, g_rowY, g.defRowH), span(true, fr, fy, y0, bottom, sy, g_rowY, g.defRowH)};
+
+    // A border side: 1 thin, 2 medium, 3 thick, 4 double, 5 dashed. Centred on the gridline [p, p + 1].
+    auto edge = [&](UINT8 kind, UINT32 col, bool horiz, float p, float a, float b) {
+        if (!kind) return;
+        line->SetColor(automatic(col) ? autoLine : Rgb(col));
+        if (kind == 5) {
+            D2D1_POINT_2F p0 = horiz ? D2D1_POINT_2F{a, p + .5f} : D2D1_POINT_2F{p + .5f, a}, p1 = horiz ? D2D1_POINT_2F{b, p + .5f} : D2D1_POINT_2F{p + .5f, b};
+            rt->DrawLine(p0, p1, line.Get(), 1, g_dash.Get());
+            return;
+        }
+        float o = kind == 1 ? 0 : -1, w = kind == 2 ? 2 : kind == 3 ? 3 : 1;
+        for (int k = 0; k < (kind == 4 ? 2 : 1); k++, o += 2)
+            rt->FillRectangle(horiz ? D2D1_RECT_F{a, p + o, b + 1, p + o + w} : D2D1_RECT_F{p + o, a, p + o + w, b + 1}, line.Get());
+    };
+    // Text of one cell (or merge) in its box, aligned and clipped like Excel.
+    auto drawText = [&](std::wstring_view v, size_t si, bool num, D2D1_RECT_F box, D2D1_RECT_F cell) {
+        const SheetStyle& s = g.styles[si];
+        int h = s.h ? s.h : num ? 3 : 1;
+        float pad = 2 + s.indent * 9.f;
+        box.left += h == 1 ? pad : 2, box.right -= h == 3 ? pad : 2;
+        ComPtr<IDWriteTextLayout> l;
+        if (box.right <= box.left || box.bottom <= box.top ||
+            FAILED(g_dw->CreateTextLayout(v.data(), (UINT32)v.size(), StyleFormat(g, si), box.right - box.left, box.bottom - box.top - 1, &l)))
+            return;
+        l->SetTextAlignment(h == 2 ? DWRITE_TEXT_ALIGNMENT_CENTER : h == 3 ? DWRITE_TEXT_ALIGNMENT_TRAILING : DWRITE_TEXT_ALIGNMENT_LEADING);
+        l->SetParagraphAlignment(s.v == 0 ? DWRITE_PARAGRAPH_ALIGNMENT_NEAR : s.v == 1 ? DWRITE_PARAGRAPH_ALIGNMENT_CENTER : DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+        l->SetWordWrapping(s.wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
+        if (s.underline) l->SetUnderline(TRUE, {0, (UINT32)v.size()});
+        if (s.strike) l->SetStrikethrough(TRUE, {0, (UINT32)v.size()});
+        text->SetColor(fillOf(s) ? (s.color & 0xFFFFFF ? Rgb(s.color) : D2D1_COLOR_F{0, 0, 0, 1}) : automatic(s.color) ? c.text : Rgb(s.color));
+        // A clip per text doubles the cost of drawing it (D2D1_DRAW_TEXT_OPTIONS_CLIP too): only text sticking out gets one.
+        DWRITE_TEXT_METRICS m{};
+        l->GetMetrics(&m);
+        bool clip = m.left < 0 || m.top < 0 || m.left + m.width > m.layoutWidth + .5f || m.top + m.height > m.layoutHeight + .5f;
+        if (clip) rt->PushAxisAlignedClip(cell, D2D1_ANTIALIAS_MODE_ALIASED);
+        rt->DrawTextLayout({box.left, box.top}, l.Get(), text.Get());
+        if (clip) rt->PopAxisAlignedClip();
+    };
+
+    for (const Span& ya : ys)
+        for (const Span& xa : xs) {
+            if (!xa.on || !ya.on) continue;
+            D2D1_RECT_F clip{xa.lo, ya.lo, xa.hi, ya.hi};
+            auto X = [&](size_t col) { return xa.d + ColX(g, col); };
+            auto Y = [&](size_t r) { return ya.d + RowY(g, r); };
+            rt->PushAxisAlignedClip(clip, D2D1_ANTIALIAS_MODE_ALIASED);
+            line->SetColor(c.rule);
+            if (g.gridLines) {
+                for (size_t col = xa.i0; col <= xa.i1; col++) rt->FillRectangle({X(col), clip.top, X(col) + 1, clip.bottom}, line.Get());
+                for (size_t r = ya.i0; r <= ya.i1; r++) rt->FillRectangle({clip.left, Y(r), clip.right, Y(r) + 1}, line.Get());
+            }
+            std::vector<const std::array<UINT32, 4>*> ms;
+            for (auto& m : g.merges)
+                if (m[0] < ya.i1 && m[2] >= ya.i0 && m[1] < xa.i1 && m[3] >= xa.i0) ms.push_back(&m);
+            auto mergeRc = [&](const std::array<UINT32, 4>& m) { return D2D1_RECT_F{X(m[1]), Y(m[0]), X(m[3] + 1), Y(m[2] + 1)}; };
+            // Fills (they hide the gridlines around them); merges without one hide the gridlines inside.
+            for (auto* m : ms) {
+                D2D1_RECT_F rc = mergeRc(*m);
+                if (UINT32 f = fillOf(g.styles[styleAt((*m)[0], (*m)[1])])) fill->SetColor(Rgb(f)), rt->FillRectangle({rc.left, rc.top, rc.right + 1, rc.bottom + 1}, fill.Get());
+                else {
+                    rt->PushAxisAlignedClip({rc.left + 1, rc.top + 1, rc.right, rc.bottom}, D2D1_ANTIALIAS_MODE_ALIASED);
+                    rt->Clear({0, 0, 0, 0});
+                    rt->PopAxisAlignedClip();
+                }
+            }
+            for (size_t r = ya.i0; r < ya.i1; r++)
+                for (size_t col = xa.i0; col < xa.i1; col++)
+                    if (UINT32 f = fillOf(g.styles[styleAt(r, col)]); f && !mergeAt(r, col))
+                        fill->SetColor(Rgb(f)), rt->FillRectangle({X(col), Y(r), X(col + 1) + 1, Y(r + 1) + 1}, fill.Get());
+            fill->SetColor(c.codeBg);
+            // Text. Unwrapped text runs over empty neighbours (left-aligned to the right, right-aligned to the left,
+            // centred both ways); numbers stay in their cell.
+            for (auto* m : ms) {
+                std::wstring_view v = cellText((*m)[0], (*m)[1]);
+                size_t i = (size_t)(*m)[0] * g.cols + (*m)[1];
+                if (!v.empty()) drawText(v, styleAt((*m)[0], (*m)[1]), i < g.num.size() && g.num[i], mergeRc(*m), mergeRc(*m));
+            }
+            size_t minCol = xa.d == x0 ? 0 : fc;  // the scrolled pane doesn't show frozen columns' text
+            for (size_t r = ya.i0; r < ya.i1 && r < rows; r++) {
+                size_t from = xa.i0;
+                while (from > minCol && from + 64 > xa.i0 && empty(r, from - 1)) from--;
+                from = from > minCol ? from - 1 : from;
+                for (size_t col = from; col < xa.i1 && col < g.cols; col++) {
+                    std::wstring_view v = Cell(g, r, col);
+                    if (v.empty() || mergeAt(r, col)) continue;
+                    size_t si = styleAt(r, col);
+                    const SheetStyle& s = g.styles[si];
+                    bool num = g.num[r * g.cols + col];
+                    int h = s.h ? s.h : num ? 3 : 1;
+                    D2D1_RECT_F cell{X(col), Y(r), X(col + 1), Y(r + 1)}, box = cell;
+                    if (!s.wrap && !num) {
+                        if (h != 3)
+                            for (size_t k = col + 1; k < col + 64 && X(k) < clip.right && empty(r, k); k++) box.right = X(k + 1);
+                        if (h != 1)
+                            for (size_t k = col; k > minCol && k + 64 > col && X(k) > clip.left && empty(r, k - 1); k--) box.left = X(k - 1);
+                        if (h == 2) {
+                            float mid = (cell.left + cell.right) / 2, half = std::min(mid - box.left, box.right - mid);
+                            box.left = mid - half, box.right = mid + half;
+                        }
+                    }
+                    drawText(v, si, num, box, {box.left, cell.top, box.right, cell.bottom});
+                }
+            }
+            // Borders: each cell's own sides; a merge's from its edge cells.
+            for (auto* m : ms) {
+                auto [m0, m1, m2, m3] = *m;
+                for (UINT32 col = m1; col <= m3 && col <= xa.i1; col++) {
+                    const SheetStyle &t = g.styles[styleAt(m0, col)], &b = g.styles[styleAt(m2, col)];
+                    edge(t.line[1], t.border[1], true, Y(m0), X(col), X(col + 1));
+                    edge(b.line[3], b.border[3], true, Y(m2 + 1), X(col), X(col + 1));
+                }
+                for (UINT32 r = m0; r <= m2 && r <= ya.i1; r++) {
+                    const SheetStyle &l = g.styles[styleAt(r, m1)], &rr = g.styles[styleAt(r, m3)];
+                    edge(l.line[0], l.border[0], false, X(m1), Y(r), Y(r + 1));
+                    edge(rr.line[2], rr.border[2], false, X(m3 + 1), Y(r), Y(r + 1));
+                }
+            }
+            for (size_t r = ya.i0; r < ya.i1 && r < rows; r++)
+                for (size_t col = xa.i0; col < xa.i1 && col < g.cols; col++) {
+                    const SheetStyle& s = g.styles[styleAt(r, col)];
+                    if (!(s.line[0] | s.line[1] | s.line[2] | s.line[3]) || mergeAt(r, col)) continue;
+                    edge(s.line[0], s.border[0], false, X(col), Y(r), Y(r + 1));
+                    edge(s.line[2], s.border[2], false, X(col + 1), Y(r), Y(r + 1));
+                    edge(s.line[1], s.border[1], true, Y(r), X(col), X(col + 1));
+                    edge(s.line[3], s.border[3], true, Y(r + 1), X(col), X(col + 1));
+                }
+            // Pictures over the cells; charts (not drawn) as a quiet box.
+            for (size_t i = 0; i < g.pics.size(); i++) {
+                D2D1_RECT_F p = g.pics[i].rc;
+                p = {xa.d + p.left, ya.d + p.top, xa.d + p.right, ya.d + p.bottom};
+                if (p.right < clip.left || p.left > clip.right || p.bottom < clip.top || p.top > clip.bottom) continue;
+                if (!g_picBmp[i] && g.pics[i].wic) g_picBmp[i] = SharedBitmap(g.pics[i].wic.Get());
+                if (g_picBmp[i]) rt->DrawBitmap(g_picBmp[i].Get(), p, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                else {
+                    rt->PushAxisAlignedClip(p, D2D1_ANTIALIAS_MODE_ALIASED);
+                    rt->Clear({0, 0, 0, 0});  // no gridlines through it
+                    rt->PopAxisAlignedClip();
+                    rt->FillRectangle(p, fill.Get());
+                    line->SetColor(c.rule);
+                    rt->DrawRectangle({p.left + .5f, p.top + .5f, p.right - .5f, p.bottom - .5f}, line.Get());
+                    text->SetColor(c.dim);
+                    rt->DrawText(L"Chart", 5, g_fmtCenter.Get(), p, text.Get());
+                }
+            }
+            rt->PopAxisAlignedClip();
+        }
+    // Frozen-pane dividers.
+    line->SetColor(c.dim);
+    if (fc) rt->FillRectangle({x0 + fx, y0, x0 + fx + 1, bottom}, line.Get());
+    if (fr) rt->FillRectangle({x0, y0 + fy, area.right, y0 + fy + 1}, line.Get());
+
+    // Headers: letters across, numbers down, a corner box.
     auto letters = [](size_t i) {
         std::wstring s;
         for (i++; i; i = (i - 1) / 26) s.insert(s.begin(), wchar_t(L'A' + (i - 1) % 26));
         return s;
     };
-    size_t c0 = 0, r0 = (size_t)std::max(0.f, std::floor(sy / kRow));
-    while (x0 + colX(c0 + 1) - sx < x0) c0++;
-    size_t c1 = c0, r1 = r0;
-    while (x0 + colX(c1) - sx < area.right) c1++;
-    while (y0 + r1 * kRow - sy < bottom) r1++;
-
-    rt->PushAxisAlignedClip({x0, y0, area.right, bottom}, D2D1_ANTIALIAS_MODE_ALIASED);
-    for (size_t r = r0; r < r1 && r < rows; r++)
-        for (size_t col = c0; col < c1 && col < g.cols; col++) {
-            std::wstring_view v = Cell(g, r, col);
-            if (v.empty()) continue;
-            float x = x0 + colX(col) - sx, y = y0 + r * kRow - sy;
-            bool right = g.num[r * g.cols + col];
-            // Text runs over empty cells to the right, as in Excel (numbers stay in their cell).
-            float end = x0 + colX(col + 1) - sx;
-            if (!right)
-                for (size_t k = col + 1; k < g.cols && Cell(g, r, k).empty() && end < area.right; k++) end = x0 + colX(k + 1) - sx;
-            rt->DrawText(v.data(), (UINT32)v.size(), (right ? g_fmtCellR : g_fmtCell).Get(), {x + 4, y, end - 4, y + kRow}, text.Get());
-        }
-    for (size_t col = c0; col <= c1; col++) rt->FillRectangle({x0 + colX(col) - sx, y0, x0 + colX(col) - sx + 1, bottom}, line.Get());
-    for (size_t r = r0; r <= r1; r++) rt->FillRectangle({x0, y0 + r * kRow - sy, area.right, y0 + r * kRow - sy + 1}, line.Get());
-    rt->PopAxisAlignedClip();
-
-    // Headers: letters across, numbers down, a corner box.
     text->SetColor(c.dim);
+    line->SetColor(c.rule);
     rt->FillRectangle({area.left, area.top, area.right, y0}, fill.Get());
     rt->FillRectangle({area.left, y0, x0, bottom}, fill.Get());
-    rt->PushAxisAlignedClip({x0, area.top, area.right, y0}, D2D1_ANTIALIAS_MODE_ALIASED);
-    for (size_t col = c0; col < c1; col++) {
-        float x = x0 + colX(col) - sx, e = x0 + colX(col + 1) - sx;
-        std::wstring l = letters(col);
-        rt->DrawText(l.data(), (UINT32)l.size(), g_fmtCenter.Get(), {x, area.top, e, y0}, text.Get());
-        rt->FillRectangle({x, area.top, x + 1, y0}, line.Get());
+    for (const Span& xa : xs) {
+        if (!xa.on) continue;
+        rt->PushAxisAlignedClip({xa.lo, area.top, xa.hi, y0}, D2D1_ANTIALIAS_MODE_ALIASED);
+        for (size_t col = xa.i0; col < xa.i1; col++) {
+            float x = xa.d + ColX(g, col), e = xa.d + ColX(g, col + 1);
+            if (e - x < 1) continue;
+            std::wstring l = letters(col);
+            rt->DrawText(l.data(), (UINT32)l.size(), g_fmtCenter.Get(), {x, area.top, e, y0}, text.Get());
+            rt->FillRectangle({x, area.top, x + 1, y0}, line.Get());
+        }
+        rt->PopAxisAlignedClip();
     }
-    rt->PopAxisAlignedClip();
-    rt->PushAxisAlignedClip({area.left, y0, x0, bottom}, D2D1_ANTIALIAS_MODE_ALIASED);
-    for (size_t r = r0; r < r1; r++) {
-        float y = y0 + r * kRow - sy;
-        std::wstring n = std::to_wstring(r + 1);
-        rt->DrawText(n.data(), (UINT32)n.size(), g_fmtCenter.Get(), {area.left, y, x0, y + kRow}, text.Get());
-        rt->FillRectangle({area.left, y, x0, y + 1}, line.Get());
+    for (const Span& ya : ys) {
+        if (!ya.on) continue;
+        rt->PushAxisAlignedClip({area.left, ya.lo, x0, ya.hi}, D2D1_ANTIALIAS_MODE_ALIASED);
+        for (size_t r = ya.i0; r < ya.i1; r++) {
+            float y = ya.d + RowY(g, r), e = ya.d + RowY(g, r + 1);
+            if (e - y < 1) continue;
+            std::wstring n = std::to_wstring(r + 1);
+            rt->DrawText(n.data(), (UINT32)n.size(), g_fmtCenter.Get(), {area.left, y, x0, e}, text.Get());
+            rt->FillRectangle({area.left, y, x0, y + 1}, line.Get());
+        }
+        rt->PopAxisAlignedClip();
     }
-    rt->PopAxisAlignedClip();
     rt->FillRectangle({area.left, y0 - 1, area.right, y0}, line.Get());
     rt->FillRectangle({x0 - 1, area.top, x0, bottom}, line.Get());
 
-    // Sheet tabs.
-    // shortcut: tabs past the window's width are cut off; add arrows when workbooks with many sheets show up.
+    // Sheet tabs; when they don't fit, arrows and the wheel scroll them, and the active one is scrolled into view.
     rt->FillRectangle({area.left, bottom, area.right, area.bottom}, fill.Get());
     rt->FillRectangle({area.left, bottom, area.right, bottom + 1}, line.Get());
+    std::vector<float> tx{0};
+    for (auto& name : g.tabs) tx.push_back(tx.back() + std::clamp(name.size() * g_charW + 28, 64.f, 240.f));
+    bool arrows = tx.back() > area.right - area.left - 16;
+    g_tabStrip = {area.left + 8 + (arrows ? 2 * kArrowW : 0), bottom + 1, area.right - 8, area.bottom};
+    float vis = g_tabStrip.right - g_tabStrip.left;
+    g_tabMax = std::max(0.f, tx.back() - vis);
+    if (g_tabReveal && g.tab >= 0 && g.tab + 1 < (int)tx.size()) {
+        if (tx[g.tab] < g_tabScroll) g_tabScroll = tx[g.tab];
+        if (tx[g.tab + 1] > g_tabScroll + vis) g_tabScroll = tx[g.tab + 1] - vis;
+        g_tabReveal = false;
+    }
+    g_tabScroll = std::clamp(g_tabScroll, 0.f, g_tabMax);
+    g_tabPrev = g_tabNext = {};
+    if (arrows) {
+        g_tabPrev = {area.left + 8, bottom + 1, area.left + 8 + kArrowW, area.bottom};
+        g_tabNext = {g_tabPrev.right, bottom + 1, g_tabPrev.right + kArrowW, area.bottom};
+        const wchar_t prev = 0xE76B, next = 0xE76C;  // ChevronLeft, ChevronRight
+        text->SetColor(g_tabScroll > 0 ? c.text : c.dim);
+        rt->DrawText(&prev, 1, g_fmtChevron.Get(), g_tabPrev, text.Get());
+        text->SetColor(g_tabScroll < g_tabMax ? c.text : c.dim);
+        rt->DrawText(&next, 1, g_fmtChevron.Get(), g_tabNext, text.Get());
+    }
     g_tabRc.clear();
-    float x = area.left + 8;
+    rt->PushAxisAlignedClip(g_tabStrip, D2D1_ANTIALIAS_MODE_ALIASED);
     for (size_t i = 0; i < g.tabs.size(); i++) {
-        const std::wstring& name = g.tabs[i];
-        float w = std::clamp(name.size() * g_charW + 28, 64.f, 240.f);
-        D2D1_RECT_F r{x, bottom + 1, x + w, area.bottom};
-        g_tabRc.push_back(r);
+        D2D1_RECT_F r{g_tabStrip.left + tx[i] - g_tabScroll, bottom + 1, g_tabStrip.left + tx[i + 1] - g_tabScroll, area.bottom};
+        g_tabRc.push_back({std::max(r.left, g_tabStrip.left), r.top, std::min(r.right, g_tabStrip.right), r.bottom});
+        if (r.right < g_tabStrip.left || r.left > g_tabStrip.right) continue;
         bool on = (int)i == g.tab;
         text->SetColor(on ? c.text : c.dim);
-        rt->DrawText(name.data(), (UINT32)name.size(), (on ? g_fmtHead : g_fmtCell).Get(), {r.left + 14, r.top, r.right - 8, r.bottom},
+        rt->DrawText(g.tabs[i].data(), (UINT32)g.tabs[i].size(), (on ? g_fmtHead : g_fmtCell).Get(), {r.left + 14, r.top, r.right - 8, r.bottom},
                      text.Get());
+        if (i) rt->FillRectangle({r.left, r.top + 8, r.left + 1, r.bottom - 8}, line.Get());
         if (on) {
             line->SetColor(c.link);
             rt->FillRectangle({r.left + 10, r.bottom - 5, r.right - 10, r.bottom - 3}, line.Get());
             line->SetColor(c.rule);
         }
-        x += w;
     }
-    return {headW + g_colX[g.cols], kHead + rows * kRow + kTabH + kRow};
+    rt->PopAxisAlignedClip();
+
+    float w = ColX(g, g.cols), h = RowY(g, rows);
+    for (auto& p : g.pics) w = std::max(w, p.rc.right), h = std::max(h, p.rc.bottom);
+    return {headW + w, kHead + h + kTabH + g.defRowH};
 }
 
 int GridTabAt(D2D1_POINT_2F pt) {
-    for (size_t i = 0; g_grid && g_grid->sheet && i < g_tabRc.size(); i++)
-        if (pt.x >= g_tabRc[i].left && pt.x < g_tabRc[i].right && pt.y >= g_tabRc[i].top && pt.y < g_tabRc[i].bottom) return (int)i;
+    if (!g_grid || !g_grid->sheet || pt.y < g_tabStrip.top || pt.y >= g_tabStrip.bottom) return -1;
+    if (pt.x >= g_tabPrev.left && pt.x < g_tabPrev.right) return g_tabScroll -= 200, -2;
+    if (pt.x >= g_tabNext.left && pt.x < g_tabNext.right) return g_tabScroll += 200, -2;
+    for (size_t i = 0; i < g_tabRc.size(); i++)
+        if (pt.x >= g_tabRc[i].left && pt.x < g_tabRc[i].right) return (int)i;
     return -1;
+}
+
+float GridDigitWidth(const std::wstring& font, float size) {
+    ComPtr<IDWriteTextFormat> f;
+    ComPtr<IDWriteTextLayout> l;
+    DWRITE_TEXT_METRICS m{};
+    float w = 0;
+    if (SUCCEEDED(g_dw->CreateTextFormat(font.c_str(), nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                                         DWRITE_FONT_STRETCH_NORMAL, size, L"", &f)))
+        for (wchar_t d = L'0'; d <= L'9'; d++)
+            if (SUCCEEDED(g_dw->CreateTextLayout(&d, 1, f.Get(), 1000, 100, &l)) && SUCCEEDED(l->GetMetrics(&m)))
+                w = std::max(w, m.widthIncludingTrailingWhitespace);
+    return w > 0 ? std::round(w) : 7;
+}
+
+bool GridTabWheel(D2D1_POINT_2F pt, float delta) {
+    if (!g_grid || !g_grid->sheet || pt.y < g_tabStrip.top || pt.y >= g_tabStrip.bottom || g_tabMax <= 0) return false;
+    g_tabScroll = std::clamp(g_tabScroll - delta, 0.f, g_tabMax);
+    return true;
 }
 
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors& c) {
