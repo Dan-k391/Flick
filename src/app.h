@@ -30,6 +30,7 @@ enum : UINT {
     WM_FLICK_SUBS,                 // sent by the poster worker (wParam = gen, lParam = std::vector<SubCue>*)
     WM_FLICK_SHOT,                 // scripts/shot.ps1: save the frame as Paint draws it to %FLICK_SHOT% (PNG)
     WM_FLICK_WORD,                 // posted by the docx picture worker (wParam = gen, lParam = its message)
+    WM_FLICK_SELECTALL,            // scripts/shot.ps1: Ctrl+A (WM_COPY: Ctrl+C)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -63,11 +64,17 @@ bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;
 
 // ---- pdf.cpp: PDF worker. Reply to WM_FLICK_PDF with (pixelWidth << 32 | page + 1), or 0 for "nothing".
+struct SlideText {  // pptx: a paragraph as drawn on its slide
+    Microsoft::WRL::ComPtr<IDWriteTextLayout> layout;  // without drawing effects (no worker brushes): UI thread
+    D2D1_MATRIX_3X2_F toPage;                          // layout coordinates -> page points
+    std::wstring text;
+};
 struct PdfMsg {
     int gen, page;                                // page -1: opened (sizes empty = failed); -2: idle
     std::vector<std::pair<float, float>> sizes;   // page sizes in points
     Microsoft::WRL::ComPtr<IWICBitmap> bmp;       // rendered page (null if it failed)
     UINT32 pageCount = 0;                         // with page -1
+    std::vector<SlideText> text;                  // pptx: the page's text, for selection
 };
 void PdfOpen(const std::wstring& path, int gen);  // "" closes the document
 void PdfWake();                                   // worker idle and the UI needs a page
@@ -80,14 +87,34 @@ struct PagesFree {
 using PagesPtr = std::unique_ptr<Pages, PagesFree>;
 PagesPtr PagesOpen(const std::wstring& path);                   // nullptr: not a readable deck
 std::vector<std::pair<float, float>> PagesSizes(const Pages&);  // points
-Microsoft::WRL::ComPtr<IWICBitmap> PagesRender(Pages&, int index, UINT width, ID2D1Factory*, IWICImagingFactory*);
+Microsoft::WRL::ComPtr<IWICBitmap> PagesRender(Pages&, int index, UINT width, ID2D1Factory*, IWICImagingFactory*,
+                                               std::vector<SlideText>* text = nullptr);
 bool PagesFor(const std::wstring& path);                        // a file pages.cpp draws (pptx)
 
 // ---- markdown.cpp: parsed into blocks, laid out lazily with DirectWrite
 struct MdColors {
     D2D1_COLOR_F text, dim, link, codeBg, rule;
     const COLORREF* roles = nullptr;  // syntax colours per Role (code blocks)
+    D2D1_COLOR_F sel{};               // selected text's background
 };
+
+// ---- text selection (word.cpp; docx and pptx slides): positions are (paragraph, UTF-16 index). The unit first
+// clicked (1 character, 2 word, 3 paragraph) is what a drag extends by.
+struct TextSel {
+    using Pos = std::pair<UINT32, UINT32>;
+    Pos a, b, ua, ub;  // anchor, focus; the unit clicked
+    bool all = false;  // Ctrl+A: everything, laid out or not
+    bool Empty() const { return !all && a == b; }
+    void Click(Pos from, Pos to) { ua = a = from, ub = b = to, all = false; }
+    void Drag(Pos from, Pos to) {
+        if (to <= ua) a = ub, b = from;
+        else a = ua, b = to;
+    }
+    bool Span(UINT32 para, UINT32 len, UINT32& from, UINT32& to) const;  // the part of `para` selected
+};
+UINT32 TextHit(IDWriteTextLayout*, float x, float y);  // caret position nearest the point (layout coordinates)
+void TextUnit(const std::wstring& s, UINT32 i, int unit, UINT32& from, UINT32& to);  // the word/paragraph at i
+void FillText(ID2D1RenderTarget*, IDWriteTextLayout*, UINT32 from, UINT32 to, D2D1_POINT_2F at, ID2D1Brush*);
 void MdInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* monoFont);
 void MdLoad(const std::wstring& text, const std::wstring& baseDir = L"");
 void MdClear();
@@ -104,6 +131,11 @@ void WordClear();
 float WordColumn();  // the document's text width at 100%, DIPs
 float WordPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const MdColors&);  // -> document height
 bool WordPicture(WPARAM gen, LPARAM msg);  // WM_FLICK_WORD: true = repaint
+// Selection, in window DIPs against the last paint's area (scrolled to `scroll`). clicks 1-3: a click (character,
+// word, paragraph), 0: dragged there. Copy: plain text (CRLF between paragraphs, tabs between table cells).
+void WordSelect(D2D1_POINT_2F pt, float scroll, int clicks);
+void WordSelectAll();
+std::wstring WordCopy();
 std::wstring WordSelfTest();  // "" = ok
 
 // ---- grid.cpp: table view for CSV/TSV and archive listings
@@ -165,6 +197,12 @@ bool GridTabWheel(D2D1_POINT_2F pt, float delta);  // sheets: wheel over the tab
 UINT32 DarkInk(UINT32 c);
 float GridDigitWidth(const std::wstring& font, float size);  // widest digit in whole DIPs (Excel's column unit); any thread
 size_t GridShownRows();  // body rows visible (--selftest)
+// Sheets and CSV (not trees): a cell range, selected as in WordSelect (clicks 0: dragged there); a column letter,
+// row number or the corner selects columns, rows, all. Copy: cells as shown, tab-separated rows ending in CRLF.
+void GridSelect(D2D1_POINT_2F pt, float scrollX, float scrollY, int clicks);
+void GridSelectAll();
+std::wstring GridCopy();
+std::wstring GridRangeText(const GridData&, size_t r0, size_t c0, size_t r1, size_t c1);  // inclusive, clamped
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
 // ---- font.cpp: font specimen (ttf, otf, ttc, woff, woff2)

@@ -2,8 +2,12 @@
 # someone uses the PC): runs `Flick.exe --show <file>`, captures the window with PrintWindow, closes it.
 # Usage: shot.ps1 <file> [-Wait ms] [-Wheel notches] [-Click x,y]  -> build\shots\<file name>.png
 # Default: Flick paints the frame into the PNG itself (no text view: it's a child window). -Window: PrintWindow.
-# -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...). -Find text: opens the text search, types text.
-param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @(), [string]$Find, [switch]$Window)
+# -Click: a left click at client pixel x,y (repeatable as x1,y1,x2,y2...; within the double-click time: a double click).
+# -Find text: opens the text search, types text. -Drag x1,y1,x2,y2: left button down, moved, up (the child window
+# there gets it: the text view). -SelectAll: Ctrl+A. -Copy: Ctrl+C, then prints the clipboard text (CR LF tab
+# escaped) and puts back the text that was on the clipboard before.
+param([Parameter(Mandatory)][string]$File, [int]$Wait = 1200, [int]$Wheel = 0, [int[]]$Click = @(), [int[]]$Keys = @(), [string]$Find,
+      [int[]]$Drag = @(), [switch]$SelectAll, [switch]$Copy, [switch]$Window)
 $ErrorActionPreference = 'Stop'
 $exe = (Resolve-Path "$PSScriptRoot\..\build\Release\Flick.exe").Path
 $out = Join-Path (New-Item -ItemType Directory -Force "$PSScriptRoot\..\build\shots").FullName ((Split-Path $File -Leaf) + '.png')
@@ -21,6 +25,9 @@ public static class Shot {
   [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
   [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+  [DllImport("user32.dll")] public static extern IntPtr ChildWindowFromPointEx(IntPtr h, POINT p, uint f);
+  [DllImport("user32.dll")] public static extern int MapWindowPoints(IntPtr from, IntPtr to, ref POINT p, uint n);
   public static IntPtr Find(uint pid) {
     IntPtr found = IntPtr.Zero;
     EnumWindows((h, l) => { uint p; GetWindowThreadProcessId(h, out p); var s = new StringBuilder(64); GetClassName(h, s, 64);
@@ -47,6 +54,27 @@ for ($i = 0; $i + 1 -lt $Click.Count; $i += 2) {
     $lp = [IntPtr](($Click[$i + 1] -shl 16) -bor $Click[$i])
     [void][Shot]::SendMessage($h, 0x201, [IntPtr]1, $lp); [void][Shot]::SendMessage($h, 0x202, [IntPtr]0, $lp)
     Start-Sleep -Milliseconds 100
+}
+if ($Drag.Count -ge 4) {  # WM_LBUTTONDOWN, WM_MOUSEMOVEs in 8 steps, WM_LBUTTONUP (client pixels of the window under x1,y1)
+    $at = New-Object Shot+POINT; $at.X = $Drag[0]; $at.Y = $Drag[1]
+    $t = [Shot]::ChildWindowFromPointEx($h, $at, 1)
+    $lp = { param($x, $y) $q = New-Object Shot+POINT; $q.X = $x; $q.Y = $y; [void][Shot]::MapWindowPoints($h, $t, [ref]$q, 1)
+            [IntPtr]((($q.Y -band 0xFFFF) -shl 16) -bor ($q.X -band 0xFFFF)) }
+    [void][Shot]::SendMessage($t, 0x201, [IntPtr]1, (& $lp $Drag[0] $Drag[1]))
+    for ($i = 1; $i -le 8; $i++) {
+        [void][Shot]::SendMessage($t, 0x200, [IntPtr]1, (& $lp ($Drag[0] + ($Drag[2] - $Drag[0]) * $i / 8) ($Drag[1] + ($Drag[3] - $Drag[1]) * $i / 8)))
+        Start-Sleep -Milliseconds 40
+    }
+    [void][Shot]::SendMessage($t, 0x202, [IntPtr]0, (& $lp $Drag[2] $Drag[3]))
+    Start-Sleep -Milliseconds 200
+}
+if ($SelectAll) { [void][Shot]::SendMessage($h, 0x8011, [IntPtr]::Zero, [IntPtr]::Zero); Start-Sleep -Milliseconds 200 }  # WM_FLICK_SELECTALL
+if ($Copy) {  # WM_COPY (what Ctrl+C does), the clipboard printed, then given back
+    $saved = Get-Clipboard -Raw
+    [void][Shot]::SendMessage($h, 0x301, [IntPtr]::Zero, [IntPtr]::Zero)
+    $got = Get-Clipboard -Raw
+    if ($null -ne $saved) { Set-Clipboard -Value $saved }
+    'clipboard: ' + ("$got" -replace "`r", '\r' -replace "`n", '\n' -replace "`t", '\t')
 }
 if ($Find) {  # WM_FLICK_FIND, then the query as WM_CHARs
     [void][Shot]::PostMessage($h, 0x800D, [IntPtr]::Zero, [IntPtr]::Zero)

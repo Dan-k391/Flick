@@ -332,6 +332,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
             if (g->Rows() != 4 || g->cols != 2 || cell(1, 1) != L"x, \"y\" z" || cell(2, 1) != L"b" ||
                 cell(3, 0) != L"3" || cell(3, 1) != L"" || !g->rightAlign[0] || g->rightAlign[1])
                 ok = false, Log(L"selftest: csv");
+            // Copy: tabs between cells, CRLF after rows, quoted when a cell holds a quote; clamped to the data.
+            if (GridRangeText(*g, 1, 0, 99, 9) != L"1\t\"x, \"\"y\"\" z\"\r\n2\tb\r\n3\t\r\n" || GridRangeText(*g, 0, 1, 0, 1) != L"name\r\n" ||
+                GridRangeText(*g, 9, 0, 9, 1) != L"")
+                ok = false, Log(L"selftest: copy cells");
         } else {
             ok = false;
         }

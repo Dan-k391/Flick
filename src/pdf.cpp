@@ -114,7 +114,7 @@ DWORD WINAPI PdfThread(void*) {
         for (LRESULT next; (next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg)) > 0 && (doc || office);) {
             msg = {gen, (int)(next & 0xFFFFFFFF) - 1};
             if (office) {
-                msg.bmp = PagesRender(*office, msg.page, (UINT)(next >> 32), d2d.Get(), wic.Get());
+                msg.bmp = PagesRender(*office, msg.page, (UINT)(next >> 32), d2d.Get(), wic.Get(), &msg.text);
                 continue;
             }
             try {

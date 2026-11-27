@@ -33,6 +33,16 @@ std::unique_ptr<GridData> g_grid;
 std::vector<float> g_colX;  // column edges
 std::vector<bool> g_open;   // trees: per body row, folder expanded (all collapsed at first)
 std::vector<UINT32> g_shown;  // body rows currently visible (children of collapsed folders hidden)
+// Selection (sheets, CSV): anchor and focus cells, as data row/column; mode 1: whole columns, 2: whole rows, 3: all.
+struct GridSel {
+    size_t r[2], c[2];
+    int mode;
+    bool on;
+} g_sel;
+constexpr size_t kEnd = 1 << 30;  // "to the last row/column"
+D2D1_RECT_F g_area;               // last paint
+float g_x0, g_y0, g_fx, g_fy, g_bottom;  // sheets, last paint: A1's corner (unscrolled), frozen extents, the tab strip's top
+size_t g_fc, g_fr;
 
 bool HasChildren(const GridData& g, size_t i) { return i + 1 < g.indent.size() && g.indent[i + 1] > g.indent[i]; }
 
@@ -385,6 +395,8 @@ std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bo
 }  // namespace
 
 void GridSet(std::unique_ptr<GridData> g) {
+    // The selection survives the sheet worker's completed copy of the same sheet (indices are clamped where used).
+    if (!g || !g_grid || !g->sheet || !g_grid->sheet || g->tab != g_grid->tab || g->tabs != g_grid->tabs) g_sel = {};
     g_grid = std::move(g);
     g_colX.clear(), g_rowY.clear(), g_mergeAt.clear(), g_styleFmt.clear(), g_picBmp.clear();
     if (!g_grid) return;
@@ -454,6 +466,8 @@ size_t At(const std::vector<float>& edges, float def, float v) {  // index of th
     return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(edges.begin(), edges.end(), v) - edges.begin() - 1);
 }
 
+bool SelRect(const GridData& g, size_t& r0, size_t& c0, size_t& r1, size_t& c1);
+
 IDWriteTextFormat* StyleFormat(const GridData& g, size_t i) {
     if (g_styleFmt[i]) return g_styleFmt[i];
     const SheetStyle& s = g.styles[i];
@@ -517,6 +531,9 @@ D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx,
         s.i1 = scrolled ? At(edges, def, s.hi - s.d) + 1 : frozen;
         return s;
     };
+    g_x0 = x0, g_y0 = y0, g_fx = fx, g_fy = fy, g_fc = fc, g_fr = fr, g_bottom = bottom;  // for GridSelect
+    size_t sr0, sc0, sr1, sc1;
+    bool sel = SelRect(g, sr0, sc0, sr1, sc1);
     Span xs[2] = {span(false, fc, fx, x0, area.right, sx, g_colX, g.defColW), span(true, fc, fx, x0, area.right, sx, g_colX, g.defColW)};
     Span ys[2] = {span(false, fr, fy, y0, bottom, sy, g_rowY, g.defRowH), span(true, fr, fy, y0, bottom, sy, g_rowY, g.defRowH)};
 
@@ -665,6 +682,13 @@ D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx,
                     rt->DrawText(L"Chart", 5, g_fmtCenter.Get(), p, text.Get());
                 }
             }
+            if (sel && sr0 <= ya.i1 && sc0 <= xa.i1) {  // the selection: tinted, an accent frame
+                D2D1_RECT_F r{X(sc0), Y(sr0), X(std::min(sc1, xa.i1) + 1), Y(std::min(sr1, ya.i1) + 1)};
+                line->SetColor({c.link.r, c.link.g, c.link.b, 0.15f});
+                rt->FillRectangle(r, line.Get());
+                line->SetColor(c.link);
+                rt->DrawRectangle({r.left + .5f, r.top + .5f, r.right + .5f, r.bottom + .5f}, line.Get(), 2);
+            }
             rt->PopAxisAlignedClip();
         }
     // Frozen-pane dividers.
@@ -792,6 +816,83 @@ float GridDigitWidth(const std::wstring& font, float size) {
     return w > 0 ? std::round(w) : 7;
 }
 
+namespace {
+// The selected rectangle, merges included whole; false: none.
+bool SelRect(const GridData& g, size_t& r0, size_t& c0, size_t& r1, size_t& c1) {
+    if (!g_sel.on) return false;
+    r0 = std::min(g_sel.r[0], g_sel.r[1]), r1 = std::max(g_sel.r[0], g_sel.r[1]);
+    c0 = std::min(g_sel.c[0], g_sel.c[1]), c1 = std::max(g_sel.c[0], g_sel.c[1]);
+    if (g_sel.mode & 1) r0 = 0, r1 = kEnd;
+    if (g_sel.mode & 2) c0 = 0, c1 = kEnd;
+    for (bool grew = true; grew;) {  // a merge partly inside: all of it
+        grew = false;
+        for (auto& m : g.merges)
+            if (m[0] <= r1 && m[2] >= r0 && m[1] <= c1 && m[3] >= c0 && (m[0] < r0 || m[2] > r1 || m[1] < c0 || m[3] > c1))
+                r0 = std::min<size_t>(r0, m[0]), r1 = std::max<size_t>(r1, m[2]), c0 = std::min<size_t>(c0, m[1]), c1 = std::max<size_t>(c1, m[3]), grew = true;
+    }
+    return true;
+}
+
+// The cell under a point (as last painted, scrolled to sx, sy); head: 1 column letters, 2 row numbers (sheets), 3 the
+// corner. Dragged (`drag`), points outside the cells give the nearest cell shown.
+bool CellAt(const GridData& g, D2D1_POINT_2F pt, float sx, float sy, bool drag, size_t& r, size_t& c, int& head) {
+    if (g.sheet) {
+        if (!drag && pt.y >= g_bottom) return false;  // the tab strip
+        head = (pt.y < g_y0 ? 1 : 0) | (pt.x < g_x0 ? 2 : 0);
+        auto coord = [](float d, float f, size_t frozen, float scroll) { return frozen && d < f ? std::max(0.f, d) : std::max(d, f) + scroll; };
+        c = At(g_colX, g.defColW, coord(pt.x - g_x0, g_fx, g_fc, sx));
+        r = At(g_rowY, g.defRowH, coord(pt.y - g_y0, g_fy, g_fr, sy));
+        if (auto it = g_mergeAt.find((UINT64)r << 32 | c); !drag && !head && it != g_mergeAt.end())  // a merge: its anchor cell
+            r = g.merges[it->second][0], c = g.merges[it->second][1];
+        return true;
+    }
+    float top = g_area.top + (g.header ? kRowH : 0);
+    if (g_shown.empty() || !g.cols || (!drag && pt.y >= g_area.bottom)) return false;
+    head = g.header && pt.y < top ? 1 : 0;
+    c = std::min<size_t>(At(g_colX, kMinCol, pt.x - g_area.left + sx), g.cols - 1);
+    r = g_shown[std::min(g_shown.size() - 1, (size_t)((std::max(pt.y, top) - top + sy) / kRowH))] + (g.header ? 1 : 0);
+    return true;
+}
+}  // namespace
+
+void GridSelect(D2D1_POINT_2F pt, float sx, float sy, int clicks) {
+    size_t r, c;
+    int head = 0;
+    if (!g_grid || !g_grid->folder.empty() || !CellAt(*g_grid, pt, sx, sy, !clicks, r, c, head)) return;
+    if (clicks) g_sel = {{r, r}, {c, c}, head, true};
+    else g_sel.r[1] = r, g_sel.c[1] = c;
+}
+
+void GridSelectAll() {
+    if (g_grid && g_grid->folder.empty()) g_sel = {{0, 0}, {0, 0}, 3, true};
+}
+
+std::wstring GridCopy() {
+    size_t r0, c0, r1, c1;
+    return g_grid && g_grid->folder.empty() && SelRect(*g_grid, r0, c0, r1, c1) ? GridRangeText(*g_grid, r0, c0, r1, c1) : L"";
+}
+
+// Excel's plain text: tabs between cells, CRLF after each row; a cell with a tab, line break or quote in quotes.
+std::wstring GridRangeText(const GridData& g, size_t r0, size_t c0, size_t r1, size_t c1) {
+    std::wstring s;
+    if (!g.cols || !g.Rows()) return s;
+    r1 = std::min(r1, g.Rows() - 1), c1 = std::min<size_t>(c1, g.cols - 1);
+    for (size_t r = r0; r <= r1 && c0 <= c1; r++) {
+        for (size_t c = c0; c <= c1; c++) {
+            if (c > c0) s += L'\t';
+            std::wstring_view v = Cell(g, r, c);
+            if (v.find_first_of(L"\t\r\n\"") == v.npos) s += v;
+            else {
+                s += L'"';
+                for (wchar_t ch : v) s.append(ch == L'"' ? 2 : 1, ch);
+                s += L'"';
+            }
+        }
+        s += L"\r\n";
+    }
+    return s;
+}
+
 bool GridTabWheel(D2D1_POINT_2F pt, float delta) {
     if (!g_grid || !g_grid->sheet || pt.y < g_tabStrip.top || pt.y >= g_tabStrip.bottom || g_tabMax <= 0) return false;
     g_tabScroll = std::clamp(g_tabScroll - delta, 0.f, g_tabMax);
@@ -799,6 +900,7 @@ bool GridTabWheel(D2D1_POINT_2F pt, float delta) {
 }
 
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors& c) {
+    g_area = area;
     if (g_grid->sheet) return SheetPaint(rt, area, scrollX, scrollY, c);
     const GridData& g = *g_grid;
     ComPtr<ID2D1SolidColorBrush> text, fill;
@@ -845,11 +947,25 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
         if (i % 2) rt->FillRectangle({area.left - scrollX, y, area.left - scrollX + total, y + kRowH}, fill.Get());
         drawRow(g_shown[i] + (g.header ? 1 : 0), y, false);
     }
+    size_t r0, c0, r1, c1;
+    bool sel = g.folder.empty() && g.Rows() && SelRect(g, r0, c0, r1, c1);  // CSV: rows are shown in order
+    auto selRect = [&](float y0, float y1) {
+        auto x = [&](size_t col) { return area.left - scrollX + (col >= g.cols ? total : g_colX[col]); };
+        D2D1_RECT_F r{x(c0), y0, x(std::min<size_t>(c1, g.cols - 1) + 1), y1};
+        fill->SetColor({c.link.r, c.link.g, c.link.b, 0.15f});
+        rt->FillRectangle(r, fill.Get());
+        fill->SetColor(c.link);
+        rt->DrawRectangle({r.left + 1, r.top + 1, r.right - 1, r.bottom - 1}, fill.Get(), 2);
+        fill->SetColor(c.codeBg);
+    };
+    if (size_t h = g.header ? 1 : 0; sel && std::max(r0, h) <= std::min(r1, g.Rows() - 1) && c0 < g.cols)
+        selRect(top + (std::max(r0, h) - h) * kRowH - scrollY, top + (std::min(r1, g.Rows() - 1) + 1 - h) * kRowH - scrollY);
     rt->PopAxisAlignedClip();
     if (g.header) {  // sticky header
         rt->PushAxisAlignedClip({area.left, area.top, area.right, top}, D2D1_ANTIALIAS_MODE_ALIASED);
         rt->FillRectangle({area.left, area.top, area.right, top}, fill.Get());
         drawRow(0, area.top, true);
+        if (sel && r0 == 0 && c0 < g.cols) selRect(area.top, top);
         fill->SetColor(c.rule);
         for (size_t col = 1; col < g.cols; col++) {
             float x = area.left + g_colX[col] - scrollX;

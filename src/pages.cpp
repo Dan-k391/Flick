@@ -181,6 +181,7 @@ struct Draw {
     const Node* txStyles = nullptr;
     std::vector<std::pair<std::wstring, std::string>> media;
     D2D1_COLOR_F ph{0, 0, 0, 1};  // phClr: the colour a style reference passes in
+    std::vector<SlideText>* text = nullptr;  // the paragraphs drawn, for selection
 
     const Node* TopOf(Part* p) { return p ? Top(p->root) : nullptr; }
 
@@ -451,6 +452,7 @@ struct Draw {
             std::wstring bullet, bulletFont;
             float bulletX, bulletSize;
             D2D1_COLOR_F bulletColor;
+            std::wstring text;
         };
         std::vector<Para> paras;
         float width = std::max(1.f, box.right - box.left - tb.ins[0] - tb.ins[2]);
@@ -597,6 +599,7 @@ struct Draw {
             DWRITE_TEXT_METRICS m{};
             out.layout->GetMetrics(&m);
             out.height = m.height;
+            out.text = std::move(text);
             paras.push_back(std::move(out));
         }
         float total = 0;
@@ -610,6 +613,12 @@ struct Draw {
             y += p.before;
             float x = box.left + tb.ins[0];
             rt->DrawTextLayout({x + p.x, y}, p.layout.Get(), brush.Get(), D2D1_DRAW_TEXT_OPTIONS_NONE);
+            if (text) {  // handed to the UI thread: without this target's brushes
+                D2D1_MATRIX_3X2_F m;
+                rt->GetTransform(&m);
+                p.layout->SetDrawingEffect(nullptr, {0, (UINT32)p.text.size()});
+                text->push_back({p.layout, Matrix3x2F::Translation(x + p.x, y) * m * Matrix3x2F::Scale(1 / scale, 1 / scale), std::move(p.text)});
+            }
             if (!p.bullet.empty()) {
                 ComPtr<IDWriteTextFormat> bf;
                 DWRITE_LINE_METRICS lm{};
@@ -893,7 +902,8 @@ PagesPtr PagesOpen(const std::wstring& path) {
 
 std::vector<std::pair<float, float>> PagesSizes(const Pages& d) { return {d.slides.size(), {d.w, d.h}}; }
 
-ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2d, IWICImagingFactory* wic) {
+ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2d, IWICImagingFactory* wic,
+                               std::vector<SlideText>* text) {
     if (index < 0 || (size_t)index >= d.slides.size() || !width) return nullptr;
     UINT height = std::max(1u, (UINT)std::lround(width * d.h / d.w));
     ComPtr<IWICBitmap> bmp;
@@ -922,7 +932,7 @@ ComPtr<IWICBitmap> PagesRender(Pages& d, int index, UINT width, ID2D1Factory* d2
                 media.push_back({t, {}});
     d.Load(names, &media);
     Draw draw{d, rt.Get(), wic, scale, Matrix3x2F::Scale(scale, scale), &d.Get(d.slides[index])};
-    draw.media = std::move(media);
+    draw.media = std::move(media), draw.text = text;
     rt->BeginDraw();
     rt->Clear(D2D1::ColorF(D2D1::ColorF::White));
     if (Top(draw.slide->root)) draw.Run();

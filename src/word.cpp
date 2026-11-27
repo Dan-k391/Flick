@@ -22,7 +22,7 @@ namespace {
 
 constexpr float kPt = 96.f / 72;             // DIPs per point (Word at 100%)
 constexpr float kMargin = 12;                // around the column, DIPs
-constexpr UINT32 kAuto = 1, kLink = 2;       // brush keys: the palette's text and link colours (real ones are 0xFFRRGGBB)
+constexpr UINT32 kAuto = 1, kLink = 2, kSel = 3;  // brush keys: the palette's text, link, selection colours (real ones are 0xFFRRGGBB)
 constexpr wchar_t kObj = 0xFFFC;             // stands for an inline object in the text
 
 float Twips(std::string_view v, float def = 0) { return Num(v, def * 15) / 15; }  // twentieths of a point -> DIPs
@@ -107,6 +107,11 @@ struct MBox {
         s += L"(";
         for (auto& [p, k] : kids) s += k.Outline() + L",";
         return s + L")";
+    }
+    std::wstring Text() const {  // copied: the runs' text, a bar fraction as num/den
+        std::wstring s = str;
+        for (size_t k = 0; k < kids.size(); k++) s += (kind == 'f' && k == 1 && kids.size() == 2 ? L"/" : L"") + kids[k].second.Text();
+        return s;
     }
 };
 
@@ -443,6 +448,7 @@ struct Obj final : IDWriteInlineObject {
     bool isMath = false;
     float align = 0;  // display math: as wide as the line, the equation at 0 left, 0.5 centred, 1 right
     ComPtr<IDWriteTextLayout> script;  // super/subscript
+    std::wstring str;                  // its text (copied)
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
         if (id == __uuidof(IUnknown) || id == __uuidof(IDWriteInlineObject)) return AddRef(), *out = this, S_OK;
@@ -519,6 +525,8 @@ struct Item {  // a paragraph or a table, laid out; positions relative to the it
     std::unique_ptr<Table> table;
     std::string_view style;
     std::vector<const Node*> boxes;  // text box paragraphs: laid out after this one
+    UINT32 leaf = 0;                 // paragraphs: number in document order (selection positions)
+    std::wstring str;                // paragraphs: the text of `text`
 };
 struct Cell {
     float x, w, ml, mt, contentH = 0;
@@ -607,6 +615,11 @@ std::unique_ptr<Word> g_w;
 std::vector<Item> g_items;  // top-level blocks laid out at g_width
 size_t g_next;              // next block of g_w->blocks to lay out
 float g_width = -1, g_laidH;
+UINT32 g_leaves;            // paragraphs laid out so far (blocks are laid out in document order)
+TextSel g_sel;              // paragraphs by Item::leaf
+int g_unit = 1;             // what the click that started the selection selected
+bool g_selOn;               // during a paint: something is selected
+float g_x0, g_y0;           // last paint: the column's left edge, the area's top
 
 void LayoutAll(Word& d, const std::vector<const Node*>& nodes, float width, const Ctx& ctx, std::vector<Item>& out);
 
@@ -716,6 +729,7 @@ struct Para {
             o->script->GetMetrics(&m);
             o->script->GetLineMetrics(&lm, 1, &n);
             o->w = m.widthIncludingTrailingWhitespace, o->asc = lm.baseline - shift, o->desc = std::max(0.f, m.height - lm.baseline + shift);
+            o->str = std::move(s);
             Object(o, f);
             return;
         }
@@ -1004,6 +1018,7 @@ struct Para {
                    before + padT + m.height + padB};
         it.tx = tx, it.ty = before + padT;
         it.h = it.band.bottom;
+        it.str = std::move(text);
     }
 };
 
@@ -1149,11 +1164,11 @@ float LayoutBlock(Word& d, const Node& n, float width, const Ctx& ctx, std::vect
     Item& it = out.emplace_back();
     it.y = y;
     if (n.name == "tbl") LayoutTable(d, n, width, ctx, it, until - y);
-    else Para{d, n, it, width, ctx}.Build(out.size() > 1 ? &out[out.size() - 2] : nullptr);
+    else it.leaf = g_leaves++, Para{d, n, it, width, ctx}.Build(out.size() > 1 ? &out[out.size() - 2] : nullptr);
     y = it.y + it.h + it.after;
     for (const Node* b : std::vector<const Node*>(it.boxes)) {  // text box paragraphs
         Item& bi = out.emplace_back();
-        bi.y = y;
+        bi.y = y, bi.leaf = g_leaves++;
         Para{d, *b, bi, width, ctx}.Build(nullptr);
         y = bi.y + bi.h + bi.after;
     }
@@ -1210,6 +1225,8 @@ void DrawItem(ID2D1RenderTarget* rt, Item& it, float x, float y, float top, floa
     Line(rt, {band.right, band.top}, {band.right, band.bottom}, it.bd[2]), Line(rt, {band.left, band.bottom}, {band.right, band.bottom}, it.bd[3]);
     float tx = x + it.tx, ty = y + it.ty;
     for (auto& [r, c] : it.marks) rt->FillRectangle({tx + r.left, ty + r.top, tx + r.right, ty + r.bottom}, Brush(c));
+    if (UINT32 a, b; g_selOn && it.text && g_sel.Span(it.leaf, (UINT32)it.str.size(), a, b) && b > a)
+        FillText(rt, it.text.Get(), a, b, {tx, ty}, Brush(kSel));
     if (it.text) rt->DrawTextLayout({tx, ty}, it.text.Get(), Brush(kAuto), D2D1_DRAW_TEXT_OPTIONS_NONE);
     if (it.bullet) rt->DrawTextLayout({x + it.bx, ty}, it.bullet.Get(), Brush(kAuto), D2D1_DRAW_TEXT_OPTIONS_NONE);
 }
@@ -1289,7 +1306,189 @@ bool Open(Word& d) {
     return true;
 }
 
+// ---- selection
+// The paragraph under (x, y), else the nearest laid out one; (ox, oy): the list's origin on screen in, the
+// returned paragraph's list's out.
+Item* Hit(std::vector<Item>& items, float x, float y, float& ox, float& oy) {
+    auto k = std::upper_bound(items.begin(), items.end(), y - oy, [](float v, const Item& it) { return v < it.y; });
+    if (k != items.begin()) --k;
+    if (k == items.end()) return nullptr;
+    if (!k->table) return &*k;
+    Table& t = *k->table;
+    if (!t.Laid()) return nullptr;
+    float tx = ox + t.x, ty = oy + k->y;
+    size_t r = std::min(t.Laid() - 1, (size_t)std::max<ptrdiff_t>(0, std::upper_bound(t.rowY.begin(), t.rowY.end(), y - ty) - t.rowY.begin() - 1));
+    Cell* best = nullptr;
+    float bestD = INFINITY;
+    for (auto& c : t.cells) {  // the cell of row r nearest x
+        if (c.row > r) break;
+        float d = std::max({0.f, tx + c.x - x, x - (tx + c.x + c.w)});
+        if (c.row + c.span > r && d < bestD) bestD = d, best = &c;
+    }
+    if (!best) return nullptr;
+    float top = ty + t.rowY[best->row], bottom = ty + t.rowY[std::min(best->row + best->span, t.Laid())];
+    ox = tx + best->x + best->ml;
+    oy = top + best->mt + (best->valign ? std::max(0.f, (bottom - top) - best->contentH) / (best->valign == 1 ? 2 : 1) : 0);
+    return Hit(best->items, x, y, ox, oy);
+}
+
+// Copied text: a separator goes in only between pieces (the last one asked for wins: cell over paragraph end).
+struct Out {
+    std::wstring s;
+    const wchar_t* sep = nullptr;
+    bool started = false;
+    void Put(std::wstring_view v) {
+        if (started && sep) s += sep;
+        s += v, started = true, sep = nullptr;
+    }
+    void Sep(const wchar_t* p) {
+        if (started) sep = p;
+    }
+};
+
+void Emit(const std::vector<Item>& items, Out& o) {  // the selected part of laid out items
+    for (auto& it : items) {
+        if (it.table) {
+            const Table& t = *it.table;
+            size_t row = SIZE_MAX;
+            for (auto& c : t.cells) {
+                if (c.row >= t.Laid()) break;
+                if (row != SIZE_MAX) o.Sep(c.row != row ? L"\r\n" : L"\t");
+                row = c.row;
+                Emit(c.items, o);
+            }
+            o.Sep(L"\r\n");
+            continue;
+        }
+        UINT32 a, b;
+        if (!g_sel.Span(it.leaf, (UINT32)it.str.size(), a, b)) continue;
+        std::wstring v;
+        for (UINT32 k = a; k < b; k++)
+            if (it.str[k] == L' ') v += L"\r\n";
+            else if (it.str[k] != kObj) v += it.str[k];
+            else if (ComPtr<IDWriteInlineObject> io; it.text && SUCCEEDED(it.text->GetInlineObject(k, &io, nullptr)) && io) {
+                auto* o2 = static_cast<Obj*>(io.Get());  // every inline object here is an Obj
+                v += o2->isMath ? o2->math.Text() : o2->str;
+            }
+        o.Put(v);
+        o.Sep(L"\r\n");
+    }
+}
+
+// Text straight from the XML (Ctrl+A over blocks not laid out yet): roughly what Para::Walk collects.
+void NodeText(const Node& n, std::wstring& s) {
+    for (auto& k : n.kids)
+        if (k.name == "t") s += Wide(k.text);
+        else if (k.name == "tab" || k.name == "ptab") s += L'\t';
+        else if (k.name == "br" || k.name == "cr") s += k.A("type") == "page" || k.A("type") == "column" ? L"" : L"\r\n";
+        else if (k.name == "f" && k["num"] && k["den"]) NodeText(*k["num"], s), s += L'/', NodeText(*k["den"], s);
+        else if (k.name != "pPr" && k.name != "rPr" && !(k.name == "r" && On(At(&k, {"rPr", "vanish"})))) NodeText(k, s);
+}
+
+void NodeBlock(const Node& n, Out& o) {
+    if (n.name == "p") {
+        std::wstring s;
+        NodeText(n, s);
+        o.Put(s), o.Sep(L"\r\n");
+        return;
+    }
+    for (auto& tr : n.kids) {
+        if (tr.name != "tr") continue;
+        bool first = true;
+        for (auto& tc : tr.kids) {
+            if (tc.name != "tc") continue;
+            if (!first) o.Sep(L"\t");
+            first = false;
+            std::vector<const Node*> blocks;
+            Word::Flatten(tc, blocks);
+            for (const Node* b : blocks) NodeBlock(*b, o);
+        }
+        o.Sep(L"\r\n");
+    }
+}
+
+const Table* OpenTable() {  // the last block, a table laid out part way
+    return g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
+}
+
 }  // namespace
+
+bool TextSel::Span(UINT32 para, UINT32 len, UINT32& from, UINT32& to) const {
+    if (all) return from = 0, to = len, true;
+    Pos lo = std::min(a, b), hi = std::max(a, b);
+    if (para < lo.first || para > hi.first) return false;
+    from = para == lo.first ? std::min(lo.second, len) : 0;
+    to = para == hi.first ? std::min(hi.second, len) : len;
+    return to >= from;
+}
+
+UINT32 TextHit(IDWriteTextLayout* l, float x, float y) {
+    BOOL trailing, inside;
+    DWRITE_HIT_TEST_METRICS m{};
+    return SUCCEEDED(l->HitTestPoint(x, y, &trailing, &inside, &m)) ? m.textPosition + (trailing ? m.length : 0) : 0;
+}
+
+void TextUnit(const std::wstring& s, UINT32 i, int unit, UINT32& from, UINT32& to) {
+    from = to = std::min(i, (UINT32)s.size());
+    if (unit == 3 || (unit == 2 && s.empty())) from = 0, to = (UINT32)s.size();
+    if (unit != 2 || s.empty()) return;
+    auto word = [&](UINT32 k) { return IsCharAlphaNumericW(s[k]) || s[k] == L'_'; };
+    UINT32 k = std::min(from, (UINT32)s.size() - 1);
+    if (!word(k) && k > 0 && word(k - 1)) k--;  // just after a word
+    from = k, to = k + 1;
+    if (word(k))
+        while (from > 0 && word(from - 1)) from--;
+    if (word(k))
+        while (to < s.size() && word(to)) to++;
+}
+
+void FillText(ID2D1RenderTarget* rt, IDWriteTextLayout* l, UINT32 from, UINT32 to, D2D1_POINT_2F at, ID2D1Brush* b) {
+    UINT32 n = 0;
+    l->HitTestTextRange(from, to - from, at.x, at.y, nullptr, 0, &n);
+    std::vector<DWRITE_HIT_TEST_METRICS> hm(n);
+    UINT32 lines = 0;
+    l->GetLineMetrics(nullptr, 0, &lines);
+    std::vector<DWRITE_LINE_METRICS> lm(lines);
+    if (!n || FAILED(l->HitTestTextRange(from, to - from, at.x, at.y, hm.data(), n, &n)) || FAILED(l->GetLineMetrics(lm.data(), lines, &lines)))
+        return;
+    for (auto& h : hm) {  // as tall as the line (the text's own height leaves gaps, and misses pictures and math)
+        float top = at.y, bottom = h.top + h.height;
+        for (auto& m : lm)
+            if (top + m.height > h.top + 0.5f) {
+                bottom = top + m.height;
+                break;
+            } else top += m.height;
+        rt->FillRectangle({h.left, std::min(top, h.top), h.left + h.width, std::max(bottom, h.top + h.height)}, b);
+    }
+}
+
+void WordSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
+    float ox = g_x0, oy = g_y0 - scroll;
+    Item* it = g_w ? Hit(g_items, pt.x, pt.y, ox, oy) : nullptr;
+    if (!it || !it->text) {
+        if (clicks) g_sel = {};
+        return;
+    }
+    if (clicks) g_unit = std::min(clicks, 3);
+    UINT32 from, to;
+    TextUnit(it->str, TextHit(it->text.Get(), pt.x - ox - it->tx, pt.y - oy - it->y - it->ty), g_unit, from, to);
+    if (clicks) g_sel.Click({it->leaf, from}, {it->leaf, to});
+    else g_sel.Drag({it->leaf, from}, {it->leaf, to});
+}
+
+void WordSelectAll() {
+    g_sel = {};
+    g_sel.all = g_w != nullptr;
+}
+
+std::wstring WordCopy() {
+    if (!g_w || g_sel.Empty()) return {};
+    Out o;
+    if (g_sel.all && !(g_w->done && g_next >= g_w->blocks.size() && !OpenTable()))  // the rest isn't laid out: from the XML
+        for (size_t i = 0; g_w->Block(i); i++) NodeBlock(*g_w->blocks[i], o);
+    else Emit(g_items, o);
+    return o.s;
+}
 
 bool WordLoad(const std::wstring& path, std::wstring& sub) {
     WordClear();
@@ -1323,7 +1522,7 @@ bool WordLoad(const std::wstring& path, std::wstring& sub) {
 
 void WordClear() {
     g_gen++;
-    g_items.clear(), g_next = 0, g_width = -1, g_laidH = 0;
+    g_items.clear(), g_next = 0, g_width = -1, g_laidH = 0, g_leaves = 0, g_sel = {};
     g_pics.clear(), g_want.clear();
     g_brush.clear(), g_brushRt.Reset();
     g_w.reset();
@@ -1341,8 +1540,10 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
     bool dark = Lum(((UINT32)(c.text.r * 255) << 16) | ((UINT32)(c.text.g * 255) << 8) | (UINT32)(c.text.b * 255)) > 0.5f;
     if (dark != g_dark) g_dark = dark, g_width = -1;
     Brush(kAuto)->SetColor(c.text), Brush(kLink)->SetColor(c.link);
+    if ((g_selOn = !g_sel.Empty())) Brush(kSel)->SetColor(c.sel);
     float width = area.right - area.left - 2 * kMargin, viewH = area.bottom - area.top;
-    if (width != g_width) g_width = width, g_items.clear(), g_next = 0, g_laidH = kMargin, d.counters.clear(), d.notes = 0;
+    if (width != g_width) g_width = width, g_items.clear(), g_next = 0, g_laidH = kMargin, g_leaves = 0, d.counters.clear(), d.notes = 0;
+    g_x0 = area.left + kMargin, g_y0 = area.top;
     float until = scroll + viewH + 400;
     for (;;) {
         Item* last = g_items.empty() ? nullptr : &g_items.back();
@@ -1360,7 +1561,7 @@ float WordPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, co
         if (p.bmp && p.seen != g_paint && std::abs(p.y - (scroll + viewH / 2)) > 3 * viewH) p.bmp.Reset(), p.px = 0;
     if (!g_want.empty())
         CloseHandle(CreateThread(nullptr, 0, PicThread, new PicJob{d.path, g_gen, std::move(g_want)}, 0, nullptr)), g_want.clear();
-    const Table* open = g_items.empty() || !g_items.back().table || g_items.back().table->Done() ? nullptr : g_items.back().table.get();
+    const Table* open = OpenTable();
     bool all = d.done && g_next >= d.blocks.size() && !open;
     float h = g_laidH + kMargin;
     if (open) h += open->rowY.back() / std::max<size_t>(1, open->Laid()) * (open->rowMin.size() - open->Laid());  // the rows to come, at the average so far
@@ -1397,5 +1598,29 @@ std::wstring WordSelfTest() {
     Math mt{L"Calibri", 6};
     std::wstring o = mt.Row(Top(m), 16, true).Outline();
     if (o != L"e(f(e(t:1,),e(s(e(t:x,),e(t:i,),),),),t:=y,D(d:(,e(e(r(e(t:a,),),),),d:),),e(t:z,),)") return L"word: math " + o;
+    if (mt.Row(Top(m), 16, true).Text() != L"1/xi=y(a)z") return L"word: math text";
+    // Copied text from the XML: paragraphs, cells (tab), rows (CRLF), math, hidden runs.
+    std::string doc2 = R"(<w:document><w:body><w:p><w:r><w:t>x</w:t></w:r><w:r><w:rPr><w:vanish/></w:rPr><w:t>h</w:t></w:r></w:p><w:tbl>)"
+                       R"(<w:tr><w:tc><w:p><w:r><w:t>a</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>b</w:t><w:tab/><w:t>c</w:t></w:r></w:p></w:tc></w:tr>)"
+                       R"(<w:tr><w:tc><w:p/></w:tc><w:tc><w:p><m:oMath><m:f><m:num><m:r><m:t>1</m:t></m:r></m:num><m:den><m:r><m:t>2</m:t></m:r></m:den></m:f></m:oMath></w:p></w:tc></w:tr>)"
+                       R"(</w:tbl><w:p><w:r><w:t>y</w:t><w:br/><w:t>z</w:t></w:r></w:p></w:body></w:document>)";
+    Word d2;
+    d2.xml = doc2;
+    Out out;
+    if (!Open(d2)) return L"word: body 2";
+    for (size_t i = 0; d2.Block(i); i++) NodeBlock(*d2.blocks[i], out);
+    if (out.s != L"x\r\na\tb\tc\r\n\t1/2\r\ny\r\nz") return L"word: copy " + out.s;
+    // Selection: a word double-clicked, then dragged back into an earlier paragraph.
+    UINT32 f1, t1;
+    TextUnit(L"ab cd", 3, 2, f1, t1);
+    UINT32 f2, t2;
+    TextUnit(L"ab cd", 2, 2, f2, t2);
+    TextSel s;
+    s.Click({1, 3}, {1, 5});
+    s.Drag({0, 2}, {0, 4});
+    UINT32 a0, b0, a1, b1;
+    if (f1 != 3 || t1 != 5 || f2 != 0 || t2 != 2 || !s.Span(0, 10, a0, b0) || !s.Span(1, 9, a1, b1) || a0 != 2 || b0 != 10 || a1 != 0 ||
+        b1 != 5 || s.Span(2, 3, a0, b0))
+        return L"word: selection";
     return L"";
 }

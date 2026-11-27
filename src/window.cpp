@@ -149,6 +149,16 @@ LONGLONG g_pdfT0;
 std::vector<std::pair<float, float>> g_pages;  // points
 std::vector<ComPtr<ID2D1Bitmap>> g_pageBmp;
 std::vector<UINT> g_pageW;  // pixel width each page was last rendered at (0 = never)
+// pptx: each rendered page's paragraphs (kept with its bitmap); a selection lies within one slide.
+std::vector<std::vector<SlideText>> g_pageText;
+TextSel g_slideSel;
+int g_slidePage = -1, g_slideUnit = 1;
+// Text selection (docx, sheets/CSV, slides): dragging with the left button, auto-scrolling past an edge (kSelTimer).
+bool g_selDrag;
+LPARAM g_selAt;  // the mouse while dragging
+int g_clicks;    // 2 double, 3 triple click
+DWORD g_clickT;
+POINT g_clickAt;
 
 // Find in text (Ctrl+F): a search field in the title bar. Every match gets one indicator, the current
 // match a stronger one. Searching runs on every keystroke (Scintilla search, at most kMaxHits matches).
@@ -162,7 +172,7 @@ std::atomic<bool> g_canFind;  // read by the keyboard hook: a text preview is sh
 
 // Pictures: the wheel zooms around the mouse (1 = fitted to the window), dragging pans. Zooming past the
 // decoded size re-decodes the pixels needed once the wheel rests (kZoomTimer).
-constexpr UINT_PTR kGifTimer = 1, kZoomTimer = 2;
+constexpr UINT_PTR kGifTimer = 1, kZoomTimer = 2, kSelTimer = 3;
 float g_zoom = 1, g_panX, g_panY;  // pan: offset of the picture's centre from the area's centre, DIPs
 bool g_panDrag;
 POINT g_panAt;
@@ -640,6 +650,7 @@ LRESULT OnPdf(PdfMsg& m) {
         g_pageW.resize(g_pages.size());
         g_thumbBmp.resize(g_pages.size());
         g_thumbW.resize(g_pages.size());
+        g_pageText.resize(g_pages.size());
         g_pdfFailed = g_pages.empty();
         if (m.page == -1)
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
@@ -655,6 +666,7 @@ LRESULT OnPdf(PdfMsg& m) {
     } else if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
         g_pageW[m.page] = (UINT)std::lround(PageWidth() * g_dpi / 96);
         if (m.bmp) g_pageBmp[m.page] = ToD2D(m.bmp.Get());
+        g_pageText[m.page] = std::move(m.text);
         if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
@@ -681,6 +693,8 @@ void WaitForContent() {
     }
 }
 
+D2D1::Matrix3x2F Mat(const D2D1_MATRIX_3X2_F& m) { return {m._11, m._12, m._21, m._22, m._31, m._32}; }
+
 // Pages stacked at the content width. Pages far from the view drop their bitmaps.
 float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
     float w = PageWidth(), y = top + kPad / 2 - g_scroll[1], viewH = bottom - top;
@@ -695,8 +709,21 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
             g_rt->FillRectangle(r, fill);
             if (i < g_pageBmp.size() && g_pageBmp[i])
                 g_rt->DrawBitmap(g_pageBmp[i].Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            if ((int)i == g_slidePage && !g_slideSel.Empty() && i < g_pageText.size()) {  // selected text, over the slide
+                const Palette& p = Pal();
+                fill->SetColor({p.link.r, p.link.g, p.link.b, 0.35f});
+                for (UINT32 k = 0, a, b; k < g_pageText[i].size(); k++)
+                    if (const SlideText& t = g_pageText[i][k]; g_slideSel.Span(k, (UINT32)t.text.size(), a, b) && b > a) {
+                        g_rt->SetTransform(Mat(t.toPage) * D2D1::Matrix3x2F::Scale(w / pages[i].first, w / pages[i].first) *
+                                           D2D1::Matrix3x2F::Translation(r.left, r.top));
+                        FillText(g_rt.Get(), t.layout.Get(), a, b, {0, 0}, fill);
+                    }
+                g_rt->SetTransform(D2D1::Matrix3x2F::Identity());
+                fill->SetColor(C(0xFFFFFF));
+            }
         } else if (i < g_pageBmp.size() && (r.bottom < top - 2 * viewH || r.top > bottom + 2 * viewH)) {
             g_pageBmp[i].Reset(), g_pageW[i] = 0;
+            if ((int)i != g_slidePage) g_pageText[i].clear();
         }
         y += h + kPageGap;
     }
@@ -1305,6 +1332,8 @@ void ClearContent() {
     WordClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
+    g_pageText.clear(), g_slidePage = -1, g_slideSel = {};
+    if (g_selDrag) ReleaseCapture();
     g_sideCurrent = -1, g_sideFocus = false;
     GridSet(nullptr);
     ++g_gridGen;  // a worker still reading stops
@@ -1776,7 +1805,7 @@ void Paint() {
     }
     if (Scrollable()) {
         D2D1_RECT_F doc{kPad + SideW(), kTitleH, sz.width - kPad, sz.height};
-        MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role};
+        MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role, Rgb(GetRValue(p.sel) << 16 | GetGValue(p.sel) << 8 | GetBValue(p.sel))};
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
@@ -1855,6 +1884,105 @@ void DragThumb(LPARAM l) {
     if (a < 0 || !Thumb(a, at, len)) return;
     float view = View(a), mouse = a ? Dip(GET_Y_LPARAM(l)) - kTitleH : Dip(GET_X_LPARAM(l)) - kPad;
     ScrollTo(a, (mouse - g_dragGrab) / (view - len) * (g_doc[a] - view));
+}
+
+// ---- Text selection. Selecting needs a click, and a click activates the window: Ctrl+A and Ctrl+C then come to
+// PreviewKey. While Explorer has the keyboard they stay Explorer's (Ctrl+C copies the file, as before).
+bool Selectable() {
+    return g_kind == K_Word || (g_kind == K_Grid && GridGet() && GridGet()->folder.empty()) || (g_kind == K_Pdf && PagesFor(g_path));
+}
+
+// The page at window y (DIPs): the one whose slot (half the gaps included) contains it.
+int PageAt(float y) {
+    float w = PageWidth(), top = kTitleH + kPad / 2 - g_scroll[1];
+    for (size_t i = 0; i < g_pages.size(); i++) {
+        float h = std::round(w * g_pages[i].second / g_pages[i].first);
+        if (y < top + h + kPageGap / 2 || i + 1 == g_pages.size()) return (int)i;
+        top += h + kPageGap;
+    }
+    return -1;
+}
+
+// The paragraph of slide `page` nearest pt (window DIPs) and the caret position in it; dist: how far, in points.
+bool SlideHit(int page, D2D1_POINT_2F pt, UINT32& para, UINT32& pos, float* dist = nullptr) {
+    if (page < 0 || (size_t)page >= g_pageText.size()) return false;
+    float w = PageWidth(), k = w / g_pages[page].first, top = kTitleH + PageTop(page) - g_scroll[1];
+    D2D1_POINT_2F p{(pt.x - kPad - SideW()) / k, (pt.y - top) / k};
+    float best = INFINITY;
+    for (UINT32 i = 0; i < g_pageText[page].size(); i++) {
+        const SlideText& t = g_pageText[page][i];
+        D2D1::Matrix3x2F inv = Mat(t.toPage);
+        DWRITE_TEXT_METRICS m{};
+        if (!inv.Invert() || FAILED(t.layout->GetMetrics(&m))) continue;
+        D2D1_POINT_2F l = inv.TransformPoint(p);
+        float d = std::hypot(std::max({0.f, m.left - l.x, l.x - m.left - m.width}), std::max({0.f, m.top - l.y, l.y - m.top - m.height}));
+        if (d < best) best = d, para = i, pos = TextHit(t.layout.Get(), l.x, l.y);
+    }
+    if (dist) *dist = best;
+    return best < INFINITY;
+}
+
+void SlideSelect(D2D1_POINT_2F pt, int clicks) {
+    if (clicks) g_slidePage = PageAt(pt.y), g_slideUnit = std::min(clicks, 3), g_slideSel = {};
+    UINT32 para, pos, from, to;
+    if (!SlideHit(g_slidePage, pt, para, pos)) return;
+    TextUnit(g_pageText[g_slidePage][para].text, pos, g_slideUnit, from, to);
+    if (clicks) g_slideSel.Click({para, from}, {para, to});
+    else g_slideSel.Drag({para, from}, {para, to});
+}
+
+std::wstring SlideCopy() {
+    std::wstring s;
+    if (g_slidePage < 0 || (size_t)g_slidePage >= g_pageText.size() || g_slideSel.Empty()) return s;
+    bool first = true;
+    for (UINT32 k = 0, a, b; k < g_pageText[g_slidePage].size(); k++)
+        if (const SlideText& t = g_pageText[g_slidePage][k]; g_slideSel.Span(k, (UINT32)t.text.size(), a, b))
+            s += (first ? L"" : L"\r\n") + t.text.substr(a, b - a), first = false;
+    return s;
+}
+
+// clicks 1-3: a click (character, word, paragraph); 0: dragged to l.
+void SelectAt(LPARAM l, int clicks) {
+    D2D1_POINT_2F pt{Dip(GET_X_LPARAM(l)), Dip(GET_Y_LPARAM(l))};
+    if (g_kind == K_Word) WordSelect(pt, g_scroll[1], clicks);
+    else if (g_kind == K_Grid) GridSelect(pt, g_scroll[0], g_scroll[1], clicks);
+    else SlideSelect(pt, clicks);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+void SelectAll() {
+    if (g_kind == K_Text) Sci(SCI_SELECTALL);
+    else if (g_kind == K_Word) WordSelectAll();
+    else if (g_kind == K_Grid) GridSelectAll();
+    else if (Selectable()) g_slidePage = CurrentItem(), g_slideSel = {}, g_slideSel.all = true;
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
+// Plain text onto the clipboard (the text view: Scintilla's own copy).
+void Copy() {
+    if (g_kind == K_Text) return (void)Sci(SCI_COPY);
+    std::wstring s = g_kind == K_Word ? WordCopy() : g_kind == K_Grid ? GridCopy() : Selectable() ? SlideCopy() : L"";
+    if (s.empty() || !OpenClipboard(g_hwnd)) return;
+    EmptyClipboard();
+    size_t bytes = (s.size() + 1) * sizeof(wchar_t);
+    if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* p = GlobalLock(mem)) memcpy(p, s.c_str(), bytes), GlobalUnlock(mem);
+        if (!SetClipboardData(CF_UNICODETEXT, mem)) GlobalFree(mem);
+    }
+    CloseClipboard();
+}
+
+// While dragging a selection past an edge of the view, the view scrolls (every kSelTimer tick) and the selection follows.
+void EdgeScroll() {
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    bool sheet = g_kind == K_Grid && GridGet() && GridGet()->sheet;  // its headers and tab strip count as edges
+    float x = Dip(GET_X_LPARAM(g_selAt)), y = Dip(GET_Y_LPARAM(g_selAt)), left = sheet ? 40.f : 0, right = Dip(rc.right);
+    float top = kTitleH + (sheet ? 22 : 0), bottom = Dip(rc.bottom) - (sheet ? 30 : 0);
+    float dy = y < top ? y - top : y > bottom ? y - bottom : 0, dx = g_kind != K_Grid ? 0 : x < left ? x - left : x > right ? x - right : 0;
+    if (!dx && !dy) return;
+    ScrollBy(0, dx), ScrollBy(1, dy);
+    SelectAt(g_selAt, 0);
 }
 
 Hot HitButton(LPARAM l) {
@@ -1979,6 +2107,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_MOUSEMOVE: {
             if (g_dragAxis >= 0) return DragThumb(l), 0;
+            if (g_selDrag) return g_selAt = l, SelectAt(l, 0), 0;
             if (g_panDrag) {
                 g_panX += Dip(GET_X_LPARAM(l) - g_panAt.x), g_panY += Dip(GET_Y_LPARAM(l) - g_panAt.y);
                 g_panAt = {GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -2023,6 +2152,18 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 else if (tab != GridGet()->tab && LoadSheet(g_path, tab)) g_scroll[0] = g_scroll[1] = 0, InvalidateRect(h, nullptr, FALSE);
                 return 0;
             }
+            if (Selectable() && OnBar(l) < 0 && Dip(GET_Y_LPARAM(l)) > kTitleH) {
+                DWORD now = GetTickCount();
+                POINT at{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                bool again = now - g_clickT <= GetDoubleClickTime() && abs(at.x - g_clickAt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
+                             abs(at.y - g_clickAt.y) <= GetSystemMetrics(SM_CYDOUBLECLK);
+                g_clicks = again ? g_clicks + 1 : 1, g_clickT = now, g_clickAt = at;
+                SelectAt(l, g_clicks);
+                g_selDrag = true, g_selAt = l;
+                SetCapture(h);
+                SetTimer(h, kSelTimer, 30, nullptr);
+                return 0;
+            }
             if (g_kind == K_Grid && OnBar(l) < 0) {  // trees: click a folder to expand/collapse it
                 RECT rc;
                 GetClientRect(h, &rc);
@@ -2043,10 +2184,11 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_CAPTURECHANGED:
             if (g_seekDrag) EndSeek();
             g_seekDrag = g_volDrag = g_panDrag = false;
+            if (g_selDrag) g_selDrag = false, KillTimer(h, kSelTimer);
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
         case WM_LBUTTONUP:
-            if (g_dragAxis >= 0 || g_seekDrag || g_volDrag || g_panDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
+            if (g_dragAxis >= 0 || g_seekDrag || g_volDrag || g_panDrag || g_selDrag) ReleaseCapture();  // -> WM_CAPTURECHANGED ends the drag
             else if (HitButton(l) == H_FindPrev) FindShow(g_hit - 1);
             else if (HitButton(l) == H_FindNext) FindShow(g_hit + 1);
             else if (HitButton(l) == H_Close) PreviewHide(true);
@@ -2054,11 +2196,39 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_RBUTTONUP:
             if (HitButton(l) == H_Open && g_kind != K_Info) OpenFile(true);
+            else if (Selectable() && Dip(GET_Y_LPARAM(l)) > kTitleH) {  // Copy, Select all
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING, 1, L"Copy\tCtrl+C");
+                AppendMenuW(menu, MF_STRING, 2, L"Select all\tCtrl+A");
+                POINT pt{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+                ClientToScreen(h, &pt);
+                int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, h, nullptr);
+                DestroyMenu(menu);
+                if (cmd == 1) Copy();
+                if (cmd == 2) SelectAll();
+            }
+            return 0;
+        case WM_COPY:
+            Copy();
+            return 0;
+        case WM_FLICK_SELECTALL:
+            SelectAll();
             return 0;
         case WM_SETCURSOR:
             if (LOWORD(l) == HTCLIENT && g_kind == K_Image && g_zoom > 1)
                 return SetCursor(LoadCursorW(nullptr, IDC_SIZEALL)), TRUE;
             if (LOWORD(l) == HTCLIENT && g_hot == H_Find) return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
+            if (LOWORD(l) == HTCLIENT && (g_kind == K_Word || (g_kind == K_Pdf && Selectable()))) {  // an I-beam over text
+                POINT c;
+                GetCursorPos(&c);
+                ScreenToClient(h, &c);
+                D2D1_POINT_2F pt{Dip(c.x), Dip(c.y)};
+                UINT32 para, pos;
+                float d;
+                if (pt.y > kTitleH && pt.x >= SideW() && OnBar(MAKELPARAM(c.x, c.y)) < 0 &&
+                    (g_kind == K_Word || (SlideHit(PageAt(pt.y), pt, para, pos, &d) && d <= 0)))
+                    return SetCursor(LoadCursorW(nullptr, IDC_IBEAM)), TRUE;
+            }
             break;
         case WM_FLICK_SHOT: {  // screen captures can be stale (DWM): Paint into a bitmap instead, over the theme colour
             wchar_t out[MAX_PATH];
@@ -2104,6 +2274,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             break;
         case WM_TIMER:
             if (w == kZoomTimer) Sharpen();
+            if (w == kSelTimer && g_selDrag) EdgeScroll();
             if (w == kGifTimer) {
                 UINT delay = 0;
                 if (g_kind == K_Image && g_gif.dec && g_visible)
@@ -2398,6 +2569,11 @@ bool PreviewCanFind() { return g_canFind; }
 bool PreviewKey(const MSG& m) {
     if (g_findOn && g_visible && FindKey(m)) return true;
     if (m.message != WM_KEYDOWN || !g_visible) return false;
+    if (GetKeyState(VK_CONTROL) < 0 && (m.wParam == 'C' || m.wParam == 'A') && Selectable()) {
+        if (m.wParam == 'C') Copy();
+        else SelectAll();
+        return true;
+    }
     if (m.wParam == 'F' && GetKeyState(VK_CONTROL) < 0 && g_kind == K_Text) return FindOpen(), true;
     if (m.wParam == VK_ESCAPE || m.wParam == VK_SPACE) PreviewHide(true);
     else if (m.wParam == VK_RETURN) OpenFile(false);
