@@ -10,6 +10,7 @@
 namespace {
 
 constexpr size_t kMaxXml = 32 << 20;  // per zip member
+constexpr size_t kMaxDepth = 256;     // DOM nesting: deeper elements are dropped (every walker over a Node recurses)
 
 // ---- XML: a forgiving pull scanner. Names are local (prefix dropped); text is raw (see AppendXml).
 struct Xml {
@@ -178,6 +179,8 @@ void ParseKids(Xml& x, Node& n) {
             if (open.back()->name == "t") x.cdata ? (void)open.back()->text.append(x.text) : AppendXml(open.back()->text, x.text);
         } else if (x.close) {
             open.pop_back();
+        } else if (open.size() > kMaxDepth) {
+            x.Skip();
         } else {
             open.back()->kids.push_back({x.name, x.attrs});
             if (!x.empty) open.push_back(&open.back()->kids.back());

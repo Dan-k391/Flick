@@ -386,7 +386,7 @@ std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bo
 
 void GridSet(std::unique_ptr<GridData> g) {
     g_grid = std::move(g);
-    g_colX.clear();
+    g_colX.clear(), g_rowY.clear(), g_mergeAt.clear(), g_styleFmt.clear(), g_picBmp.clear();
     if (!g_grid) return;
     g_open.assign(g_grid->folder.size(), false);
     // A single top-level folder (typical for archives) starts expanded: nothing to see otherwise.
@@ -397,9 +397,8 @@ void GridSet(std::unique_ptr<GridData> g) {
     if (d.sheet) {
         g_rowY.assign(1, 0);
         for (size_t r = 0, n = std::max(d.Rows(), d.rowH.size()); r < n; r++) g_rowY.push_back(g_rowY.back() + (r < d.rowH.size() ? d.rowH[r] : d.defRowH));
-        g_mergeAt.clear();
-        for (UINT32 k = 0; k < d.merges.size(); k++)
-            for (UINT64 r = d.merges[k][0]; r <= d.merges[k][2] && g_mergeAt.size() < 1000000; r++)
+        for (UINT32 k = 0; k < d.merges.size(); k++)  // cells with text only: merges past the grid change nothing here
+            for (UINT64 r = d.merges[k][0]; r <= d.merges[k][2] && r < d.Rows() && d.merges[k][1] < d.cols + 64 && g_mergeAt.size() < 1000000; r++)
                 for (UINT64 c = d.merges[k][1]; c <= d.merges[k][3] && c < d.cols + 64; c++) g_mergeAt[r << 32 | c] = k;
         g_styleFmt.assign(d.styles.size(), nullptr);
         g_picBmp.assign(d.pics.size(), nullptr);

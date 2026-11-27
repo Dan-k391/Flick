@@ -146,7 +146,10 @@ struct Pages {
     }
     Part* Related(Part& p, std::wstring_view kind) {
         for (auto& [id, t] : p.rels)
-            if (t.find(kind) != t.npos) return &Get(t);
+            if (t.find(kind) != t.npos) {
+                Part& r = Get(t);
+                return r.root.kids.empty() ? nullptr : &r;  // missing or unreadable XML: as if not there
+            }
         return nullptr;
     }
 };

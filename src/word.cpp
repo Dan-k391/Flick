@@ -863,6 +863,7 @@ struct Para {
         return out;
     }
     static std::wstring Roman(int v, bool upper) {
+        if (v > 3999) return std::to_wstring(v);  // a start value from the file: not millions of "m"
         static const std::pair<int, const wchar_t*> r[] = {{1000, L"m"}, {900, L"cm"}, {500, L"d"}, {400, L"cd"}, {100, L"c"}, {90, L"xc"},
                                                            {50, L"l"},   {40, L"xl"},  {10, L"x"},  {9, L"ix"},   {5, L"v"},   {4, L"iv"}, {1, L"i"}};
         std::wstring s;

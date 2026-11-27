@@ -294,7 +294,7 @@ std::string FormatNumber(double v, std::string_view code, bool d1904 = false) {
     std::string out;
     if (date) {
         v += d1904 ? 1462 : 0;  // the 1904 date system counts from 1904-01-01
-        if (v < 0 || v > 2958465) return "########";
+        if (!(v >= 0 && v <= 2958465)) return "########";  // NaN too
         bool frac = false;
         for (auto& t : toks) frac |= t.kind == 'd' && t.s[0] == '.';
         long long ms = std::llround(v * 86400000.0);
@@ -407,7 +407,7 @@ std::string DocxToMd(std::string_view doc, std::string_view styles) {
             if (x.name == "style") id = Attr(x.attrs, "styleId");
             else if (id.empty()) continue;
             else if (x.name == "name") {  // built-in names are English whatever the UI language
-                if (_strnicmp(v.data(), "heading ", 8) == 0 && v.size() > 8) level[id] = atoi(v.data() + 8);
+                if (v.size() > 8 && _strnicmp(v.data(), "heading ", 8) == 0) level[id] = atoi(v.data() + 8);
                 else if (v == "Title") level[id] = 1;
             } else if (x.name == "outlineLvl" && atoi(std::string(v).c_str()) < 9 && !level.count(id))
                 level[id] = atoi(std::string(v).c_str()) + 1;
@@ -622,7 +622,7 @@ UINT32 XlColor(std::string_view a, const std::vector<UINT32>& theme) {
         size_t i = (size_t)atoi(std::string(th).c_str());
         i = i < 4 ? i ^ 1 : i;  // 0 lt1, 1 dk1, 2 lt2, 3 dk2; the theme lists dk1 lt1 dk2 lt2
         if (i < theme.size()) c = theme[i];
-    } else if (int k = atoi(std::string(ix).c_str()); !ix.empty() && k < 64) c = 0xFF000000 | kIndexed[k];
+    } else if (int k = atoi(std::string(ix).c_str()); !ix.empty() && (unsigned)k < 64) c = 0xFF000000 | kIndexed[k];
     double t = atof(std::string(Attr(a, "tint")).c_str());
     if (c && t) {
         UINT32 out = 0xFF000000;
@@ -771,10 +771,10 @@ void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData&
     Members m;
     ArchiveReadMembers(path, [&](std::wstring_view n) { return n == drawing || n == relsName ? kMaxXml : 0; }, m);
     auto rels = Rels(Member(m, relsName), dir);
-    auto edge = [](const std::vector<float>& sizes, float def, long long i) {
+    auto edge = [](const std::vector<float>& sizes, float def, long long i) {  // i from the file: any value
         float at = 0;
-        for (long long k = 0; k < i; k++) at += k < (long long)sizes.size() ? sizes[k] : def;
-        return at;
+        for (long long k = 0; k < i && k < (long long)sizes.size(); k++) at += sizes[k];
+        return at + def * (float)std::max(0LL, i - (long long)sizes.size());
     };
     std::vector<std::wstring> media;  // per picture
     long long v[2][4] = {}, ext[2] = {}, pos[2] = {}, *field = nullptr;  // from/to: col, colOff, row, rowOff
@@ -928,6 +928,7 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
             }
             if ((r & 1023) == 0 && gen && *gen != mine) return nullptr;
             if (r >= (long long)kMaxRows) break;
+            if (r < 0) continue;  // r="0" or negative: its cells are dropped too (Put needs r >= 0)
             std::string_view ht = Attr(a, "ht"), hidden = Attr(a, "hidden");
             if (!ht.empty() || hidden == "1" || hidden == "true") {
                 if (rowH.size() <= (size_t)r) rowH.resize(r + 1, -1);
@@ -1115,7 +1116,7 @@ std::string DocToMd(IStorage* stg) {
     size_t k = fcClx, end = fcClx + lcbClx;
     while (k < end && table[k] == 1) k += 3 + U16(table, k + 1);  // Prc
     if (k >= end || table[k] != 2) return "";
-    unsigned lcb = U32(table, k + 1);
+    size_t lcb = std::min<size_t>(U32(table, k + 1), end - std::min(end, k + 5));  // PlcPcd: within the Clx
     k += 5;
     size_t pieces = lcb >= 4 ? (lcb - 4) / 12 : 0;
     std::wstring text;
@@ -1453,5 +1454,15 @@ std::wstring OfficeSelfTest() {
     for (auto& n : nums)
         if (std::string got = FormatNumber(n.v, n.code); got != n.want) return L"number format " + Wide(n.code) + L": " + Wide(got);
     if (FormatNumber(0, "yyyy-mm-dd", true) != "1904-01-01") return L"1904 dates";
+    // Malformed input: no crash, no unbounded work.
+    if (FormatNumber(NAN, "dddd") != "########") return L"NaN date";
+    if (XlColor(R"(indexed="-2000000000")", {}) != 0) return L"negative indexed colour";
+    if (DocxToMd("<w:p><w:r><w:t>x</w:t></w:r></w:p>", R"(<w:style w:styleId="a"><w:name/></w:style>)") != "x\n\n") return L"docx: style without a name";
+    std::string deep;
+    for (int k = 0; k < 5000; k++) deep += "<a>";
+    Node root = Parse(deep);
+    size_t depth = 0;
+    for (const Node* n = &root; !n->kids.empty(); n = &n->kids[0]) depth++;
+    if (depth != kMaxDepth) return L"xml depth cap: " + std::to_wstring(depth);
     return L"";
 }
