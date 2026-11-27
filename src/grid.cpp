@@ -502,10 +502,8 @@ D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx,
     // White fills in dark mode are the sheet's "no gridlines" look, not meant as white blocks.
     auto fillOf = [&](const SheetStyle& s) { return dark && (s.fill & 0xFFFFFF) == 0xFFFFFF ? 0 : s.fill; };
     D2D1_COLOR_F autoLine = dark ? D2D1_COLOR_F{c.text.r, c.text.g, c.text.b, 0.7f} : D2D1_COLOR_F{0, 0, 0, 1};
-    // Automatic: unset, or (dark mode) so dark it would vanish on the dark window, like theme text with a tint.
-    auto automatic = [&](UINT32 col) {
-        return !(col & 0xFFFFFF) || (dark && 0.3 * (col >> 16 & 255) + 0.59 * (col >> 8 & 255) + 0.11 * (col & 255) < 70);
-    };
+    // The colour drawn; 0: automatic (unset or black, or in dark mode near-black: the theme's colour).
+    auto ink = [&](UINT32 col) -> UINT32 { return !(col & 0xFFFFFF) ? 0 : dark ? DarkInk(col) : col; };
 
     // Frozen panes: columns/rows before the split stay put (unless they don't leave room for the rest).
     size_t fc = g.frozenCols, fr = g.frozenRows;
@@ -526,7 +524,8 @@ D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx,
     // A border side: 1 thin, 2 medium, 3 thick, 4 double, 5 dashed. Centred on the gridline [p, p + 1].
     auto edge = [&](UINT8 kind, UINT32 col, bool horiz, float p, float a, float b) {
         if (!kind) return;
-        line->SetColor(automatic(col) ? autoLine : Rgb(col));
+        UINT32 k = ink(col);
+        line->SetColor(k ? Rgb(k) : autoLine);
         if (kind == 5) {
             D2D1_POINT_2F p0 = horiz ? D2D1_POINT_2F{a, p + .5f} : D2D1_POINT_2F{p + .5f, a}, p1 = horiz ? D2D1_POINT_2F{b, p + .5f} : D2D1_POINT_2F{p + .5f, b};
             rt->DrawLine(p0, p1, line.Get(), 1, g_dash.Get());
@@ -551,7 +550,8 @@ D2D1_SIZE_F SheetPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float sx,
         l->SetWordWrapping(s.wrap ? DWRITE_WORD_WRAPPING_WRAP : DWRITE_WORD_WRAPPING_NO_WRAP);
         if (s.underline) l->SetUnderline(TRUE, {0, (UINT32)v.size()});
         if (s.strike) l->SetStrikethrough(TRUE, {0, (UINT32)v.size()});
-        text->SetColor(fillOf(s) ? (s.color & 0xFFFFFF ? Rgb(s.color) : D2D1_COLOR_F{0, 0, 0, 1}) : automatic(s.color) ? c.text : Rgb(s.color));
+        UINT32 k = ink(s.color);
+        text->SetColor(fillOf(s) ? (s.color & 0xFFFFFF ? Rgb(s.color) : D2D1_COLOR_F{0, 0, 0, 1}) : k ? Rgb(k) : c.text);
         // A clip per text doubles the cost of drawing it (D2D1_DRAW_TEXT_OPTIONS_CLIP too): only text sticking out gets one.
         DWRITE_TEXT_METRICS m{};
         l->GetMetrics(&m);
@@ -766,6 +766,18 @@ int GridTabAt(D2D1_POINT_2F pt) {
     for (size_t i = 0; i < g_tabRc.size(); i++)
         if (pt.x >= g_tabRc[i].left && pt.x < g_tabRc[i].right) return (int)i;
     return -1;
+}
+
+UINT32 DarkInk(UINT32 c) {
+    int r = c >> 16 & 255, g = c >> 8 & 255, b = c & 255, hi = std::max({r, g, b}), lo = std::min({r, g, b});
+    if (hi < 60) return 0;  // black-ish: by luminance, 0000FF or C00000 would count as black too
+    if (0.299f * r + 0.587f * g + 0.114f * b >= 0.35f * 255) return c;
+    int k = 255 - hi - lo;  // HSL lightness l -> 1 - l
+    r += k, g += k, b += k;
+    // Saturated blues stay dark at any lightness that keeps them blue (0000FF is l = 0.5): toward white until readable.
+    float y = 0.299f * r + 0.587f * g + 0.114f * b, t = std::max(0.f, (0.45f * 255 - y) / (255 - y));
+    auto up = [&](int v) { return (UINT32)std::lround(v + t * (255 - v)); };
+    return 0xFF000000 | up(r) << 16 | up(g) << 8 | up(b);
 }
 
 float GridDigitWidth(const std::wstring& font, float size) {

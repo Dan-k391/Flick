@@ -160,6 +160,9 @@ void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);
 bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt);  // toggles a folder row
 int GridTabAt(D2D1_POINT_2F pt);  // sheets: tab under the point, -1 none, -2 a tab-strip arrow (scrolled)
 bool GridTabWheel(D2D1_POINT_2F pt, float delta);  // sheets: wheel over the tab strip scrolls it
+// An explicit text/line colour (0xFFRRGGBB) on the dark window: 0 when near-black (draw it in the theme's
+// text colour), a dark colour with its lightness mirrored and hue kept (navy -> light blue), else as it is.
+UINT32 DarkInk(UINT32 c);
 float GridDigitWidth(const std::wstring& font, float size);  // widest digit in whole DIPs (Excel's column unit); any thread
 size_t GridShownRows();  // body rows visible (--selftest)
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);

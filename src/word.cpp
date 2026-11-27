@@ -685,17 +685,13 @@ struct Para {
         return f;
     }
     // The colour drawn: automatic is black or white on a fill, the palette's text colour on the window.
-    // Explicit colours stay, except where they would vanish into the window: near-black (near-white in light
-    // mode) takes the palette's colour, other dark colours on the dark window get their lightness mirrored.
+    // Explicit colours stay, except where they would vanish into the window: near-white in light mode takes the
+    // palette's colour, on the dark window DarkInk decides (near-black: the palette's; dark: lightness mirrored).
     UINT32 Ink(UINT32 c, UINT32 under) {
         if (under) return c ? c : Lum(under) < 0.5f ? 0xFFFFFFFF : 0xFF000000;
         if (link) return kLink;
-        if (!c || (g_dark ? Lum(c) < 0.2f : Lum(c) > 0.85f)) return kAuto;
-        if (g_dark && Lum(c) < 0.35f) {
-            int r = c >> 16 & 255, g = c >> 8 & 255, b = c & 255, k = 255 - std::max({r, g, b}) - std::min({r, g, b});
-            return 0xFF000000 | (r + k) << 16 | (g + k) << 8 | (b + k);
-        }
-        return c;
+        if (g_dark && c) c = DarkInk(c);
+        return !c || (!g_dark && Lum(c) > 0.85f) ? kAuto : c;
     }
     void Break() {  // a line break, unless the line is empty
         if (!text.empty() && text.back() != L'\u2028') text += L'\u2028';
