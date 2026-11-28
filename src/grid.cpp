@@ -33,7 +33,7 @@ float g_charW = 7;  // average character width of the cell font, for column sizi
 std::unique_ptr<GridData> g_grid;
 std::vector<float> g_colX;  // column edges
 std::vector<bool> g_open;   // trees: per body row, folder expanded (all collapsed at first)
-std::vector<UINT32> g_shown;  // body rows currently visible (children of collapsed folders hidden)
+std::vector<UINT32> g_shown;  // trees: visible body rows (children of collapsed folders hidden)
 // Selection (sheets, CSV): anchor and focus cells, as data row/column; mode 1: whole columns, 2: whole rows, 3: all.
 struct GridSel {
     size_t r[2], c[2];
@@ -49,11 +49,11 @@ bool HasChildren(const GridData& g, size_t i) { return i + 1 < g.indent.size() &
 
 void Rebuild() {
     const GridData& g = *g_grid;
-    size_t body = g.Rows() - (g.header ? 1 : 0);
     g_shown.clear();
+    size_t body = g.folder.size();
     for (size_t i = 0; i < body; i++) {
         g_shown.push_back((UINT32)i);
-        if (!g.folder.empty() && g.folder[i] && !g_open[i])  // skip the collapsed subtree
+        if (g.folder[i] && !g_open[i])  // skip the collapsed subtree
             for (UINT8 depth = g.indent[i]; i + 1 < body && g.indent[i + 1] > depth;) i++;
     }
 }
@@ -419,8 +419,19 @@ void GridSet(std::unique_ptr<GridData> g) {
     // The selection survives the sheet worker's completed copy of the same sheet (indices are clamped where used).
     if (!g || !g_grid || !g->sheet || !g_grid->sheet || g->tab != g_grid->tab || g->tabs != g_grid->tabs) g_sel = {};
     g_grid = std::move(g);
-    g_colX.clear(), g_rowY.clear(), g_mergeAt.clear(), g_styleFmt.clear(), g_picBmp.clear();
-    if (!g_grid) return;
+    g_colX.clear(), g_rowY.clear(), g_styleFmt.clear(), g_picBmp.clear();
+    constexpr size_t kKeepGridCapacity = 4096;
+    if (!g_grid && g_mergeAt.bucket_count() > kKeepGridCapacity) decltype(g_mergeAt){}.swap(g_mergeAt);
+    else g_mergeAt.clear();
+    if (!g_grid) {
+        g_open.clear(), g_shown.clear();
+        // Reuse small buffers across opens and return capacity held by unusually large previews.
+        if (g_open.capacity() > kKeepGridCapacity) decltype(g_open){}.swap(g_open);
+        if (g_shown.capacity() > kKeepGridCapacity) decltype(g_shown){}.swap(g_shown);
+        if (g_colX.capacity() > kKeepGridCapacity) decltype(g_colX){}.swap(g_colX);
+        if (g_rowY.capacity() > kKeepGridCapacity) decltype(g_rowY){}.swap(g_rowY);
+        return;
+    }
     g_open.assign(g_grid->folder.size(), false);
     // A single top-level folder (typical for archives) starts expanded: nothing to see otherwise.
     if (!g_open.empty() && g_grid->folder[0] && std::count(g_grid->indent.begin(), g_grid->indent.end(), 0) == 1)
@@ -466,7 +477,10 @@ void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value) {
     g_grid->cells[i] = {(UINT32)g_grid->text.size(), (UINT32)value.size()};
     g_grid->text += value;
 }
-size_t GridShownRows() { return g_shown.size(); }
+size_t GridShownRows() {
+    if (!g_grid) return 0;
+    return g_grid->folder.empty() ? g_grid->Rows() - g_grid->header : g_shown.size();
+}
 
 // A click in the table: expands/collapses the folder row under it. True if the view changed.
 bool GridClick(const D2D1_RECT_F& area, float scrollY, D2D1_POINT_2F pt) {
@@ -872,10 +886,11 @@ bool CellAt(const GridData& g, D2D1_POINT_2F pt, float sx, float sy, bool drag, 
         return true;
     }
     float top = g_area.top + (g.header ? kRowH : 0);
-    if (g_shown.empty() || !g.cols || (!drag && pt.y >= g_area.bottom)) return false;
+    size_t body = GridShownRows();
+    if (!body || !g.cols || (!drag && pt.y >= g_area.bottom)) return false;
     head = g.header && pt.y < top ? 1 : 0;
     c = std::min<size_t>(At(g_colX, kMinCol, pt.x - g_area.left + sx), g.cols - 1);
-    r = g_shown[std::min(g_shown.size() - 1, (size_t)((std::max(pt.y, top) - top + sy) / kRowH))] + (g.header ? 1 : 0);
+    r = std::min(body - 1, (size_t)((std::max(pt.y, top) - top + sy) / kRowH)) + g.header;
     return true;
 }
 }  // namespace
@@ -941,7 +956,7 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
     ComPtr<ID2D1SolidColorBrush> text, fill;
     rt->CreateSolidColorBrush(c.text, &text);
     rt->CreateSolidColorBrush(c.codeBg, &fill);
-    size_t body = g_shown.size();
+    size_t body = GridShownRows();
     float top = area.top + (g.header ? kRowH : 0);
     // Stretch the last column to the edge when the table is narrower than the view.
     float lastW = std::max(g_colX.back(), area.right - area.left) - g_colX[g.cols - 1];
@@ -985,7 +1000,7 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
         float y = top + i * kRowH - scrollY;
         if (y > area.bottom) break;
         if (i % 2) rt->FillRectangle({area.left - scrollX, y, area.left - scrollX + total, y + kRowH}, fill.Get());
-        drawRow(g_shown[i] + (g.header ? 1 : 0), y, false);
+        drawRow((g.folder.empty() ? i : g_shown[i]) + g.header, y, false);
     }
     size_t r0, c0, r1, c1;
     bool sel = g.folder.empty() && g.Rows() && SelRect(g, r0, c0, r1, c1);  // CSV: rows are shown in order
