@@ -74,7 +74,8 @@ ComPtr<IDWriteTextFormat> CellFormat(const wchar_t* family, float size, DWRITE_F
 }
 
 std::wstring_view Cell(const GridData& g, size_t row, size_t col) {
-    auto [off, len] = g.cells[row * g.cols + col];
+    if (!g.rowEnds.empty() && col >= g.RowCols(row)) return {};
+    auto [off, len] = g.cells[g.RowStart(row) + col];
     return {g.text.data() + off, len};
 }
 
@@ -82,19 +83,25 @@ std::wstring_view Cell(const GridData& g, size_t row, size_t col) {
 void DetectNumeric(GridData& g) {
     g.rightAlign.assign(g.cols, false);
     size_t rows = std::min<size_t>(g.Rows(), 500);
-    for (size_t c = 0; c < g.cols; c++) {
-        size_t num = 0, total = 0;
-        for (size_t r = g.header; r < rows; r++) {  // the header is text, whatever the column holds
-            std::wstring_view v = Cell(g, r, c);
-            if (v.empty()) continue;
-            total++;
+    if (rows <= g.header) return;
+    struct Counts { UINT16 num = 0, total = 0; };
+    std::vector<Counts> counts(g.cols);
+    for (size_t r = g.header; r < rows; r++) {  // the header is text, whatever the column holds
+        size_t first = g.RowStart(r);
+        for (size_t c = 0, cols = g.RowCols(r); c < cols; c++) {
+            auto [off, len] = g.cells[first + c];
+            if (!len) continue;
+            counts[c].total++;
             wchar_t buf[64], *end = nullptr;
-            if (v.size() >= 64) continue;
-            wmemcpy(buf, v.data(), v.size());
-            buf[v.size()] = 0;
+            if (len >= std::size(buf)) continue;
+            wmemcpy(buf, g.text.data() + off, len);
+            buf[len] = 0;
             wcstod(buf, &end);
-            num += end != buf && !*end;
+            counts[c].num += end != buf && !*end;
         }
+    }
+    for (size_t c = 0; c < g.cols; c++) {
+        auto [num, total] = counts[c];
         g.rightAlign[c] = total && num * 10 >= total * 8;
     }
 }
@@ -255,12 +262,16 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
     }
     if (rowEnd.empty() || rowEnd.back() != g->cells.size()) endRow();
     if (rowEnd.empty()) return nullptr;
-    // Uneven rows (rare): pad every row to the widest.
+    // Keep the dense path for nearly rectangular files, with at most 25% extra cells.
+    // In a ragged file a single wide row must not multiply the storage for all the others.
     UINT32 prev = 0;
     for (UINT32 e : rowEnd) g->cols = std::max(g->cols, e - prev), prev = e;
-    if (g->cells.size() != (size_t)g->cols * rowEnd.size()) {
+    const UINT64 padded = (UINT64)g->cols * rowEnd.size();
+    if (padded - g->cells.size() > g->cells.size() / 4) {
+        g->rowEnds = std::move(rowEnd);
+    } else if (padded != g->cells.size()) {
         std::vector<std::pair<UINT32, UINT32>> cells;
-        cells.reserve((size_t)g->cols * rowEnd.size());
+        cells.reserve((size_t)padded);
         prev = 0;
         for (UINT32 e : rowEnd) {
             cells.insert(cells.end(), g->cells.begin() + prev, g->cells.begin() + e);
@@ -271,7 +282,6 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
     }
     g->header = true;
     DetectNumeric(*g);
-    if (g->Rows() < 2) g->rightAlign.assign(g->cols, false);
     size_t rows = g->Rows() - 1;
     g->sub = std::to_wstring(rows) + (rows == 1 ? L" row × " : L" rows × ") + std::to_wstring(g->cols) +
              (g->cols == 1 ? L" column" : L" columns");
@@ -434,8 +444,11 @@ void GridSet(std::unique_ptr<GridData> g) {
         }
     }
     std::vector<size_t> chars(g_grid->cols, 0);
-    for (size_t r = 0, n = std::min<size_t>(g_grid->Rows(), 1000); r < n; r++)
-        for (size_t c = 0; c < g_grid->cols; c++) chars[c] = std::max(chars[c], Cell(*g_grid, r, c).size());
+    for (size_t r = 0, n = std::min<size_t>(d.Rows(), 1000); r < n; r++) {
+        size_t first = d.RowStart(r);
+        for (size_t c = 0, cols = d.RowCols(r); c < cols; c++)
+            chars[c] = std::max<size_t>(chars[c], d.cells[first + c].second);
+    }
     float extra0 = g_grid->folder.empty() ? 0 : kChevronW + kIconW + kIndent * 3;  // tree indent + chevron + icon
     g_colX.push_back(0);
     for (size_t c = 0; c < g_grid->cols; c++)
@@ -446,9 +459,10 @@ void GridSet(std::unique_ptr<GridData> g) {
 const GridData* GridGet() { return g_grid.get(); }
 
 void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value) {
-    if (!g_grid || col >= g_grid->cols) return;
-    size_t i = (bodyRow + (g_grid->header ? 1 : 0)) * g_grid->cols + col;
-    if (i >= g_grid->cells.size()) return;
+    if (!g_grid) return;
+    size_t row = bodyRow + g_grid->header;
+    if (row >= g_grid->Rows() || col >= g_grid->RowCols(row)) return;
+    size_t i = g_grid->RowStart(row) + col;
     g_grid->cells[i] = {(UINT32)g_grid->text.size(), (UINT32)value.size()};
     g_grid->text += value;
 }
@@ -892,9 +906,13 @@ std::wstring GridCopy() {
 // Excel's plain text: tabs between cells, CRLF after each row; a cell with a tab, line break or quote in quotes.
 std::wstring GridRangeText(const GridData& g, size_t r0, size_t c0, size_t r1, size_t c1) {
     std::wstring s;
-    if (!g.cols || !g.Rows()) return s;
+    if (r0 > r1 || c0 > c1 || !g.cols || !g.Rows()) return s;
     r1 = std::min(r1, g.Rows() - 1), c1 = std::min<size_t>(c1, g.cols - 1);
-    for (size_t r = r0; r <= r1 && c0 <= c1; r++) {
+    if (r0 > r1 || c0 > c1) return s;
+    // A ragged CSV can contain billions of implicit blanks. Bound their expansion into clipboard text.
+    constexpr size_t kMaxCsvCopy = 32 << 20;  // UTF-16 characters, before quoting cell contents
+    if (!g.rowEnds.empty() && r1 - r0 + 1 > kMaxCsvCopy / (c1 - c0 + 2)) return s;
+    for (size_t r = r0; r <= r1; r++) {
         for (size_t c = c0; c <= c1; c++) {
             if (c > c0) s += L'\t';
             std::wstring_view v = Cell(g, r, c);
@@ -928,12 +946,16 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
     // Stretch the last column to the edge when the table is narrower than the view.
     float lastW = std::max(g_colX.back(), area.right - area.left) - g_colX[g.cols - 1];
     float total = g_colX[g.cols - 1] + lastW;
+    // The last column can stretch past its stored edge. Its start still bounds the binary search.
+    auto lastStart = g_colX.end() - 1;
+    size_t firstCol = std::lower_bound(g_colX.begin() + 1, lastStart, scrollX) - (g_colX.begin() + 1);
+    size_t endCol = std::upper_bound(g_colX.begin(), lastStart, scrollX + area.right - area.left) - g_colX.begin();
 
     auto drawRow = [&](size_t r, float y, bool head) {
-        for (size_t col = 0; col < g.cols; col++) {
+        size_t first = g.RowStart(r), end = std::min(endCol, g.RowCols(r));
+        for (size_t col = firstCol; col < end; col++) {
             float x0 = area.left + g_colX[col] - scrollX, x1 = col + 1 == g.cols ? x0 + lastW : area.left + g_colX[col + 1] - scrollX;
-            if (x1 < area.left || x0 > area.right) continue;
-            std::wstring_view v = Cell(g, r, col);
+            auto [off, len] = g.cells[first + col];
             float left = x0 + kCellPad;
             if (col == 0 && !g.folder.empty() && !head) {  // tree: indent + chevron + folder/file icon
                 size_t i = r - 1;
@@ -950,9 +972,10 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
                 text->SetColor(c.text);
                 left += kIconW;
             }
+            if (!len) continue;
             bool right = g.rightAlign[col];
             IDWriteTextFormat* f = head ? (right ? g_fmtHeadR : g_fmtHead).Get() : (right ? g_fmtCellR : g_fmtCell).Get();
-            rt->DrawText(v.data(), (UINT32)v.size(), f, {left, y, std::max(left, x1 - kCellPad), y + kRowH}, text.Get());
+            rt->DrawText(g.text.data() + off, len, f, {left, y, std::max(left, x1 - kCellPad), y + kRowH}, text.Get());
         }
     };
 
@@ -984,7 +1007,7 @@ D2D1_SIZE_F GridPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scro
         drawRow(0, area.top, true);
         if (sel && r0 == 0 && c0 < g.cols) selRect(area.top, top);
         fill->SetColor(c.rule);
-        for (size_t col = 1; col < g.cols; col++) {
+        for (size_t col = std::max<size_t>(1, firstCol); col < endCol; col++) {
             float x = area.left + g_colX[col] - scrollX;
             rt->FillRectangle({x, area.top + 6, x + 1, top - 6}, fill.Get());
         }

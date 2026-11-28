@@ -185,6 +185,7 @@ struct SheetPic {
 struct GridData {
     std::wstring text;                             // all cell text
     std::vector<std::pair<UINT32, UINT32>> cells;  // (offset, length) into text, row-major
+    std::vector<UINT32> rowEnds;                   // ragged CSV only: cell index after each row
     UINT32 cols = 0;
     bool header = false;                           // row 0 is a header
     std::vector<bool> rightAlign;                  // per column
@@ -205,7 +206,9 @@ struct GridData {
     UINT32 frozenRows = 0, frozenCols = 0;
     bool gridLines = true;
     bool more = false;  // sheets: first rows only, or pictures to decode: OfficeToGrid on a worker completes it
-    size_t Rows() const { return cols ? cells.size() / cols : 0; }
+    size_t Rows() const { return rowEnds.empty() ? (cols ? cells.size() / cols : 0) : rowEnds.size(); }
+    size_t RowStart(size_t row) const { return rowEnds.empty() ? row * cols : row ? rowEnds[row - 1] : 0; }
+    size_t RowCols(size_t row) const { return rowEnds.empty() ? cols : rowEnds[row] - RowStart(row); }
 };
 void GridInit(IDWriteFactory*, const wchar_t* uiFont, const wchar_t* iconFont);
 std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep);  // sep 0: guess
