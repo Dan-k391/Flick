@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <vector>
 #include <algorithm>
+#include <numeric>
+#include <span>
 
 using Microsoft::WRL::ComPtr;
 
@@ -135,6 +137,11 @@ void Pump() {
     while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) DispatchMessageW(&m);
 }
 
+double MedianSorted(std::span<const double> samples) {
+    size_t mid = samples.size() / 2;
+    return samples.size() % 2 ? samples[mid] : std::midpoint(samples[mid - 1], samples[mid]);
+}
+
 // `Flick.exe --bench file...`: open each file repeatedly in-process (no Explorer involved).
 int Bench(int argc, wchar_t** argv) {
     constexpr int kRuns = 20;
@@ -161,8 +168,8 @@ int Bench(int argc, wchar_t** argv) {
         std::sort(composed.begin(), composed.end());
         Log(L"BENCH %-5s %-28s first: ready %6.2f ms, on-screen %6.2f ms | median: load %5.2f, ready %6.2f ms, "
             L"on-screen %6.2f ms | min ready %5.2f ms",
-            t.kind, PathFindFileNameW(full), first.ready, first.composed, load[kRuns / 2], ready[kRuns / 2],
-            composed[kRuns / 2], ready[0]);
+            t.kind, PathFindFileNameW(full), first.ready, first.composed, MedianSorted(load), MedianSorted(ready),
+            MedianSorted(composed), ready[0]);
     }
     for (LONGLONG s = Now(); MsSince(s) < 1500;)  // workers of the last preview (a big sheet's rows) wind down
         MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT), Pump();
