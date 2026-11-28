@@ -22,8 +22,8 @@ enum : UINT {
     WM_FLICK_INFO,                 // worker thread finished a thumbnail (lParam = InfoJob*)
     WM_FLICK_PDF,                  // sent by the PDF worker (lParam = PdfMsg*); reply = next page
     WM_FLICK_GRID,                 // sent by the archive worker (wParam = gen, lParam = GridData*)
-    WM_FLICK_MEDIA,                // media engine event (wParam = MF_MEDIA_ENGINE_EVENT)
-    WM_FLICK_FRAME,                // display refreshed while playing: pull a video frame
+    WM_FLICK_MEDIA,                // media engine event (wParam = gen, lParam = MF_MEDIA_ENGINE_EVENT)
+    WM_FLICK_FRAME,                // video frame or audio progress tick (wParam = gen)
     WM_FLICK_SIZE,                 // sent by the folder-size worker (lParam = SizeMsg*)
     WM_FLICK_SCRUB,                // sent by the scrub worker (wParam = gen, lParam = IWICBitmap* frame)
     WM_FLICK_POSTER,               // sent by the poster worker (wParam = gen, lParam = IWICBitmap* first frame)
@@ -301,9 +301,10 @@ bool MediaOpen(const std::wstring& path);  // false if Media Foundation is unava
 void MediaClose();
 MediaState MediaGet();
 bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWICBitmap>& out);
-void MediaFrameHandled();
-void MediaOnEvent(DWORD event);
+bool MediaOnTick(WPARAM gen, MediaState& state);
+bool MediaOnEvent(WPARAM gen, DWORD event);
 void MediaToggle();
+void MediaSetPlaying(bool play);  // pause/resume a seek drag without rewinding an ended clip
 void MediaSeek(double seconds);
 void MediaMute(bool muted);  // for tests
 void MediaSetVolume(double v);  // 0..1, kept for the session

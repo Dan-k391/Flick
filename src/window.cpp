@@ -746,9 +746,12 @@ LRESULT OnPdf(PdfMsg& m) {
     return next;
 }
 
-bool TryFrame();
+bool TryFrame(const MediaState&);
 bool Pending() {
-    if (g_kind == K_Media && g_mediaVideo && !g_frame && !g_posterDone && !MediaGet().error && !TryFrame()) return true;
+    if (g_kind == K_Media && g_mediaVideo && !g_frame && !g_posterDone) {
+        MediaState s = MediaGet();
+        if (!s.error && !TryFrame(s)) return true;
+    }
     return (g_kind == K_Pdf && !g_pdfFailed && (g_pageW.empty() || !g_pageW[0])) || (g_kind == K_Grid && g_gridPending);
 }
 
@@ -1206,8 +1209,7 @@ D2D1_RECT_F VideoRect(const MediaState& s) {
 }
 
 // Pulls the next video frame if one is due, at the pixel size it is shown.
-bool TryFrame() {
-    MediaState s = MediaGet();
+bool TryFrame(const MediaState& s) {
     if (!s.videoW) return false;
     D2D1_RECT_F r = VideoRect(s);
     UINT w = (UINT)std::lround((r.right - r.left) * g_dpi / 96), h = (UINT)std::lround((r.bottom - r.top) * g_dpi / 96);
@@ -1216,9 +1218,8 @@ bool TryFrame() {
     return true;
 }
 
-void OnMediaEvent(DWORD event) {
-    if (g_kind != K_Media) return;
-    MediaOnEvent(event);
+void OnMediaEvent(WPARAM gen, DWORD event) {
+    if (!MediaOnEvent(gen, event) || g_kind != K_Media) return;
     MediaState s = MediaGet();
     if (s.error) {
         if (g_mediaVideo) ShowInfo(), g_info.push_back(L"Can't play: Windows has no decoder for this video's format");
@@ -1367,9 +1368,10 @@ void DrawSubs(const MediaState& s, ID2D1SolidColorBrush* brush) {
 // shows the key frame under the knob (the media engine needs 250-750 ms per seek and, while playing,
 // shows almost no frames during a stream of seeks). Releasing seeks the engine exactly, once.
 void BeginSeek() {
+    g_scrubGen = 0;
     MediaState s = MediaGet();
     g_seekResume = !s.paused && !s.ended;
-    if (g_seekResume) MediaToggle();
+    if (g_seekResume) MediaSetPlaying(false);
     if (g_mediaVideo && s.videoW) {
         D2D1_RECT_F r = VideoRect(s);
         g_scrubGen = MediaScrubStart(g_path, (UINT)std::lround((r.right - r.left) * g_dpi / 96),
@@ -1386,6 +1388,7 @@ void SeekAt(float x) {
 }
 
 void EndSeek() {
+    g_scrubGen = 0;
     MediaScrubStop();
     if (g_seekFrac >= 0) MediaSeek(g_seekFrac * MediaGet().dur);
     g_seekFrac = -1;
@@ -2516,18 +2519,19 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_FLICK_PDF:
             return OnPdf(*reinterpret_cast<PdfMsg*>(l));
         case WM_FLICK_MEDIA:
-            OnMediaEvent((DWORD)w);
+            OnMediaEvent(w, (DWORD)l);
             return 0;
         case WM_FLICK_FRAME: {
-            MediaFrameHandled();
-            if (g_kind != K_Media || !g_visible) return 0;
-            bool repaint = g_mediaVideo && TryFrame();
-            // Progress: repaint whenever the knob moves a pixel (or the clock a second), not on a fixed tick.
-            MediaState s = MediaGet();
-            double frac = g_seekFrac >= 0 ? g_seekFrac : s.dur > 0 ? s.pos / s.dur : 0;
-            double shown = std::floor(frac * (g_trackRc.right - g_trackRc.left) * g_dpi / 96) * 1e6 + std::floor(s.pos);
-            if (shown != g_shownPos) g_shownPos = shown, repaint = true;
-            if (!g_subs.empty() && SubsAt(SubClock(s)) != g_subOn) repaint = true;  // a cue starts or ends between frames
+            MediaState s;
+            if (!MediaOnTick(w, s) || g_kind != K_Media || !g_visible || g_seekDrag) return 0;
+            bool repaint = g_mediaVideo && TryFrame(s);
+            if (g_playRc.bottom > 0) {
+                double frac = s.dur > 0 ? std::clamp(s.pos / s.dur, 0.0, 1.0) : 0;
+                float trackW = std::max(0.f, g_trackRc.right - g_trackRc.left);
+                double shown = std::floor(frac * trackW * g_dpi / 96) * 1e6 + std::floor(s.pos);
+                if (shown != g_shownPos) g_shownPos = shown, repaint = true;
+            }
+            if (!repaint && !g_subs.empty() && SubsAt(s.pos) != g_subOn) repaint = true;
             if (repaint) InvalidateRect(h, nullptr, FALSE);
             return 0;
         }
@@ -2568,6 +2572,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             DestroyWindow(h);
             return 0;
         case WM_DESTROY:
+            MediaClose();
+            MediaScrubStop();
             PostQuitMessage(0);
             return 0;
     }

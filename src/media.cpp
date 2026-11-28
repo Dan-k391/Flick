@@ -1,7 +1,7 @@
 // Audio/video playback with Media Foundation's media engine in frame-server mode, without a DXGI
 // device: decoding and scaling run on the CPU, so no GPU driver is loaded into the process. Frames
-// are pulled once per display refresh (a thread waiting on DwmFlush posts WM_FLICK_FRAME) and
-// copied at the size shown.
+// are pulled at display refresh while playing and copied at the size shown. Audio has a slower
+// progress tick. The pump sleeps when playback has no updates to show.
 #include "app.h"
 #include <mfapi.h>
 #include <mfmediaengine.h>
@@ -17,8 +17,8 @@ namespace {
 
 ComPtr<IMFMediaEngine> g_engine;
 ComPtr<IMFMediaEngineEx> g_engineEx;
-std::atomic<int> g_pumpGen;  // a pump thread runs while the generation it started with is current
-std::atomic<bool> g_framePending;
+WPARAM g_mediaGen;  // the UI thread owns the engine and its generation
+ULONGLONG g_frameUntil;  // deadline for fast frame probes, even when paused
 bool g_error;
 bool g_muted;  // --bench / --mute: tests stay silent
 double g_volume = 1;  // the user's volume and mute, kept for the session
@@ -26,8 +26,11 @@ bool g_userMuted;
 
 class Notify : public IMFMediaEngineNotify {
     std::atomic<LONG> ref_{1};
+    const HWND hwnd_;
+    const WPARAM gen_;
 
 public:
+    Notify(HWND hwnd, WPARAM gen) : hwnd_(hwnd), gen_(gen) {}
     STDMETHODIMP QueryInterface(REFIID riid, void** p) override {
         if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFMediaEngineNotify)) {
             *p = static_cast<IMFMediaEngineNotify*>(this);
@@ -44,18 +47,103 @@ public:
         return r;
     }
     STDMETHODIMP EventNotify(DWORD event, DWORD_PTR param1, DWORD) override {
-        if (event == MF_MEDIA_ENGINE_EVENT_NOTIFYSTABLESTATE) SetEvent((HANDLE)param1);
-        else PostMessageW(g_hwnd, WM_FLICK_MEDIA, event, 0);  // never block an MF thread on the UI
+        switch (event) {
+            case MF_MEDIA_ENGINE_EVENT_NOTIFYSTABLESTATE:
+                SetEvent((HANDLE)param1);
+                break;
+            case MF_MEDIA_ENGINE_EVENT_ERROR:
+            case MF_MEDIA_ENGINE_EVENT_PLAY:
+            case MF_MEDIA_ENGINE_EVENT_PAUSE:
+            case MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA:
+            case MF_MEDIA_ENGINE_EVENT_LOADEDDATA:
+            case MF_MEDIA_ENGINE_EVENT_WAITING:
+            case MF_MEDIA_ENGINE_EVENT_PLAYING:
+            case MF_MEDIA_ENGINE_EVENT_CANPLAY:
+            case MF_MEDIA_ENGINE_EVENT_CANPLAYTHROUGH:
+            case MF_MEDIA_ENGINE_EVENT_SEEKING:
+            case MF_MEDIA_ENGINE_EVENT_SEEKED:
+            case MF_MEDIA_ENGINE_EVENT_ENDED:
+            case MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE:
+            case MF_MEDIA_ENGINE_EVENT_FORMATCHANGE:
+            case MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY:
+                PostMessageW(hwnd_, WM_FLICK_MEDIA, gen_, event);  // may run on an MF thread
+                break;
+        }
         return S_OK;
     }
 };
 
-DWORD WINAPI PumpThread(void* gen) {
-    while (g_pumpGen == (int)(INT_PTR)gen) {
-        DwmFlush();  // once per composition = display refresh
-        if (!g_framePending.exchange(true)) PostMessageW(g_hwnd, WM_FLICK_FRAME, 0, 0);
+enum class PumpMode { Parked, Audio, Video, Probe, SlowProbe, Closed };
+
+struct FramePump {
+    FramePump(HWND hwnd, WPARAM gen, PumpMode mode) : hwnd(hwnd), gen(gen), mode(mode) {}
+    ~FramePump() { if (wake) CloseHandle(wake); }
+
+    const HWND hwnd;
+    const WPARAM gen;
+    const HANDLE wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    std::atomic<PumpMode> mode;
+    std::atomic<bool> pending{false};
+};
+
+std::shared_ptr<FramePump> g_pump;
+
+DWORD WINAPI PumpThread(void* p) {
+    // The worker owns only its wake event and message token. All Media Engine and WIC calls stay
+    // on the UI thread. Closing can signal this worker without waiting for a blocked DwmFlush.
+    std::unique_ptr<std::shared_ptr<FramePump>> job(static_cast<std::shared_ptr<FramePump>*>(p));
+    auto pump = std::move(*job);
+    job.reset();
+    for (;;) {
+        PumpMode mode = pump->mode;
+        if (mode == PumpMode::Closed) break;
+        if (mode != PumpMode::Video || FAILED(DwmFlush())) {
+            DWORD delay = INFINITE;
+            switch (mode) {
+                case PumpMode::Audio: delay = 50; break;
+                case PumpMode::Video: delay = 16; break;  // DwmFlush failed
+                case PumpMode::Probe: delay = 25; break;
+                case PumpMode::SlowProbe: delay = 250; break;
+            }
+            DWORD wait = WaitForSingleObject(pump->wake, delay);
+            if (wait == WAIT_OBJECT_0) continue;
+            if (wait != WAIT_TIMEOUT) break;
+        }
+        if (pump->mode == mode && !pump->pending.exchange(true) &&
+            !PostMessageW(pump->hwnd, WM_FLICK_FRAME, pump->gen, 0))
+            pump->pending = false;
     }
     return 0;
+}
+
+void UpdatePump() {
+    PumpMode mode = PumpMode::Parked;
+    if (!g_error) {
+        bool seeking = g_engine->IsSeeking() != FALSE;
+        bool playing = !seeking && g_engine->GetReadyState() >= MF_MEDIA_ENGINE_READY_HAVE_FUTURE_DATA &&
+                       !g_engine->IsPaused() && !g_engine->IsEnded();
+        if (g_engine->HasVideo()) {
+            bool fastProbe = g_frameUntil && GetTickCount64() < g_frameUntil;
+            if (!fastProbe && !seeking) g_frameUntil = 0;
+            if (playing) mode = PumpMode::Video;
+            else if (fastProbe) mode = PumpMode::Probe;
+            else if (g_frameUntil) mode = PumpMode::SlowProbe;  // an in-flight seek still needs a frame pull
+        } else if (playing) mode = PumpMode::Audio;
+    }
+    if (g_pump) {
+        if (g_pump->mode != mode) {
+            g_pump->mode = mode;
+            SetEvent(g_pump->wake);
+        }
+    } else if (mode != PumpMode::Parked) {
+        auto pump = std::make_shared<FramePump>(g_hwnd, g_mediaGen, mode);
+        if (!pump->wake) return;
+        auto* job = new std::shared_ptr<FramePump>(pump);
+        if (HANDLE thread = CreateThread(nullptr, 0, PumpThread, job, 0, nullptr)) {
+            g_pump = std::move(pump);
+            CloseHandle(thread);
+        } else delete job;
+    }
 }
 
 bool StartMediaFoundation() {
@@ -74,36 +162,62 @@ bool MediaOpen(const std::wstring& path) {
         return false;
     ComPtr<IMFAttributes> attrs;
     ComPtr<IMFMediaEngineNotify> notify;
-    notify.Attach(new Notify);
-    MFCreateAttributes(&attrs, 3);
-    attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify.Get());
-    attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);  // frame-server mode
-    attrs->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, 3 /* AudioCategory_Media */);
-    if (FAILED(factory->CreateInstance(0, attrs.Get(), &g_engine))) return false;
+    notify.Attach(new Notify(g_hwnd, g_mediaGen));
+    if (FAILED(MFCreateAttributes(&attrs, 3)) || FAILED(attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify.Get())) ||
+        FAILED(attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM)) ||  // frame-server mode
+        FAILED(attrs->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, 3 /* AudioCategory_Media */)) ||
+        FAILED(factory->CreateInstance(0, attrs.Get(), &g_engine)))
+        return false;
     g_engine.As(&g_engineEx);
-    g_error = false;
     g_engine->SetAutoPlay(TRUE);
     g_engine->SetMuted(g_muted || g_userMuted);
     g_engine->SetVolume(g_volume);
     BSTR url = SysAllocString(path.c_str());
+    if (!url) return MediaClose(), false;
     HRESULT hr = g_engine->SetSource(url);
     SysFreeString(url);
     if (FAILED(hr)) return MediaClose(), false;
-    g_framePending = false;
-    CloseHandle(CreateThread(nullptr, 0, PumpThread, (void*)(INT_PTR)++g_pumpGen, 0, nullptr));
     return true;
 }
 
 void MediaClose() {
-    g_pumpGen++;  // the pump thread exits after its current DwmFlush
+    ++g_mediaGen;  // reject queued frame and callback messages before shutting down the old engine
+    if (g_pump) {
+        g_pump->mode = PumpMode::Closed;
+        SetEvent(g_pump->wake);
+        g_pump.reset();
+    }
+    g_frameUntil = 0;
+    g_error = false;
     if (g_engine) g_engine->Shutdown();
     g_engineEx.Reset(), g_engine.Reset();
 }
 
-void MediaFrameHandled() { g_framePending = false; }
+bool MediaOnTick(WPARAM gen, MediaState& state) {
+    if (!g_pump || gen != g_mediaGen) return false;
+    g_pump->pending = false;
+    PumpMode mode = g_pump->mode;
+    if (mode == PumpMode::Parked) return false;
+    state = MediaGet();
+    if ((g_frameUntil && GetTickCount64() >= g_frameUntil) ||
+        ((mode == PumpMode::Video || mode == PumpMode::Audio) && (state.paused || state.ended)))
+        UpdatePump();
+    return true;
+}
 
-void MediaOnEvent(DWORD event) {
+bool MediaOnEvent(WPARAM gen, DWORD event) {
+    if (!g_engine || gen != g_mediaGen) return false;
     if (event == MF_MEDIA_ENGINE_EVENT_ERROR) g_error = true;
+    // SEEKED can precede the actual frame. Retry briefly, stopping as soon as a frame is copied.
+    if (event == MF_MEDIA_ENGINE_EVENT_LOADEDDATA || event == MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY ||
+        event == MF_MEDIA_ENGINE_EVENT_SEEKED || event == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE) {
+        if (g_engine->HasVideo()) {
+            auto until = GetTickCount64() + 300;
+            g_frameUntil = g_engine->IsSeeking() ? std::max(g_frameUntil, until) : until;
+        }
+    }
+    UpdatePump();
+    return true;
 }
 
 MediaState MediaGet() {
@@ -115,6 +229,7 @@ MediaState MediaGet() {
     s.ended = g_engine->IsEnded() != FALSE;
     s.pos = g_engine->GetCurrentTime();
     s.dur = g_engine->GetDuration();
+    if (!std::isfinite(s.pos)) s.pos = 0;
     if (!std::isfinite(s.dur)) s.dur = 0;
     DWORD w = 0, h = 0, ax = 1, ay = 1;
     if (g_engine->HasVideo() && SUCCEEDED(g_engine->GetNativeVideoSize(&w, &h)) && w && h) {
@@ -136,20 +251,33 @@ bool MediaFrame(UINT w, UINT h, IWICImagingFactory* wic, ComPtr<IWICBitmap>& out
         return false;
     RECT dst{0, 0, (LONG)w, (LONG)h};
     MFARGB black{0, 0, 0, 255};
-    return SUCCEEDED(g_engine->TransferVideoFrame(out.Get(), nullptr, &dst, &black));
+    if (FAILED(g_engine->TransferVideoFrame(out.Get(), nullptr, &dst, &black))) return false;
+    if (g_frameUntil && !g_engine->IsSeeking()) g_frameUntil = 0, UpdatePump();
+    return true;
 }
 
 void MediaToggle() {
-    if (!g_engine) return;
-    if (g_engine->IsEnded()) g_engine->SetCurrentTime(0), g_engine->Play();
-    else if (g_engine->IsPaused()) g_engine->Play();
+    if (!g_engine || g_error) return;
+    if (g_engine->IsEnded()) {
+        MediaSeek(0);
+        MediaSetPlaying(true);
+    } else MediaSetPlaying(g_engine->IsPaused() != FALSE);
+}
+
+void MediaSetPlaying(bool play) {
+    if (!g_engine || g_error) return;
+    if (play) g_engine->Play();
     else g_engine->Pause();
+    UpdatePump();
 }
 
 void MediaSeek(double seconds) {
-    if (!g_engine) return;
-    if (g_engineEx) g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL);
-    else g_engine->SetCurrentTime(seconds);
+    if (!g_engine || g_error || !std::isfinite(seconds)) return;
+    HRESULT hr = g_engineEx ? g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL)
+                           : g_engine->SetCurrentTime(seconds);
+    // In frame-server mode a paused seek can wait for OnVideoStreamTick before sending SEEKED.
+    if (SUCCEEDED(hr) && g_engine->HasVideo()) g_frameUntil = GetTickCount64() + 2000;
+    UpdatePump();
 }
 
 void MediaMute(bool muted) { g_muted = muted; }
@@ -357,31 +485,37 @@ ComPtr<IWICBitmap> ReadFrame(Reader& r, IWICImagingFactory* wic) {
     return bmp;
 }
 
-std::atomic<int> g_scrubGen;
-std::atomic<double> g_scrubTo{-1};
-HANDLE g_scrubWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+int g_scrubGen;
+constexpr double kScrubIdle = -1, kScrubStopped = -2;
 
 struct ScrubJob {
+    HWND hwnd;
     std::wstring path;
     UINT w, h;
     int gen;
+    std::atomic<double> to{kScrubIdle};
 };
 
-// Decodes the key frame for the latest g_scrubTo whenever it changes; positions passed while a frame
+std::shared_ptr<ScrubJob> g_scrub;
+
+// Decodes the key frame for the latest drag position whenever it changes; positions passed while a frame
 // decodes are skipped, so the picture never falls behind the mouse.
 DWORD WINAPI ScrubThread(void* p) {
-    std::unique_ptr<ScrubJob> job(static_cast<ScrubJob*>(p));
-    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    std::unique_ptr<std::shared_ptr<ScrubJob>> arg(static_cast<std::shared_ptr<ScrubJob>*>(p));
+    auto job = std::move(*arg);
+    arg.reset();
+    if (job->to == kScrubStopped || FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED))) return 0;
     {
         ComPtr<IWICImagingFactory> wic;
         Reader r;
-        double done = -1;
+        double done = kScrubIdle;
         if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
             OpenReader(job->path, r))
-            while (g_scrubGen == job->gen) {
-                double to = g_scrubTo;
-                if (to < 0 || to == done) {
-                    WaitForSingleObject(g_scrubWake, 200);
+            for (;;) {
+                double to = job->to;
+                if (to == kScrubStopped) break;
+                if (to == done) {
+                    job->to.wait(done);
                     continue;
                 }
                 done = to;
@@ -395,7 +529,7 @@ DWORD WINAPI ScrubThread(void* p) {
                     SUCCEEDED(scaler->Initialize(frame.Get(), job->w, job->h, WICBitmapInterpolationModeLinear)) &&
                     SUCCEEDED(wic->CreateBitmapFromSource(scaler.Get(), WICBitmapCacheOnLoad, &scaled)))
                     frame = scaled;
-                if (frame && g_scrubGen == job->gen) SendMessageW(g_hwnd, WM_FLICK_SCRUB, job->gen, (LPARAM)frame.Get());
+                if (frame && job->to != kScrubStopped) SendMessageW(job->hwnd, WM_FLICK_SCRUB, job->gen, (LPARAM)frame.Get());
             }
     }
     CoUninitialize();
@@ -410,18 +544,29 @@ ComPtr<IWICBitmap> MediaFirstFrame(const std::wstring& path, IWICImagingFactory*
 }
 
 int MediaScrubStart(const std::wstring& path, UINT w, UINT h) {
-    g_scrubTo = -1;
-    auto* job = new ScrubJob{path, w, h, ++g_scrubGen};
-    CloseHandle(CreateThread(nullptr, 0, ScrubThread, job, 0, nullptr));
-    return job->gen;
+    MediaScrubStop();
+    int gen = ++g_scrubGen;
+    auto job = std::make_shared<ScrubJob>(g_hwnd, path, w, h, gen);
+    auto* arg = new std::shared_ptr<ScrubJob>(job);
+    if (HANDLE thread = CreateThread(nullptr, 0, ScrubThread, arg, 0, nullptr)) {
+        g_scrub = std::move(job);
+        CloseHandle(thread);
+        return gen;
+    }
+    delete arg;
+    return 0;
 }
 
 void MediaScrubTo(double seconds) {
-    g_scrubTo = seconds;
-    SetEvent(g_scrubWake);
+    if (!g_scrub || !std::isfinite(seconds) || seconds < 0) return;
+    g_scrub->to = std::max(0.0, seconds);  // keep one representation of zero for atomic wait
+    g_scrub->to.notify_one();
 }
 
 void MediaScrubStop() {
-    g_scrubGen++;
-    SetEvent(g_scrubWake);
+    if (g_scrub) {
+        g_scrub->to = kScrubStopped;
+        g_scrub->to.notify_one();
+        g_scrub.reset();
+    }
 }
