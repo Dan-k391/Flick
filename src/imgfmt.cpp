@@ -565,7 +565,40 @@ ComPtr<IWICBitmapSource> ZipPreview(const std::wstring& path, std::initializer_l
     return nullptr;
 }
 
+// Tag 274 of a TIFF's first IFD (most raw formats are TIFF inside, whatever their first word: "II*", "IIRO", "IIU"...).
+UINT TiffOrient(std::string_view f) {
+    if (f.size() < 8 || (f.compare(0, 2, "II") && f.compare(0, 2, "MM"))) return 1;
+    bool be = f[0] == 'M';
+    auto u16 = [&](size_t i) { return be ? (UINT)(BYTE)f[i] << 8 | (BYTE)f[i + 1] : U16(f, i); };
+    auto u32 = [&](size_t i) { return be ? Be32(f, i) : U32(f, i); };
+    size_t ifd = u32(4);
+    if (ifd > f.size() - 2) return 1;
+    for (size_t i = 0, n = u16(ifd); i < n && i < 1000 && ifd + 2 + (i + 1) * 12 <= f.size(); i++)
+        if (size_t e = ifd + 2 + i * 12; u16(e) == 274) return u16(e + 8) >= 1 && u16(e + 8) <= 8 ? u16(e + 8) : 1;
+    return 1;
+}
+
 }  // namespace
+
+UINT TiffOrientation(const std::wstring& path) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                           OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return 1;
+    // The header, then the first IFD wherever it is (DNG writers often put it at the end), re-based to offset 8.
+    std::string f(8, '\0');
+    DWORD n = 0;
+    ReadFile(h, f.data(), 8, &n, nullptr);
+    LARGE_INTEGER at{};
+    if (n == 8 && (!f.compare(0, 2, "II") || !f.compare(0, 2, "MM"))) {
+        at.QuadPart = f[0] == 'M' ? Be32(f, 4) : U32(f, 4);
+        f.replace(4, 4, f[0] == 'M' ? std::string("\0\0\0\x08", 4) : std::string("\x08\0\0\0", 4));
+        std::string ifd(2 + 1000 * 12, '\0');
+        if (SetFilePointerEx(h, at, nullptr, FILE_BEGIN) && ReadFile(h, ifd.data(), (DWORD)ifd.size(), &n, nullptr))
+            f += ifd.substr(0, n);
+    }
+    CloseHandle(h);
+    return TiffOrient(f);
+}
 
 ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural) {
     IWICImagingFactory* wic = WicFactory();
@@ -661,5 +694,10 @@ std::wstring ImgSelfTest() {
     std::string cur = "\0\0\2\0\xFF\xFF"s + std::string(65535 * 16, '\0');
     for (int i = 0; i < 257; i++) cur[6 + i * 16] = cur[7 + i * 16] = (char)(i == 100 ? 64 : i == 256 ? 128 : 16);
     if (IconPick(cur) != 6 + 100 * 16 || IconPick(cur.substr(0, 5)) || IconPick("\0\0\3\0\1\0"s)) return L"cur pick";
+    // TIFF orientation (tag 274 = 6) little- and big-endian; a cut IFD gives 1.
+    std::string tif = "II*\0\x08\0\0\0\x02\0"s + "\x00\x01\x04\0\1\0\0\0\x10\0\0\0"s + "\x12\x01\x03\0\1\0\0\0\x06\0\0\0"s;
+    std::string mm = "MM\0*\0\0\0\x08\0\x01"s + "\x01\x12\0\x03\0\0\0\x01\0\x03\0\0"s;
+    if (TiffOrient(tif) != 6 || TiffOrient(mm) != 3 || TiffOrient(tif.substr(0, 30)) != 1 || TiffOrient("II*\0\xFF\xFF\xFF\xFF\0\0"s) != 1)
+        return L"tiff orientation";
     return L"";
 }

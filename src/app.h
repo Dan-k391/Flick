@@ -254,6 +254,7 @@ std::wstring FileInfoSelfTest();  // "" = ok
 extern const wchar_t kImgOwnExt[];
 Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural);
 std::wstring ImgSelfTest();  // "" = ok
+UINT TiffOrientation(const std::wstring& path);  // EXIF-style 1-8 from a TIFF-based file's first IFD (camera raw); 1 if none
 
 // ---- convert.cpp: other formats as Markdown text ("" if not parseable)
 std::wstring NotebookToMarkdown(const std::wstring& json);

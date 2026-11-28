@@ -17,7 +17,7 @@ Arrows move between files, Space/Esc closes.
 | Code and text | 100+ languages with syntax colours (C/C++, C#, Java, JS/TS, Python, Go, Rust, JSON, XML, HTML, CSS, YAML, shell, SQL, …); any other text file as plain text |
 | Markdown | `.md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd`, Jupyter `.ipynb`, AsciiDoc `.adoc .asciidoc`, reStructuredText `.rst .rest` |
 | Images | `.jpg .jpeg .jpe .jfif .png .gif .bmp .dib .tif .tiff .ico .cur .ani .webp .jxr .wdp .dds .svg .svgz .emf .wmf .tga .qoi .pbm .pgm .ppm .pnm .pam .hdr .pcx`; `.heic .heif .avif .jxl` with the codecs from the Microsoft Store |
-| Camera RAW | `.dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .raf .orf .rw2 .pef .srw .raw .rwl .erf .kdc .dcr .mrw .x3f .3fr .mef .mos .iiq` (the embedded preview; needs the Raw Image Extension from the Microsoft Store) |
+| Camera RAW | `.dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .raf .orf .rw2 .pef .srw .rwl .erf .kdc .dcr .mrw .x3f .3fr .mef .mos .iiq` (the embedded preview, else file details; needs the Raw Image Extension from the Microsoft Store) |
 | Design files | the saved preview of `.sketch .xmind .kra .ora` |
 | PDF | `.pdf` |
 | Word | `.docx .docm .dotx .dotm`; text only: `.doc .dot .odt .ott` |

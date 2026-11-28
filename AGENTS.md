@@ -101,7 +101,9 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   first; seek-bar drags show key frames from another reader. `MFShutdown` per preview made memory worse.
 - Subtitles: the engine doesn't draw them in frame-server mode → parsed and drawn by us (`.lrc` beside audio too).
 - Camera RAW: WIC's own DNG decoder shows only the small first IFD → the Raw codec by container GUID, showing
-  `GetPreview` (0.6 ms); `GetFrame` demosaics (24 MP ~440 ms), so the sensor size stays unknown.
+  `GetPreview` (0.6 ms) turned by the TIFF orientation tag; `GetFrame` demosaics (24 MP ~440 ms): no preview, info card.
+- EMF/WMF: one GDI record can take minutes (a pen 2e9 wide) → pens/fonts clamped in a copy, played record by record
+  for at most 150 ms onto a canvas no larger than the window.
 - Certificates: `CryptQueryObject` with every format took ~5 ms → PEM to DER by hand, then a certificate or PKCS #7.
 
 **Office**
@@ -131,5 +133,5 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 ## Not done
 PDF text selection/zoom/find; selection across slides, Shift+click; charts/SmartArt (placeholder box); docx
 headers/footers/footnotes/columns; doc/ppt/odt/odp as pages; xlsb; ods/xls formatting; Markdown links/find;
-HTML; PSD/EPUB/3D; mail; APNG/animated WebP/ANI; RAW beyond its embedded preview; pfx contents (password);
+HTML; PSD/EPUB/3D; mail; APNG/animated WebP/ANI; RAW without an embedded preview (or past its size); pfx contents (password);
 embedded subtitle tracks; multi-selection.

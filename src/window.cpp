@@ -357,7 +357,7 @@ bool LoadGif(IWICBitmapDecoder* dec, UINT frames) {
     return true;
 }
 
-constexpr wchar_t kRawExt[] = L" .dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .raf .orf .rw2 .pef .srw .raw .rwl .erf "
+constexpr wchar_t kRawExt[] = L" .dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .raf .orf .rw2 .pef .srw .rwl .erf "
                                L".kdc .dcr .mrw .x3f .3fr .mef .mos .iiq ";
 
 bool LoadImage(const std::wstring& path) {
@@ -381,28 +381,28 @@ bool LoadImage(const std::wstring& path) {
         g_natW = natural.width ? natural.width : w, g_natH = natural.width ? natural.height : h;
         if (natural.width) label = std::to_wstring(std::lround(g_natW)) + L" × " + std::to_wstring(std::lround(g_natH));
     } else {
-        // Camera raw: the Store codec's decoder by name (for .dng WIC picks its own DNG decoder, which shows only the
-        // small first IFD), and its embedded preview (a JPEG, often full size): demosaicing 24 MP takes ~450 ms.
-        bool raw = HasExt(path, kRawExt);
-        ComPtr<IWICStream> st;
-        if (raw && (FAILED(g_wic->CreateStream(&st)) || FAILED(st->InitializeFromFilename(path.c_str(), GENERIC_READ)) ||
-                    FAILED(g_wic->CreateDecoder(GUID_ContainerFormatRaw, nullptr, &dec)) ||
-                    FAILED(dec->Initialize(st.Get(), WICDecodeMetadataCacheOnDemand))))
-            dec.Reset();  // no codec: WIC's own choice (DNG) or nothing
-        if (!dec && FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                            WICDecodeMetadataCacheOnDemand, &dec)))
-            return false;
-        if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
-            SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
-            return true;
+        // Camera raw: only the embedded preview (often a full-size JPEG) of the Store codec's decoder, created by name
+        // (for .dng WIC picks its own decoder, which shows the small first IFD). Without a codec or a preview of 256+ px:
+        // the info card (its shell thumbnail is async); demosaicing here would hold the UI thread ~450 ms for 24 MP.
         ComPtr<IWICMetadataQueryReader> meta;
-        if (raw && container == GUID_ContainerFormatRaw && SUCCEEDED(dec->GetPreview(&pic)) && SUCCEEDED(pic->GetSize(&w, &h))) {
+        if (HasExt(path, kRawExt)) {
+            ComPtr<IWICStream> st;
+            if (FAILED(g_wic->CreateStream(&st)) || FAILED(st->InitializeFromFilename(path.c_str(), GENERIC_READ)) ||
+                FAILED(g_wic->CreateDecoder(GUID_ContainerFormatRaw, nullptr, &dec)) ||
+                FAILED(dec->Initialize(st.Get(), WICDecodeMetadataCacheOnDemand)) || FAILED(dec->GetPreview(&pic)) ||
+                FAILED(pic->GetSize(&w, &h)) || std::max(w, h) < 256)
+                return false;
             label = L" · embedded preview";  // the sensor's size would need the full decode
-            if (FAILED(dec->GetMetadataQueryReader(&meta)) && SUCCEEDED(pic.As(&frame))) frame->GetMetadataQueryReader(&meta);
-        } else if (pic.Reset(); SUCCEEDED(dec->GetFrame(0, &frame)))
+            g_orient = TiffOrientation(path);  // the codec gives no metadata without that decode either
+        } else {
+            if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)))
+                return false;
+            if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
+                SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
+                return true;
+            if (FAILED(dec->GetFrame(0, &frame))) return false;
             frame->GetSize(&w, &h), frame->GetMetadataQueryReader(&meta), pic = frame;
-        else
-            return false;
+        }
         PROPVARIANT pv;
         PropVariantInit(&pv);
         if (meta && SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &pv)) && pv.vt == VT_UI2 && pv.uiVal <= 8)
