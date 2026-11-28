@@ -243,8 +243,9 @@ float FontPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const
 Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, IWICImagingFactory*,
                                              UINT& w, UINT& h);
 
-// ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...) and installers (msi)
-std::vector<std::wstring> ProgramInfo(const std::wstring& path);
+// ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...), installers (msi) and certificates (cer, pem,
+// p7b, ...: none for a file that isn't one or holds a private key); sniff: also ELF/Mach-O by their first bytes
+std::vector<std::wstring> ProgramInfo(const std::wstring& path, bool sniff);
 
 // ---- convert.cpp: other formats as Markdown text ("" if not parseable)
 std::wstring NotebookToMarkdown(const std::wstring& json);

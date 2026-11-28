@@ -1063,7 +1063,8 @@ void OnInfo(InfoJob* job) {
     delete job;
 }
 
-void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LONGLONG t0) {
+// extra: the lines ProgramInfo gives, when the caller has them already
+void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LONGLONG t0, std::vector<std::wstring>* extra = nullptr) {
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
     auto* job = new InfoJob{path, (int)(kThumb * g_dpi / 96), ++g_infoGen, t0};
     job->items = dir ? 0 : -1;
@@ -1082,8 +1083,8 @@ void LoadInfo(const std::wstring& path, const WIN32_FILE_ATTRIBUTE_DATA& fa, LON
     }
     g_info.push_back(L"Modified " + FormatTime(fa.ftLastWriteTime));
     if (!dir) {  // programs: description, publisher, version, architecture after the type name
-        auto extra = ProgramInfo(path);
-        g_info.insert(g_info.begin() + 1, extra.begin(), extra.end());
+        auto lines = extra ? std::move(*extra) : ProgramInfo(path, g_kind == K_Info);  // not audio
+        g_info.insert(g_info.begin() + 1, lines.begin(), lines.end());
     }
 }
 
@@ -1395,6 +1396,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     WIN32_FILE_ATTRIBUTE_DATA fa{};
     GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fa);
     bool dir = fa.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
+    std::vector<std::wstring> cert;
     if (dir) g_kind = K_Grid, LoadTree(path, true);  // empty or unreadable: info card (ShowInfo)
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
@@ -1417,6 +1419,8 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
                                   L".wdp .dds ") &&
              LoadImage(path)) g_kind = K_Image;
+    else if (HasExt(path, L" .cer .crt .der .pem .p7b .p7c .p7s ") && !(cert = ProgramInfo(path, false)).empty())
+        g_kind = K_Info, LoadInfo(path, fa, t0, &cert);  // a certificate; anything else (a key) as text
     else if (LoadText(path)) g_kind = K_Text;
     else g_kind = K_Info, LoadInfo(path, fa, t0);
 
