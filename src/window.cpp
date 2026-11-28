@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -190,6 +191,10 @@ float g_zoom = 1, g_panX, g_panY;  // pan: offset of the picture's centre from t
 bool g_panDrag;
 POINT g_panAt;
 std::atomic<UINT> g_imageGen;
+bool g_imagePending, g_imagePendingResized, g_imagePlaceholderSized, g_imagePlaceholderDrawn;
+bool g_imageSizingChanged;  // an intermediate size invalidated refinement, even if the final size is unchanged
+LONGLONG g_imageT0;
+bool QueueImage(double scale, double maxW = 0, double maxH = 0);
 
 // Animated GIF: frames are composed onto a canvas (GIF disposal rules) on a timer.
 struct Gif {
@@ -392,10 +397,45 @@ struct ImageFrame {
     bool embedded = false, reduced = false;
 };
 
+ComPtr<IWICBitmap> NativeReduced(IWICImagingFactory* wic, IWICBitmapSourceTransform* xf, UINT w, UINT h, bool worker) {
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
+    if (FAILED(xf->GetClosestPixelFormat(&fmt))) return nullptr;
+    ComPtr<IWICBitmap> bmp;
+    if (worker) {
+        // IWICBitmapLock::GetDataPointer is unavailable in the MTA. Decode directly into a bounded
+        // buffer, then let WIC copy those reduced pixels into its own bitmap.
+        ComPtr<IWICComponentInfo> info;
+        ComPtr<IWICPixelFormatInfo> pixels;
+        UINT bpp = 0;
+        if (FAILED(wic->CreateComponentInfo(fmt, &info)) || FAILED(info.As(&pixels)) ||
+            FAILED(pixels->GetBitsPerPixel(&bpp)) || !bpp)
+            return nullptr;
+        UINT64 stride = ((UINT64)w * bpp + 31) / 32 * 4;
+        constexpr UINT kMaxScratch = 64 << 20;
+        if (!h || !stride || stride > kMaxScratch / h) return nullptr;
+        UINT widthBytes = (UINT)stride, size = widthBytes * h;
+        std::unique_ptr<BYTE[]> buffer(new (std::nothrow) BYTE[size]);
+        if (!buffer || FAILED(xf->CopyPixels(nullptr, w, h, &fmt, WICBitmapTransformRotate0, widthBytes, size, buffer.get())) ||
+            FAILED(wic->CreateBitmapFromMemory(w, h, fmt, widthBytes, size, buffer.get(), &bmp)))
+            return nullptr;
+    } else {
+        ComPtr<IWICBitmapLock> lock;
+        UINT stride = 0, size = 0;
+        BYTE* px = nullptr;
+        WICRect all{0, 0, (INT)w, (INT)h};
+        if (FAILED(wic->CreateBitmap(w, h, fmt, WICBitmapCacheOnLoad, &bmp)) ||
+            FAILED(bmp->Lock(&all, WICBitmapLockWrite, &lock)) || FAILED(lock->GetStride(&stride)) ||
+            FAILED(lock->GetDataPointer(&size, &px)) ||
+            FAILED(xf->CopyPixels(nullptr, w, h, &fmt, WICBitmapTransformRotate0, stride, size, px)))
+            return nullptr;
+    }
+    return bmp;
+}
+
 // Opening uses the monitor area and may start a GIF on the UI thread. Refinement supplies a scale
 // and returns only a fully decoded bitmap and its metadata, with no window or D2D calls.
 bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW, double maxH,
-                  double requestedScale, ImageFrame& image) {
+                  double requestedScale, ImageFrame& image, const std::atomic<UINT>* gen = nullptr, UINT mine = 0) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
     ComPtr<IWICBitmapSource> pic;
@@ -404,7 +444,7 @@ bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW
     UINT& w = image.w;
     UINT& h = image.h;
     if (HasExt(path, kImgOwnExt)) {  // imgfmt.cpp: decoded whole, scaled below like the rest
-        pic = ImgLoad(path, wic);
+        pic = ImgLoad(path, wic, gen, mine);
         if (!pic || FAILED(pic->GetSize(&w, &h))) return false;
     } else {
         // Camera raw: only the embedded preview (often a full-size JPEG) of the Store codec's decoder, created by name
@@ -423,7 +463,7 @@ bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW
         } else {
             if (FAILED(wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &dec)))
                 return false;
-            if (requestedScale == 0 && SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
+            if (!gen && requestedScale == 0 && SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
                 SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
                 return true;
             if (FAILED(dec->GetFrame(0, &frame))) return false;
@@ -437,7 +477,7 @@ bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW
         PropVariantClear(&pv);
     }
 
-    if (!w || !h) return false;
+    if (!w || !h || (gen && *gen != mine)) return false;
     if (image.orient >= 5) std::swap(maxW, maxH);
     double s = requestedScale > 0 ? std::min(1.0, requestedScale) : std::min({1.0, maxW / w, maxH / h});
     image.reduced = s < 1;
@@ -450,31 +490,21 @@ bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW
         if (SUCCEEDED(pic.As(&xf))) {
             UINT cw = w, ch = h;
             for (UINT d = 2; d <= 8; d *= 2) {
-                UINT tw = (w + d - 1) / d, th = (h + d - 1) / d;
+                UINT tw = (w - 1) / d + 1, th = (h - 1) / d + 1;
                 if (tw < sw || th < sh) break;
                 UINT qw = tw, qh = th;
                 if (SUCCEEDED(xf->GetClosestSize(&qw, &qh)) && qw == tw && qh == th) cw = tw, ch = th;
             }
-            WICPixelFormatGUID fmt = GUID_WICPixelFormat32bppBGRA;
-            ComPtr<IWICBitmap> reduced;
-            ComPtr<IWICBitmapLock> lock;
-            UINT stride = 0, size = 0;
-            BYTE* px = nullptr;
-            WICRect all{0, 0, (INT)cw, (INT)ch};
-            if (cw < w && SUCCEEDED(xf->GetClosestPixelFormat(&fmt)) &&
-                SUCCEEDED(wic->CreateBitmap(cw, ch, fmt, WICBitmapCacheOnLoad, &reduced)) &&
-                SUCCEEDED(reduced->Lock(&all, WICBitmapLockWrite, &lock)) && SUCCEEDED(lock->GetStride(&stride)) &&
-                SUCCEEDED(lock->GetDataPointer(&size, &px)) &&
-                SUCCEEDED(xf->CopyPixels(nullptr, cw, ch, &fmt, WICBitmapTransformRotate0, stride, size, px))) {
-                lock.Reset();
-                src = reduced;
+            if (cw < w || ch < h) {
+                if (auto reduced = NativeReduced(wic, xf.Get(), cw, ch, gen != nullptr)) src = reduced;
+                else if (gen) return false;  // keep the displayed bitmap rather than decoding full size on failure
             }
         }
         // Under 2x left to go, Direct2D's bilinear filter at draw time looks fine and costs less.
         UINT rw, rh;
         if (FAILED(src->GetSize(&rw, &rh))) return false;
         ComPtr<IWICBitmapScaler> scaler;
-        if (rw > 2 * sw && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
+        if (((UINT64)rw > 2ull * sw || (UINT64)rh > 2ull * sh) && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
             SUCCEEDED(scaler->Initialize(src.Get(), sw, sh, WICBitmapInterpolationModeFant)))
             src = scaler;
     }
@@ -748,6 +778,7 @@ LRESULT OnPdf(PdfMsg& m) {
 
 bool TryFrame(const MediaState&);
 bool Pending() {
+    if (g_kind == K_Image) return g_imagePending;
     if (g_kind == K_Media && g_mediaVideo && !g_frame && !g_posterDone) {
         MediaState s = MediaGet();
         if (!s.error && !TryFrame(s)) return true;
@@ -834,6 +865,7 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
 // centred on the screen; while open (arrowing through files) it is resized around its centre, or kept
 // against a screen edge it sits near (10% zones). Sizes are not remembered.
 void PlaceWindow() {
+    if (g_imagePending) g_imagePlaceholderSized = true;
     MONITORINFO mi{sizeof mi};
     GetMonitorInfoW(MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST), &mi);
     RECT wa = mi.rcWork, wr, cr;
@@ -1462,6 +1494,7 @@ void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBru
 void ClearContent() {
     ++g_infoGen;
     if (g_kind == K_Image) ++g_imageGen;
+    g_imagePending = g_imagePendingResized = g_imagePlaceholderSized = g_imagePlaceholderDrawn = g_imageSizingChanged = false;
     if (g_copyTooLarge) CopyFeedback(false);
     g_bmp.Reset();
     g_info.clear();
@@ -1498,6 +1531,16 @@ void ShowInfo() {
     g_sub.clear();
     g_kind = K_Info;
     LoadInfo(g_path, fa, Now());
+}
+
+void LoadLargeRaster(LONGLONG t0) {
+    double w, h;
+    PictureArea(w, h);
+    g_kind = K_Image;
+    g_imagePending = true;
+    g_imageT0 = t0;
+    g_sub = L"Loading image…";
+    if (!QueueImage(0, w, h)) ShowInfo();
 }
 
 // Button label for a file: 0.5-2.5 ms of registry lookups, so the open path uses the remembered one.
@@ -1543,6 +1586,9 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
                           L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "
                           L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadTree(path, false);
+    // Direct decoders do per-pixel CPU work. Keep small images and the system codecs on their usual open path.
+    else if ((fa.nFileSizeHigh || fa.nFileSizeLow >= (128 << 10)) &&
+             HasExt(path, L" .tga .qoi .pbm .pgm .ppm .pnm .pam .hdr .pcx ")) LoadLargeRaster(t0);
     else if ((HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
                            L".wdp .dds .jxl ") || HasExt(path, kRawExt) || HasExt(path, kImgOwnExt)) &&
              LoadImage(path)) g_kind = K_Image;
@@ -1620,7 +1666,7 @@ void ZoomAt(float mx, float my, float factor) {
 
 struct ImageJob {
     std::wstring path;
-    double scale;
+    double scale, maxW, maxH;  // scale 0: initial fit to the monitor
     UINT gen;
 };
 
@@ -1638,18 +1684,20 @@ DWORD WINAPI ImageThread(void*) {
         if (!job) g_imageWorker = false;
         ReleaseSRWLockExclusive(&g_imageLock);
         if (!job) break;
+        if (job->gen != g_imageGen) continue;
         ImageFrame image;
-        if (wic && job->gen == g_imageGen && DecodeRaster(job->path, wic.Get(), 0, 0, job->scale, image) &&
-            job->gen == g_imageGen)
-            SendMessageW(g_hwnd, WM_FLICK_IMAGE, job->gen, (LPARAM)&image);
+        bool ok = wic && DecodeRaster(job->path, wic.Get(), job->maxW, job->maxH, job->scale, image, &g_imageGen, job->gen);
+        // An initial job also replies on failure, so the first-content wait can finish immediately.
+        if (job->gen == g_imageGen && (ok || job->scale == 0))
+            SendMessageW(g_hwnd, WM_FLICK_IMAGE, job->gen, ok ? (LPARAM)&image : 0);
     }
     wic.Reset();
     if (SUCCEEDED(com)) CoUninitialize();
     return 0;
 }
 
-void QueueImage(double scale) {
-    auto* job = new ImageJob{g_path, scale, ++g_imageGen};
+bool QueueImage(double scale, double maxW, double maxH) {
+    auto* job = new ImageJob{g_path, scale, maxW, maxH, ++g_imageGen};
     AcquireSRWLockExclusive(&g_imageLock);
     delete std::exchange(g_imageWanted, job);  // keep only the latest request that has not started
     if (!g_imageWorker) {
@@ -1658,12 +1706,16 @@ void QueueImage(double scale) {
             CloseHandle(thread);
         } else delete std::exchange(g_imageWanted, nullptr);
     }
+    bool queued = g_imageWorker;
     ReleaseSRWLockExclusive(&g_imageLock);
+    return queued;
 }
 
-void RefineImage(bool resized = false) {
+void RefineImage(bool resized = false, bool invalidated = false) {
     KillTimer(g_hwnd, kZoomTimer);
-    if (g_kind != K_Image || !g_bmp || !g_imgReduced || g_gif.dec) return;
+    if (g_kind != K_Image || !g_bmp || (g_sizing && g_imageSizingChanged)) return;
+    if (resized) ClampPan();
+    if (!g_imgReduced || g_gif.dec) return;
     if (HasExt(g_path, L" .svg .svgz ")) {
         if (resized && LoadSvg(g_path, true)) ClampPan();
         return;
@@ -1671,7 +1723,40 @@ void RefineImage(bool resized = false) {
     D2D1_SIZE_U pixels = g_bmp->GetPixelSize();
     double have = (g_orient >= 5 ? pixels.height : pixels.width) / (double)g_natW;
     double need = std::min(1.0, FitSize(ImageArea()).width * g_zoom * g_dpi / 96.0 / g_natW);
-    if (need > 0 && (need > have * 1.1 || (resized && need < have * 0.6))) QueueImage(need);
+    if (need > 0 && (need > have * 1.1 || ((resized || invalidated) && need < have * 0.6))) QueueImage(need);
+}
+
+void ImageGeometryChanged() {
+    if (g_kind != K_Image || !g_visible || g_placing) return;
+    if (g_sizing) g_imageSizingChanged = true;
+    if (g_imagePending) {
+        g_imagePendingResized = true;
+        return;
+    }
+    ++g_imageGen;
+    if (!g_sizing) RefineImage(true);
+}
+
+void OnImage(UINT gen, const ImageFrame* image) {
+    if (gen != g_imageGen || g_kind != K_Image) return;
+    if (std::exchange(g_imagePending, false)) {
+        bool resized = std::exchange(g_imagePendingResized, false);
+        bool placeholderSized = std::exchange(g_imagePlaceholderSized, false);
+        if (image && ShowRaster(*image)) {
+            Log(L"image pixels ready %.2f ms after key press", MsSince(g_imageT0));
+            if (placeholderSized) {
+                if (resized || g_sizing) RefineImage(resized);
+                else PlaceWindow();
+            }
+        } else {
+            ShowInfo();
+            if (placeholderSized) PlaceWindow();
+        }
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    } else if (g_visible && image && ShowRaster(*image)) {
+        ClampPan();
+        InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
 }
 
 void DrawImage(const D2D1_RECT_F& area) {
@@ -1981,7 +2066,10 @@ void Paint() {
     g_rt->DrawTextLayout({kPad, 0}, tl.Get(), text.Get());
 
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
-    if (g_kind == K_Image && g_bmp) DrawImage({0, kTitleH, sz.width, sz.height});
+    if (g_kind == K_Image) {
+        g_imagePlaceholderDrawn = g_imagePending && !g_bmp;
+        if (g_bmp) DrawImage({0, kTitleH, sz.width, sz.height});
+    }
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
     if (g_kind == K_Media) {
         MediaState ms = MediaGet();
@@ -2266,26 +2354,39 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_ERASEBKGND:
             return 1;
-        case WM_SIZE:
-            if (g_sizing && g_kind == K_Image) ++g_imageGen;
-            if (g_hwndRt) g_hwndRt->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+        case WM_SIZE: {
+            auto size = D2D1::SizeU(LOWORD(l), HIWORD(l));
+            if (g_hwndRt) {
+                auto prior = g_hwndRt->GetPixelSize();
+                if (size.width != prior.width || size.height != prior.height) {
+                    g_hwndRt->Resize(size);
+                    if (size.width && size.height) ImageGeometryChanged();
+                }
+            }
             Layout();
             InvalidateRect(h, nullptr, FALSE);
             return 0;
+        }
         case WM_DPICHANGED: {
+            UINT priorDpi = g_dpi;
             g_dpi = HIWORD(w);
             if (g_rt) g_rt->SetDpi((float)g_dpi, (float)g_dpi);
             if (!g_placing) {  // PreviewShow sizes for the target monitor itself
-                if (g_kind == K_Image) ++g_imageGen;
+                RECT before, after;
+                GetClientRect(h, &before);
                 auto* r = reinterpret_cast<RECT*>(l);
+                g_placing = true;  // handle the DPI and any nested WM_SIZE as one geometry change
                 SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
                              SWP_NOZORDER | SWP_NOACTIVATE);
-                if (g_visible && !g_sizing && g_kind == K_Image) RefineImage(true);
+                g_placing = false;
+                GetClientRect(h, &after);
+                if (g_dpi != priorDpi || before.right != after.right || before.bottom != after.bottom) ImageGeometryChanged();
             }
             return 0;
         }
         case WM_ENTERSIZEMOVE:
             g_sizing = true;
+            g_imageSizingChanged = false;
             GetClientRect(h, &g_sizingClient);
             g_sizingDpi = g_dpi;
             return 0;
@@ -2294,8 +2395,9 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             GetClientRect(h, &client);
             bool resized = g_sizing && (client.right != g_sizingClient.right || client.bottom != g_sizingClient.bottom ||
                                         g_dpi != g_sizingDpi);
+            bool invalidated = std::exchange(g_imageSizingChanged, false);
             g_sizing = false;
-            if (resized && g_kind == K_Image) RefineImage(true);
+            if ((resized || invalidated) && g_kind == K_Image) RefineImage(resized, invalidated);
             InvalidateRect(h, nullptr, FALSE);  // PDF: re-render pages at the final width
             return 0;
         }
@@ -2563,11 +2665,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
             return 0;
         case WM_FLICK_IMAGE:
-            if ((UINT)w == g_imageGen && g_kind == K_Image && g_visible &&
-                ShowRaster(*reinterpret_cast<ImageFrame*>(l))) {
-                ClampPan();
-                InvalidateRect(h, nullptr, FALSE);
-            }
+            OnImage((UINT)w, reinterpret_cast<ImageFrame*>(l));
             return 0;
         case WM_FLICK_PLAYVIDEO:
             if ((int)w == g_posterGen && g_kind == K_Media && g_mediaVideo) {
@@ -2784,12 +2882,14 @@ Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
     g_opening = false;
     g_canFind = g_kind == K_Text;
     t.ready = MsSince(request.pressed);
+    bool imagePlaceholder = g_imagePlaceholderDrawn;
     DwmFlush();  // returns after DWM composed the frame containing our window
     t.composed = MsSince(request.pressed);
     // Scintilla skips scrollbar updates while hidden (text loads hidden): a changed scroll width makes it set
     // them. ~2.5 ms on a visible Scintilla, so after the frame: until then the bars may be the last file's.
     if (sptr_t sw = Sci(SCI_GETSCROLLWIDTH); g_kind == K_Text) Sci(SCI_SETSCROLLWIDTH, sw + 1), Sci(SCI_SETSCROLLWIDTH, sw);
-    t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
+    t.kind = imagePlaceholder ? L"image-wait" : g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image"
+             : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
              : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Word ? L"word" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
         t.ready, t.composed, request.path.c_str());

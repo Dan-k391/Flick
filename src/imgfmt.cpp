@@ -18,15 +18,23 @@ namespace {
 
 constexpr UINT kMaxSide = 30000;
 constexpr UINT64 kMaxPixels = 64 << 20;  // as the GIF canvas: 256 MB of pixels
+constexpr size_t kCancelPixels = 16 << 10;
+
+struct DecodeCancel {
+    const std::atomic<UINT>* gen = nullptr;
+    UINT mine = 0;
+    bool operator()() const { return gen && gen->load(std::memory_order_relaxed) != mine; }
+};
 
 struct Img {
     UINT w = 0, h = 0;
     std::vector<BYTE> px;  // BGRA, straight alpha (premultiplied by ToWic)
+    DecodeCancel cancelled;
     // most: the pixels the rest of the file could encode at the format's best ratio; more is a header asking for memory
     // its data can't fill (21 bytes asked for 540 MB). Uncompressed data may be cut to a quarter and still show its top
     // (exactly, a cut PPM fell to the text view: 360 ms): at most 16 bytes allocated per byte of file.
     bool Init(UINT64 W, UINT64 H, UINT64 most) {
-        if (!W || !H || W > kMaxSide || H > kMaxSide || W * H > std::min(kMaxPixels, most)) return false;
+        if (!W || !H || W > kMaxSide || H > kMaxSide || W * H > std::min(kMaxPixels, most) || cancelled()) return false;
         w = (UINT)W, h = (UINT)H;
         px.assign((size_t)W * H * 4, 0);
         return true;
@@ -36,9 +44,13 @@ struct Img {
         p[0] = b, p[1] = g, p[2] = r, p[3] = a;
     }
     void OpaqueIfNoAlpha() {  // 32-bit files written with an empty alpha channel
+        constexpr size_t span = kCancelPixels * 4;
         for (size_t i = 3; i < px.size(); i += 4)
-            if (px[i]) return;
-        for (size_t i = 3; i < px.size(); i += 4) px[i] = 255;
+            if (px[i] || (i % span == 3 && cancelled())) return;
+        for (size_t i = 3; i < px.size(); i += 4) {
+            if (i % span == 3 && cancelled()) return;
+            px[i] = 255;
+        }
     }
 };
 
@@ -97,7 +109,12 @@ bool Tga(std::string_view f, Img& im) {
         i++;
     };
     const BYTE* d = (const BYTE*)f.data();
+    UINT64 nextCheck = 0;
     while (i < total && pos < f.size()) {
+        if (i >= nextCheck) {
+            if (im.cancelled()) return false;
+            nextCheck = i + kCancelPixels;
+        }
         UINT64 count = 1;
         bool run = false;
         if (rle) count = (d[pos] & 127) + 1, run = d[pos] & 128, pos++;
@@ -124,6 +141,7 @@ bool Qoi(std::string_view f, Img& im) {
     size_t pos = 14, end = f.size();
     UINT run = 0;
     for (UINT64 i = 0, total = (UINT64)im.w * im.h; i < total; i++) {
+        if (i % kCancelPixels == 0 && im.cancelled()) return false;
         if (run) run--;
         else {
             if (pos >= end) break;
@@ -153,13 +171,18 @@ bool Pnm(std::string_view f, Img& im) {
     int kind = f[1] - '0';
     size_t pos = 2;
     auto space = [&] {
-        while (pos < f.size())
-            if (f[pos] == '#') while (pos < f.size() && f[pos] != '\n') pos++;
-            else if (strchr(" \t\r\n\v\f", f[pos])) pos++;
+        while (pos < f.size()) {
+            if (pos % kCancelPixels == 0 && im.cancelled()) return false;
+            if (f[pos] == '#') {
+                size_t end = f.find('\n', pos);
+                pos = end == f.npos ? f.size() : end;
+            } else if (strchr(" \t\r\n\v\f", f[pos])) pos++;
             else break;
+        }
+        return true;
     };
     auto number = [&](UINT64& v) {
-        space();
+        if (!space()) return false;
         if (pos >= f.size() || f[pos] < '0' || f[pos] > '9') return false;
         for (v = 0; pos < f.size() && f[pos] >= '0' && f[pos] <= '9'; pos++)
             if ((v = v * 10 + (f[pos] - '0')) > 1u << 30) return false;
@@ -169,7 +192,7 @@ bool Pnm(std::string_view f, Img& im) {
     if (kind == 7) {  // "WIDTH 4\nHEIGHT 2\nDEPTH 3\nMAXVAL 255\nTUPLTYPE RGB\nENDHDR\n"
         depth = 0;
         for (;;) {
-            space();
+            if (!space() || im.cancelled()) return false;
             size_t e = pos;
             while (e < f.size() && !strchr(" \t\r\n", f[e])) e++;
             std::string_view key = f.substr(pos, e - pos);
@@ -178,7 +201,10 @@ bool Pnm(std::string_view f, Img& im) {
             if (key == "ENDHDR") break;
             UINT64* v = key == "WIDTH" ? &w : key == "HEIGHT" ? &h : key == "DEPTH" ? &depth : key == "MAXVAL" ? &maxval : nullptr;
             if (v && !number(*v)) return false;
-            if (!v) while (pos < f.size() && f[pos] != '\n') pos++;  // TUPLTYPE and others
+            if (!v) {
+                size_t end = f.find('\n', pos);  // TUPLTYPE and others
+                pos = end == f.npos ? f.size() : end;
+            }
         }
         if (depth < 1 || depth > 4) return false;
     } else if (!number(w) || !number(h) || (kind != 1 && kind != 4 && !number(maxval)))
@@ -192,7 +218,7 @@ bool Pnm(std::string_view f, Img& im) {
     UINT ch = (UINT)depth;
     auto sample = [&](UINT64& v) {  // false at the end of the data
         if (kind == 1) {  // digits need no separators
-            space();
+            if (!space()) return false;
             if (pos >= f.size() || (f[pos] != '0' && f[pos] != '1')) return false;
             v = f[pos++] == '1';
             return true;
@@ -205,6 +231,7 @@ bool Pnm(std::string_view f, Img& im) {
         return true;
     };
     for (UINT y = 0; y < im.h; y++) {
+        if (im.cancelled()) return false;
         if (kind == 4) {  // packed rows, 1 = black
             size_t row = ((size_t)im.w + 7) / 8;
             for (UINT x = 0; x < im.w && pos + x / 8 < f.size(); x++) {
@@ -255,6 +282,7 @@ bool Hdr(std::string_view f, Img& im) {
     bool made[256] = {};
     const BYTE* d = (const BYTE*)f.data();
     for (UINT y = 0; y < h && pos < f.size(); y++) {
+        if (im.cancelled()) return false;
         bool rle = w >= 8 && w < 32768 && pos + 4 <= f.size() && d[pos] == 2 && d[pos + 1] == 2 && !(d[pos + 2] & 0x80);
         if (rle) {
             if ((UINT)(d[pos + 2] << 8 | d[pos + 3]) != w) break;
@@ -320,6 +348,7 @@ bool Pcx(std::string_view f, Img& im) {
     UINT run = 0;
     BYTE value = 0;
     for (UINT y = 0; y < h; y++) {
+        if (im.cancelled()) return false;
         size_t k = 0;
         for (; k < line.size(); k++) {
             if (!run) {
@@ -355,30 +384,44 @@ bool Decode(std::string_view f, const std::wstring& ext, Img& im) {
     bool ok = ext == L".tga" ? Tga(f, im) : ext == L".qoi" ? Qoi(f, im) : ext == L".hdr" ? Hdr(f, im)
             : ext == L".pcx" ? Pcx(f, im) : Pnm(f, im);
     // A header and no pixels (all transparent black): not a picture to show; the next loader in line tries.
-    return ok && std::any_of(im.px.begin(), im.px.end(), [](BYTE b) { return b != 0; });
+    return ok && !im.cancelled() && std::any_of(im.px.begin(), im.px.end(), [](BYTE b) { return b != 0; });
 }
 
 ComPtr<IWICBitmap> ToWic(Img& im, IWICImagingFactory* wic) {
-    for (size_t i = 0; i < im.px.size(); i += 4)
+    for (size_t i = 0; i < im.px.size(); i += 4) {
+        if (i % (kCancelPixels * 4) == 0 && im.cancelled()) return nullptr;
         if (BYTE a = im.px[i + 3]; a < 255)
             for (int c = 0; c < 3; c++) im.px[i + c] = (BYTE)(im.px[i + c] * a / 255);
+    }
+    if (im.cancelled()) return nullptr;
     ComPtr<IWICBitmap> b;
     wic->CreateBitmapFromMemory(im.w, im.h, GUID_WICPixelFormat32bppPBGRA, im.w * 4, (UINT)im.px.size(), im.px.data(), &b);
     return b;
 }
 
-bool ReadAll(const std::wstring& path, std::string& out) {
+bool ReadAll(const std::wstring& path, std::string& out, DecodeCancel cancelled) {
+    if (cancelled()) return false;
     HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (f == INVALID_HANDLE_VALUE) return false;
     LARGE_INTEGER size{};
-    GetFileSizeEx(f, &size);
+    if (!GetFileSizeEx(f, &size) || cancelled()) {
+        CloseHandle(f);
+        return false;
+    }
     out.resize((size_t)std::min<LONGLONG>(size.QuadPart, 320 << 20));  // > 64 MP of 32-bit pixels + headers
     DWORD read = 0;
-    BOOL ok = ReadFile(f, out.data(), (DWORD)out.size(), &read, nullptr);
+    bool ok = true;
+    while (read < out.size() && (ok = !cancelled())) {
+        DWORD want = (DWORD)out.size() - read, got = 0;
+        if (cancelled.gen) want = std::min(want, 1ul << 20);
+        if (!(ok = ReadFile(f, out.data() + read, want, &got, nullptr) != FALSE)) break;
+        read += got;
+        if (got < want) break;
+    }
     CloseHandle(f);
     out.resize(read);
-    return ok;
+    return ok && !cancelled();
 }
 
 // Any WIC format from memory: its frame, decoded later at the size shown (the image path scales big ones down while
@@ -490,7 +533,9 @@ UINT TiffOrientation(const std::wstring& path) {
     return TiffOrient(f);
 }
 
-ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* wic) {
+ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* wic, const std::atomic<UINT>* gen, UINT mine) {
+    DecodeCancel cancelled{gen, mine};
+    if (cancelled()) return nullptr;
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
     if (ext == L".sketch") return ZipPreview(path, {L"previews/preview.png"}, wic);
@@ -498,11 +543,14 @@ ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* w
     if (ext == L".kra") return ZipPreview(path, {L"mergedimage.png", L"preview.png"}, wic);
     if (ext == L".ora") return ZipPreview(path, {L"mergedimage.png", L"Thumbnails/thumbnail.png"}, wic);
     std::string f;
-    if (!ReadAll(path, f)) return nullptr;
+    if (!ReadAll(path, f, cancelled)) return nullptr;
     if (ext == L".cur") return Icon(f, wic);
     if (ext == L".ani") return Ani(f, wic);
     Img im;
-    return Decode(f, ext, im) ? ToWic(im, wic) : nullptr;
+    im.cancelled = cancelled;
+    if (!Decode(f, ext, im)) return nullptr;
+    std::string().swap(f);  // the compressed input is no longer needed while WIC owns its pixel copy
+    return ToWic(im, wic);
 }
 
 std::wstring ImgSelfTest() {

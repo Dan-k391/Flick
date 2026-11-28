@@ -33,7 +33,7 @@ enum : UINT {
     WM_FLICK_WORD,                 // posted by the docx picture worker (wParam = gen, lParam = its message)
     WM_FLICK_SELECTALL,            // scripts/shot.ps1: Ctrl+A (WM_COPY: Ctrl+C)
     WM_FLICK_PLAYVIDEO,            // start the media engine after the poster (wParam = preview generation)
-    WM_FLICK_IMAGE,                // sent by the image refinement worker (wParam = gen, lParam = ImageFrame*)
+    WM_FLICK_IMAGE,                // sent by the image worker (wParam = gen, lParam = ImageFrame* or null)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -262,7 +262,8 @@ std::wstring FileInfoSelfTest();  // "" = ok
 // ---- imgfmt.cpp: pictures WIC can't open by name, as WIC sources (null: not readable). TGA, QOI, PNM/PAM, HDR, PCX
 // decoded there; CUR/ANI (first frame); the preview PNG inside sketch/xmind/kra/ora zips.
 extern const wchar_t kImgOwnExt[];
-Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory*);
+Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory*,
+                                               const std::atomic<UINT>* gen = nullptr, UINT mine = 0);
 std::wstring ImgSelfTest();  // "" = ok
 UINT TiffOrientation(const std::wstring& path);  // EXIF-style 1-8 from a TIFF-based file's first IFD (camera raw); 1 if none
 
