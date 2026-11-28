@@ -24,7 +24,8 @@ src/word.cpp      docx reading view, OMML math, shared selection   src/pages.cpp
 src/office.cpp    odt/odp/doc/ppt -> Markdown; xlsx/xls/ods -> grid src/xml.h        XML scanner, small DOM, zips
 src/grid.cpp      CSV, sheets, archive and folder trees            src/pdf.cpp       PDF worker (Windows.Data.Pdf)
 src/media.cpp     audio/video (Media Foundation), subtitles        src/highlight.cpp Lexilla outside Scintilla
-src/font.cpp, svg.cpp (lunasvg), fileinfo.cpp (exe/dll/msi), lang.cpp (extension -> lexer, colours), app.h
+src/imgfmt.cpp    TGA/QOI/PNM/HDR/PCX decoders, EMF/WMF via GDI, CUR/ANI, previews inside sketch/xmind/kra/ora
+src/font.cpp, svg.cpp (lunasvg), fileinfo.cpp (exe/dll/msi/ELF/Mach-O/certificates), lang.cpp (extension -> lexer), app.h
 third_party/      Scintilla, Lexilla, md4c, lunasvg + plutovg: unmodified, licenses beside them
 scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), bench.ps1, e2e.ps1, shot.ps1
 .claude/skills/   build, speed-test, add-preview-type, add-language
@@ -98,7 +99,10 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   `PeekMessage(PM_QS_SENDMESSAGE)`, then re-check *before* `MsgWaitForMultipleObjects`.
 - Video: the engine needs ~300 ms for a first frame → a low-latency source reader decodes the poster (~40 ms)
   first; seek-bar drags show key frames from another reader. `MFShutdown` per preview made memory worse.
-- Subtitles: the engine doesn't draw them in frame-server mode → parsed and drawn by us.
+- Subtitles: the engine doesn't draw them in frame-server mode → parsed and drawn by us (`.lrc` beside audio too).
+- Camera RAW: WIC's own DNG decoder shows only the small first IFD → the Raw codec by container GUID, showing
+  `GetPreview` (0.6 ms); `GetFrame` demosaics (24 MP ~440 ms), so the sensor size stays unknown.
+- Certificates: `CryptQueryObject` with every format took ~5 ms → PEM to DER by hand, then a certificate or PKCS #7.
 
 **Office**
 - Office's own preview handlers (what QuickLook uses) were dropped: 0.6–1.1 s cold, 200–300 MB stays resident.
@@ -127,4 +131,5 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 ## Not done
 PDF text selection/zoom/find; selection across slides, Shift+click; charts/SmartArt (placeholder box); docx
 headers/footers/footnotes/columns; doc/ppt/odt/odp as pages; xlsb; ods/xls formatting; Markdown links/find;
-HTML; PSD/EPUB/3D; mail; APNG/animated WebP; embedded subtitle tracks; multi-selection.
+HTML; PSD/EPUB/3D; mail; APNG/animated WebP/ANI; RAW beyond its embedded preview; pfx contents (password);
+embedded subtitle tracks; multi-selection.
