@@ -73,7 +73,7 @@ DWORD WINAPI PdfThread(void*) {
     UINT32 pages = 0;
     int loaded = -1;
     bool sizePending = false;
-    // Page sizes in DIPs, up to page `n`. A few at first: in a 1000-page book reading them all takes ~50 ms.
+    // A few page sizes at first: in a 1000-page book reading them all takes ~50 ms.
     auto readSizes = [&](UINT32 n, int gen) {
         for (UINT32 i = (UINT32)sizes.size(); i < n && g_wantGen == gen; i++) {
             auto sz = doc.GetPage(i).Size();
@@ -117,24 +117,27 @@ DWORD WINAPI PdfThread(void*) {
         while (g_wantGen == gen) {
             LRESULT next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg);
             if (g_wantGen != gen || (!doc && !office)) break;
-            if (msg.page == 0 && sizePending) {
-                // Let the UI paint page one before enumerating the rest. A newer preview cancels the scan.
+            if (msg.page == 0 && !msg.thumb && sizePending) {
+                // Deliver page one's render attempt before enumerating the rest. A newer preview cancels the scan.
                 sizePending = false;
                 try {
                     readSizes(pages, gen);
                 } catch (...) {}
-                msg = {gen, -2};
+                msg = {gen, -3};
                 msg.sizes = std::move(sizes);
                 continue;
             }
             if (next <= 0) break;
             msg = {gen, (int)(next & 0x7FFFFFFF) - 1};
+            msg.width = (UINT)(next >> 32);
+            msg.thumb = (next & kPdfThumb) != 0;
+            if (!d2d || !wic || (!office && !renderer)) continue;
             if (office) {
-                msg.bmp = PagesRender(*office, msg.page, (UINT)(next >> 32), d2d.Get(), wic.Get(), next & kPdfThumb ? nullptr : &msg.text);
+                msg.bmp = PagesRender(*office, msg.page, msg.width, d2d.Get(), wic.Get(), msg.thumb ? nullptr : &msg.text);
                 continue;
             }
             try {
-                msg.bmp = Render(doc, msg.page, (UINT)(next >> 32), renderer.Get(), d2d.Get(), wic.Get());
+                msg.bmp = Render(doc, msg.page, msg.width, renderer.Get(), d2d.Get(), wic.Get());
             } catch (...) {
             }
         }

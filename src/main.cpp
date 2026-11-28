@@ -51,18 +51,19 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
             // Ignore auto-repeat: act only on the first key-down.
             if (down && !g_spaceDown && !g_disabled && !Down(VK_CONTROL) && !Down(VK_SHIFT) && !Down(VK_MENU) &&
                 !Down(VK_LWIN) && !Down(VK_RWIN))
-                if (HWND ex = ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_TOGGLE, (WPARAM)ex, Now());
+                if (HWND ex = ExplorerWithItemFocus()) PostExplorerKey(ExplorerKey::Space, ex);
             g_spaceDown = down;
-        } else if (PreviewAcceptsNavigation()) {
-            if (k->vkCode == 'F' && down && Down(VK_CONTROL) && PreviewCanFind() && ExplorerWithItemFocus()) {
-                PostMessageW(g_hwnd, WM_FLICK_FIND, 0, 0);
-                return 1;  // not Explorer's search box
-            }
-            if (k->vkCode == VK_ESCAPE && down) {
-                if (ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_HIDE, 0, 0);
-            } else if (!down && ((k->vkCode >= VK_PRIOR && k->vkCode <= VK_DOWN) || k->vkCode == VK_TAB)) {
+        } else {
+            if (k->vkCode == 'F' && down && PreviewCanFind() && Down(VK_CONTROL)) {
+                if (HWND ex = ExplorerWithItemFocus(); ex && PreviewAcceptsNavigation(ex) &&
+                    PostMessageW(g_hwnd, WM_FLICK_FIND, (WPARAM)ex, 0))
+                    return 1;  // not Explorer's search box
+            } else if (k->vkCode == VK_ESCAPE && down && PreviewAcceptsNavigation()) {
+                if (HWND ex = ExplorerWithItemFocus()) PostExplorerKey(ExplorerKey::Escape, ex);
+            } else if (!down && ((k->vkCode >= VK_PRIOR && k->vkCode <= VK_DOWN) || k->vkCode == VK_TAB) &&
+                       PreviewAcceptsNavigation()) {
                 // Explorer moved the selection on key-down; follow it on key-up.
-                if (HWND ex = ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_FOLLOW, (WPARAM)ex, Now());
+                if (HWND ex = ExplorerWithItemFocus()) PostExplorerKey(ExplorerKey::Follow, ex);
             }
         }
     }
@@ -78,7 +79,8 @@ void InstallHook() {
     g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardProc, GetModuleHandleW(nullptr), 0);
     if (old) UnhookWindowsHookEx(old);
 }
-void CALLBACK OnFront(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD) {
+void CALLBACK OnFront(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD eventTime) {
+    ExplorerForeground(h, eventTime);
     if (ClassIs(h, L"CabinetWClass") || IsDesktop(h)) InstallHook();
 }
 
@@ -151,7 +153,7 @@ int Bench(int argc, wchar_t** argv) {
         std::vector<double> load, ready, composed;
         Timing first{}, t{};
         for (int r = 0; r < kRuns; r++) {
-            t = PreviewShow(full, nullptr, Now());
+            t = PreviewShow(full, Now());
             if (r == 0) first = t;
             load.push_back(t.load);
             ready.push_back(t.ready);
@@ -520,7 +522,7 @@ c
     if (show) {
         wchar_t full[MAX_PATH];
         GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
-        PreviewShow(full, nullptr, Now());
+        PreviewShow(full, Now());
     } else {
         TrayAdd(inst);
     }

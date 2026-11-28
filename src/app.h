@@ -12,13 +12,9 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
-// Messages posted to the preview window by the keyboard hook thread.
-// wParam = Explorer top-level HWND, lParam = QueryPerformanceCounter at key press.
 enum : UINT {
-    WM_FLICK_TOGGLE = WM_APP + 1,  // Space in Explorer
-    WM_FLICK_FOLLOW,               // navigation key released in Explorer while preview open
-    WM_FLICK_HIDE,                 // Esc in Explorer while preview open
-    WM_FLICK_QUIT,                 // `Flick.exe --exit`
+    WM_FLICK_INPUT = WM_APP + 1,   // the hook thread updated the Explorer preview intent
+    WM_FLICK_QUIT = WM_APP + 4,   // `Flick.exe --exit`
     WM_FLICK_INFO,                 // worker thread finished a thumbnail (lParam = InfoJob*)
     WM_FLICK_PDF,                  // sent by the PDF worker (lParam = PdfMsg*); reply = next page
     WM_FLICK_GRID,                 // sent by the archive worker (wParam = gen, lParam = GridData*)
@@ -64,10 +60,13 @@ std::vector<StyleRun> LexRange(Lexing&, UINT32 from, UINT32 to);  // runs in [fr
 // ---- window.cpp: the preview window
 struct Timing { double sel, load, ready, composed; const wchar_t* kind; };
 bool PreviewInit(HINSTANCE);
-Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0);
+Timing PreviewShow(std::wstring path, LONGLONG t0);
 void PreviewHide(bool restoreFocus);
 bool PreviewVisible();
-bool PreviewAcceptsNavigation();  // visible or opening in Explorer
+enum class ExplorerKey { Space, Follow, Escape };
+void PostExplorerKey(ExplorerKey key, HWND source);
+void ExplorerForeground(HWND foreground, DWORD eventTime);
+bool PreviewAcceptsNavigation(HWND source = nullptr);  // requested in Explorer, including before dispatch
 bool PreviewCanFind();  // a text preview is showing (Ctrl+F opens its search field)
 bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;
@@ -81,11 +80,13 @@ struct SlideText {  // pptx: a paragraph as drawn on its slide
     std::wstring text;
 };
 struct PdfMsg {
-    int gen, page;                                // page -1: opened (sizes empty = failed); -2: idle
+    int gen, page;                                // -1: opened (sizes empty = failed), -2: idle, -3: final geometry
     std::vector<std::pair<float, float>> sizes;   // page sizes in points
     Microsoft::WRL::ComPtr<IWICBitmap> bmp;       // rendered page (null if it failed)
     UINT32 pageCount = 0;                         // with page -1
     std::vector<SlideText> text;                  // pptx: the page's text, for selection
+    UINT width = 0;                               // actual pixel width requested for page or thumbnail
+    bool thumb = false;
 };
 void PdfOpen(const std::wstring& path, int gen);  // "" closes the document
 void PdfWake();                                   // worker idle and the UI needs a page

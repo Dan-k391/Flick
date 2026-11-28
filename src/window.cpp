@@ -17,6 +17,7 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
@@ -79,7 +80,7 @@ std::string g_codeFont;
 UINT g_dpi = 96;
 bool g_dark, g_placing;
 std::atomic<bool> g_visible;
-std::atomic<bool> g_opening;  // Explorer navigation also applies before the first frame
+bool g_previewPaintPending;
 float g_natW, g_natH;   // size a picture is shown at, in DIPs: 1 image pixel = 1 DIP, like QuickLook
 void PlaceWindow();
 
@@ -143,16 +144,20 @@ constexpr float kSideW = 160, kSideMinWindow = 700, kThumbW = 120, kHeadRowH = 2
 int g_sideCurrent = -1;  // item the reading position is in, last time it was drawn
 std::vector<ComPtr<ID2D1Bitmap>> g_thumbBmp;
 std::vector<UINT> g_thumbW;  // pixel width each thumbnail was rendered at (0 = never)
-bool g_pdfReqThumb;          // the page the worker is rendering is a thumbnail
+std::vector<UINT> g_thumbFailedW;
 
 // PDF: page sizes arrive from the worker (pdf.cpp), then pages as they are rendered.
 constexpr float kPageGap = 12;
 int g_pdfGen;
-bool g_pdfIdle = true, g_pdfFailed;
+bool g_pdfIdle = true, g_pdfFailed, g_pdfLayoutPending;
+UINT32 g_pdfPageCount;  // known before the full list of sizes arrives
+enum class PdfEnd { None, Document, Sidebar };
+PdfEnd g_pdfEnd;
 LONGLONG g_pdfT0;
 std::vector<std::pair<float, float>> g_pages;  // points
 std::vector<ComPtr<ID2D1Bitmap>> g_pageBmp;
 std::vector<UINT> g_pageW;  // pixel width each page was last rendered at (0 = never)
+std::vector<UINT> g_pageFailedW;
 // pptx: each rendered page's paragraphs (kept with its bitmap); a selection lies within one slide.
 std::vector<std::vector<SlideText>> g_pageText;
 TextSel g_slideSel;
@@ -657,7 +662,7 @@ bool LoadMarkdown(const std::wstring& path) {
 void LoadPdf(const std::wstring& path, LONGLONG t0) {
     g_pdfT0 = t0;
     g_pdfFailed = false;
-    g_pdfIdle = false;
+    g_pdfIdle = false, g_pdfLayoutPending = true;
     PdfOpen(path, ++g_pdfGen);
 }
 
@@ -694,6 +699,18 @@ float PageTop(size_t i) {
     return y;
 }
 
+float PdfHeight(float end) { return end - kPageGap + kPad / 2; }
+float View(int axis);
+
+void ApplyPdfEnd() {
+    PdfEnd end = std::exchange(g_pdfEnd, PdfEnd::None);
+    if (end == PdfEnd::None || g_pages.empty()) return;
+    g_doc[1] = PdfHeight(PageTop(g_pages.size()));
+    float last = end == PdfEnd::Sidebar ? PageTop(g_pages.size() - 1) - kPad / 2 : g_doc[1];
+    g_scroll[1] = std::clamp(last, 0.f, std::max(0.f, g_doc[1] - View(1)));
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 // Item the reading position is in: the heading above the top of the view, or the page a third down.
 int CurrentItem() {
     if (g_kind == K_Md) {
@@ -717,61 +734,79 @@ int CurrentItem() {
 
 // Next page the PDF worker should render, in WM_FLICK_PDF reply format: the first page in or just
 // below the view that hasn't been rendered at the current width.
-LRESULT NextPdfPage(bool* thumb = nullptr) {
-    if (thumb) *thumb = false;
+UINT PdfPixelWidth(float width) { return (UINT)std::max(0l, std::lround(width * g_dpi / 96)); }
+
+LRESULT NextPdfPage() {
+    if (g_pages.empty()) return 0;
     RECT rc;
     GetClientRect(g_hwnd, &rc);
     float w = PageWidth(), viewH = Dip(rc.bottom) - kTitleH, y = kPad / 2;
-    UINT px = (UINT)std::lround(w * g_dpi / 96);
+    UINT px = PdfPixelWidth(w);
+    if (!px || viewH <= 0) return 0;
+    // The worker enumerates the remaining sizes after delivering page one, even if it fails to draw.
+    if (g_pdfLayoutPending && !g_pageW[0] && !g_pageFailedW[0]) return ((LRESULT)px << 32) | 1;
     for (size_t i = 0; i < g_pages.size() && y < g_scroll[1] + 2 * viewH; i++) {
         float h = std::round(w * g_pages[i].second / g_pages[i].first);
-        if (y + h > g_scroll[1] && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
+        if (y + h > g_scroll[1] && g_pageFailedW[i] != px && (g_pageW[i] == 0 || (g_pageW[i] != px && !g_sizing)))
             return ((LRESULT)px << 32) | (i + 1);
         y += h + kPageGap;
     }
     // Then the thumbnails in view in the sidebar.
-    if (SideW() > 0 && g_thumbW.size() == g_pages.size()) {
+    if (SideW() > 0) {
         std::vector<float> top, height;
         SideItems(top, height);
-        UINT tpx = (UINT)std::lround(kThumbW * g_dpi / 96);
+        UINT tpx = PdfPixelWidth(kThumbW);
         for (size_t i = 0; i < top.size(); i++)
-            if (top[i] + height[i] > g_scroll[2] && top[i] < g_scroll[2] + viewH && !g_thumbW[i]) {
-                if (thumb) *thumb = true;
+            if (top[i] + height[i] > g_scroll[2] && top[i] < g_scroll[2] + viewH &&
+                g_thumbW[i] != tpx && g_thumbFailedW[i] != tpx)
                 return ((LRESULT)tpx << 32) | kPdfThumb | (i + 1);
-            }
     }
     return 0;
 }
 
 LRESULT OnPdf(PdfMsg& m) {
-    if (m.gen != g_pdfGen || g_kind != K_Pdf) return g_pdfIdle = true, 0;
-    if (m.page == -1 || !m.sizes.empty()) {  // sizes come in two steps: the first few, then all
-        g_pages = m.sizes;
+    if (m.gen != g_pdfGen || g_kind != K_Pdf) return 0;
+    if (m.page == -1 || m.page == -3) {  // sizes come in two steps: the first few, then all
+        g_pages = std::move(m.sizes);
         g_pageBmp.resize(g_pages.size());
         g_pageW.resize(g_pages.size());
+        g_pageFailedW.resize(g_pages.size());
         g_thumbBmp.resize(g_pages.size());
         g_thumbW.resize(g_pages.size());
+        g_thumbFailedW.resize(g_pages.size());
         g_pageText.resize(g_pages.size());
         g_pdfFailed = g_pages.empty();
-        if (m.page == -1)
+        if (m.page == -1) {
+            g_pdfPageCount = m.pageCount;
             g_sub = g_pdfFailed ? L"can't open (damaged or password-protected)"
                                 : std::to_wstring(m.pageCount) + (PagesFor(g_path) ? (m.pageCount == 1 ? L" slide" : L" slides")
                                                                                    : (m.pageCount == 1 ? L" page" : L" pages"));
-        if (m.page == -1 && !g_pdfFailed) PlaceWindow();  // before page 1 is requested: rendered at the final width
+            if (!g_pdfFailed) PlaceWindow();  // request page one at the final width
+        }
+        g_pdfLayoutPending = m.page == -1 && !g_pdfFailed && g_pages.size() < g_pdfPageCount;
+        if (!g_pdfLayoutPending) ApplyPdfEnd();
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
-    if (m.page >= 0 && (size_t)m.page < g_pages.size() && g_pdfReqThumb) {
-        g_thumbW[m.page] = (UINT)std::lround(kThumbW * g_dpi / 96);
-        if (m.bmp) g_thumbBmp[m.page] = ToD2D(m.bmp.Get());
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-    } else if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
-        g_pageW[m.page] = (UINT)std::lround(PageWidth() * g_dpi / 96);
-        if (m.bmp) g_pageBmp[m.page] = ToD2D(m.bmp.Get());
-        g_pageText[m.page] = std::move(m.text);
-        if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
+    if (m.page >= 0 && (size_t)m.page < g_pages.size()) {
+        auto& bmp = (m.thumb ? g_thumbBmp : g_pageBmp)[m.page];
+        auto& width = (m.thumb ? g_thumbW : g_pageW)[m.page];
+        auto& failed = (m.thumb ? g_thumbFailedW : g_pageFailedW)[m.page];
+        auto drawable = m.bmp ? ToD2D(m.bmp.Get()) : nullptr;
+        if (drawable) {
+            bmp = std::move(drawable);
+            width = m.width, failed = 0;
+            if (!m.thumb) {
+                g_pageText[m.page] = std::move(m.text);
+                if (m.page == 0) Log(L"pdf   page 1 ready %.2f ms after key press", MsSince(g_pdfT0));
+            }
+        } else {
+            failed = m.width;  // keep any drawable result at an older width; retry only when the width changes
+        }
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
-    LRESULT next = NextPdfPage(&g_pdfReqThumb);
+    // The worker is about to read the remaining geometry; it will ask for another page when done.
+    if (m.page == 0 && !m.thumb && g_pdfLayoutPending) return 0;
+    LRESULT next = NextPdfPage();
     g_pdfIdle = !next;
     return next;
 }
@@ -783,60 +818,135 @@ bool Pending() {
         MediaState s = MediaGet();
         if (!s.error && !TryFrame(s)) return true;
     }
-    return (g_kind == K_Pdf && !g_pdfFailed && (g_pageW.empty() || !g_pageW[0])) || (g_kind == K_Grid && g_gridPending);
+    return (g_kind == K_Pdf && !g_pdfFailed && (g_pageBmp.empty() || (!g_pageBmp[0] && !g_pageFailedW[0]))) ||
+           (g_kind == K_Grid && g_gridPending);
+}
+
+struct ExplorerIntent {
+    HWND source = nullptr;
+    ExplorerKey key = ExplorerKey::Space;
+    LONGLONG pressed = 0;
+    uint64_t generation = 0, session = 0;
+    DWORD started = 0;  // to reject foreground events queued before this session began
+    bool restoreFocus = false;
+};
+std::mutex g_intentMutex;
+ExplorerIntent g_intent;
+std::atomic<uint64_t> g_visibleSession;
+bool g_handlingInput;
+
+ExplorerIntent CurrentIntent() {
+    std::lock_guard lock(g_intentMutex);
+    return g_intent;
+}
+
+// Caller holds g_intentMutex. A later Space starts a different session even if this hide is still queued.
+void CancelIntent(bool restoreFocus = false) {
+    g_intent.source = nullptr;
+    g_intent.restoreFocus = restoreFocus;
+    ++g_intent.generation;
+}
+
+// Transient shell UI (Alt+Tab, Start, search, taskbar) can take the foreground without switching apps.
+bool KeepsPreview(HWND foreground, HWND source) {
+    if (!foreground || foreground == source || GetAncestor(foreground, GA_ROOT) == source) return true;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(foreground, &pid);
+    if (pid == GetCurrentProcessId()) return true;
+    wchar_t cls[64]{};
+    GetClassNameW(foreground, cls, 64);
+    for (const wchar_t* shell : {L"XamlExplorerHostIslandWindow", L"MultitaskingViewFrame", L"TaskSwitcherWnd",
+                                 L"ForegroundStaging", L"Windows.UI.Core.CoreWindow", L"Shell_TrayWnd",
+                                 L"Shell_SecondaryTrayWnd", L"NotifyIconOverflowWindow",
+                                 L"TopLevelWindowForOverflowXamlIsland"})
+        if (!wcscmp(cls, shell)) return true;
+    return false;
 }
 
 struct OpenRequest {
     std::wstring path;
-    HWND source;
-    LONGLONG pressed;
+    HWND source = nullptr;
+    LONGLONG pressed = 0;
+    uint64_t generation = 0, session = 0;
 };
+enum class RequestState { Current, Changed, Canceled };
 
-// Waits (bounded) for the first content. During an Explorer open, take navigation messages here
-// so Escape or a changed selection can replace the request before it reaches the screen.
-bool WaitForContent(OpenRequest& request) {
+RequestState RefreshRequest(OpenRequest& request) {
+    if (!request.source) return RequestState::Current;
+    for (;;) {
+        ExplorerIntent intent = CurrentIntent();
+        if (!intent.source || intent.session != request.session) return RequestState::Canceled;
+        if (!KeepsPreview(GetForegroundWindow(), intent.source)) {
+            std::lock_guard lock(g_intentMutex);
+            if (g_intent.generation == intent.generation) CancelIntent();
+            continue;
+        }
+        if (intent.generation == request.generation) return RequestState::Current;
+
+        auto path = ExplorerSelection(intent.source);  // STA COM can dispatch messages before returning
+        bool foreground = KeepsPreview(GetForegroundWindow(), intent.source);
+        std::lock_guard lock(g_intentMutex);
+        if (g_intent.generation != intent.generation) continue;
+        if (!foreground || (intent.key == ExplorerKey::Space && (path.empty() || path == request.path)) ||
+            (path.empty() && request.path.empty())) {
+            CancelIntent();
+            return RequestState::Canceled;
+        }
+        g_intent.key = ExplorerKey::Follow;  // the selection lookup resolved any queued Space
+        request.generation = intent.generation;
+        // An arrow at the edge of the listing (or a temporary empty selection) keeps the same preview.
+        if (path.empty() || path == request.path) return RequestState::Current;
+        request.path = std::move(path), request.pressed = intent.pressed;
+        return RequestState::Changed;
+    }
+}
+
+// While waiting for a worker, consume the wake message and check the newest intent before declaring
+// the content ready. A reentrant wake during a shell call can be consumed by the outer handler.
+RequestState WaitForContent(OpenRequest& request) {
     const DWORD wakeMask = QS_SENDMESSAGE | (request.source ? QS_POSTMESSAGE : 0);
     for (LONGLONG start = Now();;) {
         MSG m;
         PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);  // runs the worker's pending SendMessage
         if (request.source) {
-            bool input = PeekMessageW(&m, g_hwnd, WM_FLICK_TOGGLE, WM_FLICK_HIDE, PM_REMOVE | PM_QS_POSTMESSAGE);
-            if (!g_opening || (input && m.message == WM_FLICK_HIDE)) break;
-            if (input) {
-                HWND explorer = (HWND)m.wParam;
-                auto path = ExplorerSelection(explorer);
-                if (!g_opening) break;
-                if (!path.empty() && path != request.path) {
-                    request = {std::move(path), explorer, (LONGLONG)m.lParam};
-                    return false;
-                }
-                if (m.message == WM_FLICK_TOGGLE) break;
-                // Releasing an arrow at the edge of the listing leaves the selection alone.
-                continue;
-            }
+            PeekMessageW(&m, g_hwnd, WM_FLICK_INPUT, WM_FLICK_INPUT, PM_REMOVE | PM_QS_POSTMESSAGE);
+            if (auto state = RefreshRequest(request); state != RequestState::Current) return state;
         }
         double left = 120 - MsSince(start);  // slow content shows the placeholder, then fills in
-        if (!Pending() || left <= 0) return true;
+        if (!Pending() || left <= 0) return RequestState::Current;
         MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)left + 1, wakeMask);
     }
-    request.path.clear();
-    return false;
 }
+
+void OnExplorerInput();
 
 D2D1::Matrix3x2F Mat(const D2D1_MATRIX_3X2_F& m) { return {m._11, m._12, m._21, m._22, m._31, m._32}; }
 
 // Pages stacked at the content width. Pages far from the view drop their bitmaps.
-float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
+float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill, ID2D1SolidColorBrush* sub) {
     float w = PageWidth(), y = top + kPad / 2 - g_scroll[1], viewH = bottom - top;
+    constexpr wchar_t unavailable[] = L"Page preview unavailable";
+    if (g_pdfFailed) {
+        g_rt->DrawText(unavailable, ARRAYSIZE(unavailable) - 1, g_fmtInfo.Get(), {kPad, top, kPad + w, bottom}, sub);
+        return 0;
+    }
     // Until the worker reports the real sizes, show one blank Letter-shaped page.
     const std::vector<std::pair<float, float>> placeholder{{612.f, 792.f}};
-    const auto& pages = g_pages.empty() && !g_pdfFailed ? placeholder : g_pages;
+    const auto& pages = g_pages.empty() ? placeholder : g_pages;
     fill->SetColor(C(0xFFFFFF));
     for (size_t i = 0; i < pages.size(); i++) {
         float h = std::round(w * pages[i].second / pages[i].first);
         D2D1_RECT_F r{kPad + SideW(), y, kPad + SideW() + w, y + h};
         if (r.bottom > top && r.top < bottom) {
-            g_rt->FillRectangle(r, fill);
+            if (i < g_pageFailedW.size() && g_pageFailedW[i] && !g_pageBmp[i]) {
+                fill->SetColor(Pal().codeBg);
+                g_rt->FillRectangle(r, fill);
+                fill->SetColor(C(0xFFFFFF));
+                g_rt->DrawText(unavailable, ARRAYSIZE(unavailable) - 1, g_fmtInfo.Get(),
+                               {r.left, std::max(top, r.top), r.right, std::min(bottom, r.bottom)}, sub);
+            } else {
+                g_rt->FillRectangle(r, fill);
+            }
             if (i < g_pageBmp.size() && g_pageBmp[i])
                 g_rt->DrawBitmap(g_pageBmp[i].Get(), r, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             if ((int)i == g_slidePage && !g_slideSel.Empty() && i < g_pageText.size()) {  // selected text, over the slide
@@ -857,7 +967,7 @@ float DrawPdf(float top, float bottom, ID2D1SolidColorBrush* fill) {
         }
         y += h + kPageGap;
     }
-    return y + g_scroll[1] - top - kPageGap + kPad / 2;
+    return PdfHeight(y + g_scroll[1] - top);
 }
 
 // QuickLook-style sizing. Each kind asks for a content size; pictures, videos and PDFs ask for their
@@ -1502,6 +1612,8 @@ void ClearContent() {
     WordClear();
     if (g_kind == K_Pdf) PdfOpen({}, ++g_pdfGen);
     g_pages.clear(), g_pageBmp.clear(), g_pageW.clear(), g_thumbBmp.clear(), g_thumbW.clear();
+    g_pageFailedW.clear(), g_thumbFailedW.clear();
+    g_pdfPageCount = 0, g_pdfEnd = PdfEnd::None;
     g_pageText.clear(), g_slidePage = -1, g_slideSel = {};
     if (g_selDrag) ReleaseCapture();
     g_sideCurrent = -1, g_sideFocus = false;
@@ -1857,6 +1969,7 @@ void DrawSidebar(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBrus
 
 // Jumps the document to sidebar item i: a heading or a page.
 void GoToItem(int i) {
+    if (g_kind == K_Pdf) g_pdfEnd = PdfEnd::None;
     if (i < 0 || i >= (int)SideCount()) return;
     float target = g_kind == K_Md ? MdHeadingY(i, true) - 8 : PageTop(i) - kPad / 2;
     RECT rc;
@@ -2056,8 +2169,10 @@ void Paint() {
     if (g_findOn) DrawFind(top, text.Get(), sub.Get(), fill.Get());
 
     // Title: file name + dimmed details, trimmed with an ellipsis.
-    if (g_kind == K_Pdf && !g_pdfFailed && g_pages.size() > 1)  // reading position: "3 / 94"
-        g_sub = std::to_wstring(CurrentItem() + 1) + L" / " + std::to_wstring(g_pages.size());
+    if (g_kind == K_Pdf && !g_pdfFailed && g_pdfPageCount > 1) {  // reading position: "3 / 94"
+        g_sub = std::to_wstring(CurrentItem() + 1) + L" / " + std::to_wstring(g_pdfPageCount);
+        if (!g_pdfLayoutPending && g_pages.size() < g_pdfPageCount) g_sub += L" · page sizes unavailable";
+    }
     std::wstring title = g_copyTooLarge ? L"Selection too large to copy" : g_title + (g_sub.empty() ? L"" : L"    " + g_sub);
     ComPtr<IDWriteTextLayout> tl;
     g_dw->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_fmtTitle.Get(),
@@ -2093,7 +2208,7 @@ void Paint() {
         MdColors mc{p.text, p.sub, p.link, p.codeBg, p.rule, p.role, Rgb(GetRValue(p.sel) << 16 | GetGValue(p.sel) << 8 | GetBValue(p.sel))};
         g_rt->PushAxisAlignedClip({0, kTitleH, sz.width, sz.height}, D2D1_ANTIALIAS_MODE_ALIASED);
         if (g_kind == K_Md) g_doc[1] = MdPaint(g_rt.Get(), doc, g_scroll[1], mc);
-        if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get());
+        if (g_kind == K_Pdf) g_doc[1] = DrawPdf(kTitleH, sz.height, fill.Get(), sub.Get());
         if (g_kind == K_Font) g_doc[1] = FontPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Word) g_doc[1] = WordPaint(g_rt.Get(), doc, g_scroll[1], mc);
         if (g_kind == K_Grid && GridGet()) {
@@ -2156,6 +2271,7 @@ int OnBar(LPARAM l) {
 }
 
 void ScrollTo(int axis, float s) {
+    if (axis == 1 && g_kind == K_Pdf) g_pdfEnd = PdfEnd::None;
     s = std::clamp(s, 0.f, std::max(0.f, g_doc[axis] - View(axis)));
     if (s != g_scroll[axis]) g_scroll[axis] = s, InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -2306,23 +2422,9 @@ void OpenFile(bool chooseApp) {
 }
 
 
-// Hide when the user switches to anything other than the source Explorer window or us.
-// Transient shell UI (the Alt+Tab switcher, Start, search, taskbar) is ignored: the user hasn't
-// switched apps (yet); if they do, the app they pick takes the foreground next.
+// Explorer sessions track foreground loss on the hook thread, even before the UI gets the wake.
 void CALLBACK OnForeground(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD) {
-    DWORD pid = 0;
-    GetWindowThreadProcessId(h, &pid);
-    if (g_visible && h && pid != GetCurrentProcessId() && GetAncestor(h, GA_ROOT) != g_source) {
-        wchar_t cls[64] = L"";
-        GetClassNameW(h, cls, 64);
-        for (const wchar_t* shell : {L"XamlExplorerHostIslandWindow", L"MultitaskingViewFrame", L"TaskSwitcherWnd",
-                                     L"ForegroundStaging", L"Windows.UI.Core.CoreWindow", L"Shell_TrayWnd",
-                                     L"Shell_SecondaryTrayWnd", L"NotifyIconOverflowWindow",
-                                     L"TopLevelWindowForOverflowXamlIsland"})
-            if (!wcscmp(cls, shell)) return;
-        Log(L"hide: foreground -> %s %p (source %p)", cls, h, g_source);
-        PreviewHide(false);
-    }
+    if (g_visible && !g_source && !KeepsPreview(h, nullptr)) PreviewHide(false);
 }
 
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
@@ -2349,7 +2451,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return HTCLIENT;
         }
         case WM_PAINT:
-            Paint();
+            if (!g_previewPaintPending) Paint();
             ValidateRect(h, nullptr);
             return 0;
         case WM_ERASEBKGND:
@@ -2607,7 +2709,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_FLICK_FIND:
-            FindOpen();
+            if (!w || (g_canFind && (HWND)w == g_source && PreviewAcceptsNavigation((HWND)w))) FindOpen();
             return 0;
         case WM_SETFOCUS:
             if (g_kind == K_Text) SetFocus(g_sci);
@@ -2618,20 +2720,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_SETTINGCHANGE:
             if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) ApplyTheme();
             break;
-        case WM_FLICK_TOGGLE: {  // Space: open; on the file already shown, close; on another file, show that
-            g_opening = true;
-            std::wstring path = ExplorerSelection((HWND)w);
-            if (!path.empty() && (!g_visible || path != g_path)) PreviewShow(std::move(path), (HWND)w, (LONGLONG)l);
-            else PreviewHide(false);
-            return 0;
-        }
-        case WM_FLICK_FOLLOW:
-            if (g_visible)
-                if (auto path = ExplorerSelection((HWND)w); !path.empty() && path != g_path)
-                    PreviewShow(std::move(path), (HWND)w, (LONGLONG)l);
-            return 0;
-        case WM_FLICK_HIDE:
-            PreviewHide(false);
+        case WM_FLICK_INPUT:
+            OnExplorerInput();
             return 0;
         case WM_FLICK_PDF:
             return OnPdf(*reinterpret_cast<PdfMsg*>(l));
@@ -2720,7 +2810,42 @@ bool HasFont(const wchar_t* family) {
 }  // namespace
 
 bool PreviewVisible() { return g_visible; }
-bool PreviewAcceptsNavigation() { return g_visible || g_opening; }
+bool PreviewAcceptsNavigation(HWND source) {
+    HWND active = CurrentIntent().source;
+    return active && (!source || source == active);
+}
+
+void PostExplorerKey(ExplorerKey key, HWND source) {
+    LONGLONG pressed = Now();
+    std::lock_guard lock(g_intentMutex);
+    bool same = g_intent.source == source;
+    if (key != ExplorerKey::Space && !same) return;
+    if (key == ExplorerKey::Escape || (key == ExplorerKey::Space && same && g_visibleSession != g_intent.session)) {
+        CancelIntent();  // Space toggles off an open that hasn't reached its first frame yet
+    } else {
+        if (!same) {
+            g_intent.session = g_intent.generation + 1;
+            g_intent.started = GetTickCount();
+        }
+        g_intent.source = source;
+        // Arrows update the selection for an unresolved Space. Two queued Spaces cancel the toggle.
+        if (key == ExplorerKey::Space)
+            g_intent.key = same && g_intent.key == ExplorerKey::Space ? ExplorerKey::Follow : key;
+        g_intent.pressed = pressed;
+        g_intent.restoreFocus = false;
+        ++g_intent.generation;
+    }
+    PostMessageW(g_hwnd, WM_FLICK_INPUT, 0, 0);
+}
+
+void ExplorerForeground(HWND foreground, DWORD eventTime) {
+    std::lock_guard lock(g_intentMutex);
+    if (!g_intent.source || (LONG)(eventTime - g_intent.started) < 0 || KeepsPreview(foreground, g_intent.source))
+        return;
+    CancelIntent();
+    PostMessageW(g_hwnd, WM_FLICK_INPUT, 0, 0);
+}
+
 ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource* src) { return ToD2D(src); }
 IWICImagingFactory* WicFactory() { return g_wic.Get(); }
 
@@ -2797,7 +2922,7 @@ bool PreviewInit(HINSTANCE inst) {
     Cloak(TRUE);
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    PreviewShow(exe, nullptr, Now());  // info view (shell thumbnail)
+    PreviewShow(exe, Now());  // info view (shell thumbnail)
     g_kind = K_Text;
     g_lang = LangForFile(L"x.cpp");
     Sci(SCI_SETILEXER, 0, (sptr_t)CreateLexer(g_lang->lexer));
@@ -2836,12 +2961,13 @@ x
     return true;
 }
 
-Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
-    OpenRequest request{std::move(path), source, t0};
+namespace {
+
+Timing ShowRequest(OpenRequest& request) {
     Timing t{};
-    g_opening = source != nullptr;
     g_canFind = false;
     for (;;) {
+        g_previewPaintPending = request.source != nullptr;
         t.sel = MsSince(request.pressed);
         LONGLONG start = Now();
         g_source = request.source;
@@ -2864,22 +2990,40 @@ Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
         }
         LoadContent(request.path, request.pressed);
         t.load = MsSince(start);
-        if (WaitForContent(request)) break;
-        if (request.path.empty()) {
-            PreviewHide(false);
-            return {};
+        auto state = WaitForContent(request);
+        if (state == RequestState::Current) {
+            PlaceWindow();
+            Layout();
+            if (!g_visible)
+                // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
+                SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            state = RefreshRequest(request);
         }
+        g_previewPaintPending = false;
+        if (state == RequestState::Canceled) return {};
+        if (state == RequestState::Changed) continue;
+
+        RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
+        bool wasVisible = g_visible;
+        if (!wasVisible) DefWindowProcW(g_hwnd, WM_NCACTIVATE, TRUE, 0);
+        // Commit the painted frame only if no newer hook event superseded it. An unchanged
+        // selection can advance the generation without discarding the frame we just painted.
+        if (request.source) {
+            for (;;) {
+                state = RefreshRequest(request);
+                if (state != RequestState::Current) break;
+                std::lock_guard lock(g_intentMutex);
+                if (g_intent.generation != request.generation) continue;
+                g_visibleSession = request.session;
+                break;
+            }
+        }
+        if (state == RequestState::Canceled) return {};
+        if (state == RequestState::Changed) continue;
+        if (!wasVisible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
+        g_visible = true;
+        break;
     }
-    PlaceWindow();
-    Layout();
-    if (!g_visible)
-        // Topmost: stays above Explorer when Explorer is re-activated (click, Alt+Tab back).
-        SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    RedrawWindow(g_hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ALLCHILDREN);
-    if (!g_visible) DefWindowProcW(g_hwnd, WM_NCACTIVATE, TRUE, 0);  // shown without focus: active look anyway
-    if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
-    g_visible = true;
-    g_opening = false;
     g_canFind = g_kind == K_Text;
     t.ready = MsSince(request.pressed);
     bool imagePlaceholder = g_imagePlaceholderDrawn;
@@ -2895,7 +3039,8 @@ Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
         t.ready, t.composed, request.path.c_str());
     if (g_openStale) {  // the default app may have changed since the label was remembered
         g_openStale = false;
-        if (std::wstring now = OpenLabel(g_path); now != g_open) {
+        if (std::wstring now = OpenLabel(request.path);
+            g_visible && (!request.source || CurrentIntent().generation == request.generation) && now != g_open) {
             g_openLabels[PathFindExtensionW(g_path.c_str())] = g_open = now;
             InvalidateRect(g_hwnd, nullptr, FALSE);
         }
@@ -2903,13 +3048,13 @@ Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
     return t;
 }
 
-void PreviewHide(bool restoreFocus) {
-    if (!g_visible && !g_opening) return;
+void HidePreviewContent(bool restoreFocus) {
+    if (!g_visible && g_kind == K_None) return;
     bool wasForeground = GetForegroundWindow() == g_hwnd;
     if (g_visible) Cloak(TRUE);
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
-    g_opening = false;
+    g_visibleSession = 0;
     g_canFind = g_findTookFocus = false;
     g_hot = H_None;
     ClearContent();  // release content memory while idle
@@ -2917,6 +3062,40 @@ void PreviewHide(bool restoreFocus) {
     Sci(SCI_CLEARALL);
     ShowWindow(g_sci, SW_HIDE);  // a hidden Scintilla loads text ~3x faster (no scrollbar/layout updates)
     if (restoreFocus && wasForeground && IsWindow(g_source)) SetForegroundWindow(g_source);
+}
+
+void OnExplorerInput() {
+    if (g_handlingInput) return;  // one owner of selection lookup and preview content, even during STA dispatch
+    g_handlingInput = true;
+    static uint64_t handled = 0;
+    for (;;) {
+        ExplorerIntent intent = CurrentIntent();
+        if (intent.generation == handled) break;
+        if (!intent.source || g_visibleSession != intent.session) HidePreviewContent(intent.restoreFocus);
+        if (!intent.source) {
+            handled = intent.generation;
+            continue;
+        }
+        OpenRequest request{g_visible ? g_path : L"", intent.source, 0, handled, intent.session};
+        if (RefreshRequest(request) == RequestState::Changed) ShowRequest(request);
+        handled = request.generation;
+    }
+    g_handlingInput = false;
+}
+
+}  // namespace
+
+Timing PreviewShow(std::wstring path, LONGLONG t0) {
+    OpenRequest request{std::move(path), nullptr, t0};
+    return ShowRequest(request);
+}
+
+void PreviewHide(bool restoreFocus) {
+    {
+        std::lock_guard lock(g_intentMutex);
+        CancelIntent(restoreFocus);
+    }
+    if (!g_handlingInput) HidePreviewContent(restoreFocus);
 }
 
 bool PreviewCanFind() { return g_canFind; }
@@ -2936,7 +3115,10 @@ bool PreviewKey(const MSG& m) {
         MediaSetVolume(MediaVolume() + (m.wParam == VK_UP ? 0.1 : -0.1)), InvalidateRect(g_hwnd, nullptr, FALSE);
     else if (g_kind == K_Media && m.hwnd == g_hwnd && (m.wParam == VK_LEFT || m.wParam == VK_RIGHT))
         MediaSeek(MediaGet().pos + (m.wParam == VK_LEFT ? -5 : 5));
-    else if (g_sideFocus && SideW() > 0 && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
+    else if (g_kind == K_Pdf && m.hwnd == g_hwnd && m.wParam == VK_END) {
+        g_pdfEnd = g_sideFocus && SideW() > 0 ? PdfEnd::Sidebar : PdfEnd::Document;
+        if (!g_pdfLayoutPending) ApplyPdfEnd();
+    } else if (g_sideFocus && SideW() > 0 && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
         bool back = m.wParam == VK_UP || m.wParam == VK_LEFT || m.wParam == VK_PRIOR;  // sidebar: step page/heading
         GoToItem(m.wParam == VK_HOME ? 0 : m.wParam == VK_END ? (int)SideCount() - 1 : CurrentItem() + (back ? -1 : 1));
     } else if (Scrollable() && m.hwnd == g_hwnd && m.wParam >= VK_PRIOR && m.wParam <= VK_DOWN) {
