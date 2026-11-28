@@ -9,6 +9,7 @@
 #include <functional>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 
@@ -172,11 +173,11 @@ std::wstring FormatDate(time_t t) {
     ULONGLONG v = ((ULONGLONG)t + 11644473600ULL) * 10000000ULL;
     ft.dwLowDateTime = (DWORD)v, ft.dwHighDateTime = (DWORD)(v >> 32);
     SYSTEMTIME utc, local;
-    FileTimeToSystemTime(&ft, &utc);
-    SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local);
+    if (!FileTimeToSystemTime(&ft, &utc) || !SystemTimeToTzSpecificLocalTime(nullptr, &utc, &local)) return L"";
     wchar_t d[64], tm[64];
-    GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, nullptr, d, 64, nullptr);
-    GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, tm, 64);
+    if (!GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_SHORTDATE, &local, nullptr, d, 64, nullptr) ||
+        !GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, TIME_NOSECONDS, &local, nullptr, tm, 64))
+        return L"";
     return std::wstring(d) + L" " + tm;
 }
 
@@ -279,7 +280,7 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
 
 // Worker thread: lists an archive. nullptr when libarchive is missing or can't read the file.
 namespace {
-std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted);
+std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, bool archive);
 }
 
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::atomic<int>& gen, int mine) {
@@ -295,6 +296,12 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
     if (api.open_filename_w(a, path.c_str(), 1 << 16) == 0) {
         void* e;
         for (int r; (r = api.next_header(a, &e)) == 0 || r == -20 /* ARCHIVE_WARN */;) {
+            if (gen != mine) break;
+            // Compressed tarballs must be decompressed to reach every header: bound the work.
+            if (entries.size() >= 200000 || MsSince(start) > 3000) {
+                partial = true;
+                break;
+            }
             const wchar_t* p = api.pathname_w(e);
             if (!p) continue;
             std::wstring s = p;
@@ -305,16 +312,11 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
             if (s.empty()) continue;
             encrypted |= api.is_encrypted(e) > 0;
             entries.push_back({std::move(s), dir, dir || !api.size_is_set(e) ? -1 : api.size(e), api.mtime(e)});
-            // Compressed tarballs must be decompressed to reach every header: bound the work.
-            if (entries.size() >= 200000 || MsSince(start) > 3000 || gen != mine) {
-                partial = true;
-                break;
-            }
         }
     }
     api.free(a);
-    if (entries.empty()) return nullptr;
-    return BuildTree(std::move(entries), partial, encrypted);
+    if (entries.empty() || gen != mine) return nullptr;
+    return BuildTree(std::move(entries), partial, encrypted, true);
 }
 
 // Worker thread: a folder's contents as a tree, breadth-first so a huge folder still shows its top
@@ -325,7 +327,7 @@ std::unique_ptr<GridData> GridReadFolder(const std::wstring& root, const std::at
     std::vector<std::wstring> queue{L""};  // folders to list, relative, '/'-separated
     bool partial = false;
     LONGLONG start = Now();
-    for (size_t q = 0; q < queue.size() && !partial; q++) {
+    for (size_t q = 0; q < queue.size() && !partial && gen == mine; q++) {
         std::wstring rel = queue[q], dir = root + L"\\" + rel;
         std::replace(dir.begin(), dir.end(), L'/', L'\\');
         WIN32_FIND_DATAW fd;
@@ -347,39 +349,48 @@ std::unique_ptr<GridData> GridReadFolder(const std::wstring& root, const std::at
         } while (!partial && FindNextFileW(h, &fd));
         FindClose(h);
     }
-    if (entries.empty()) return nullptr;
-    return BuildTree(std::move(entries), partial, false);
+    if (entries.empty() || gen != mine) return nullptr;
+    return BuildTree(std::move(entries), partial, false, false);
 }
 
 namespace {
 // Tree order (folders first, natural names), indent per depth, Name/Size/Modified columns.
-std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted) {
-    // Add folders that only appear as part of a path, then sort into a tree.
-    std::vector<std::wstring> known;
-    for (auto& e : entries) known.push_back(e.path);
-    std::sort(known.begin(), known.end());
-    for (size_t i = 0, n = entries.size(); i < n; i++)
-        for (size_t s = entries[i].path.rfind(L'/'); s != std::wstring::npos && s > 0; s = entries[i].path.rfind(L'/', s - 1)) {
-            std::wstring parent = entries[i].path.substr(0, s);
-            auto it = std::lower_bound(known.begin(), known.end(), parent);
-            if (it != known.end() && *it == parent) break;
-            known.insert(it, parent);
-            entries.push_back({parent, true, -1, 0});
-        }
+std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, bool archive) {
+    if (archive) {
+        // Archives can omit explicit directory entries. Use a set so adding parents does not shift the whole list.
+        std::unordered_set<std::wstring> known;
+        known.reserve(entries.size());
+        for (const auto& e : entries) known.insert(e.path);
+        for (size_t i = 0, n = entries.size(); i < n; i++)
+            for (size_t s = entries[i].path.rfind(L'/'); s != std::wstring::npos && s > 0; s = entries[i].path.rfind(L'/', s - 1)) {
+                std::wstring parent = entries[i].path.substr(0, s);
+                if (!known.insert(parent).second) break;
+                entries.push_back({std::move(parent), true, -1, 0});
+            }
+    }
     std::sort(entries.begin(), entries.end(), TreeLess);
 
     auto g = std::make_unique<GridData>();
     g->cols = 3;
+    g->cells.reserve((entries.size() + 1) * g->cols);
+    g->indent.reserve(entries.size());
+    g->paths.reserve(entries.size());
+    g->folder.reserve(entries.size());
     AddCell(*g, L"Name"), AddCell(*g, L"Size"), AddCell(*g, L"Modified");
     long long total = 0;
     size_t files = 0, folders = 0;
+    time_t lastMinute = -2;
+    std::wstring date;
     for (auto& e : entries) {
         size_t slash = e.path.rfind(L'/');
         AddCell(*g, slash == std::wstring::npos ? e.path : std::wstring_view(e.path).substr(slash + 1));
         AddCell(*g, e.size >= 0 ? Bytes(e.size) : L"");
-        AddCell(*g, FormatDate(e.mtime));
+        // The Modified column has minute resolution. Adjacent files often share the same displayed time.
+        time_t minute = e.mtime > 0 ? e.mtime / 60 : -1;
+        if (minute != lastMinute) date = FormatDate(e.mtime), lastMinute = minute;
+        AddCell(*g, date);
         g->indent.push_back((UINT8)std::min<size_t>(std::count(e.path.begin(), e.path.end(), L'/'), 255));
-        g->paths.push_back(e.path);
+        g->paths.push_back(std::move(e.path));
         g->folder.push_back(e.dir);
         if (e.dir) folders++;
         else files++, total += std::max(0LL, e.size);
