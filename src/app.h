@@ -297,7 +297,7 @@ struct MediaState {
     double pos, dur;      // seconds
     UINT videoW, videoH;  // display size of the video (aspect-corrected); 0 for audio
 };
-bool MediaOpen(const std::wstring& path);  // false if Media Foundation is unavailable
+bool MediaOpen(const std::wstring& path, bool videoView);  // false if Media Foundation is unavailable
 void MediaClose();
 MediaState MediaGet();
 bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWICBitmap>& out);

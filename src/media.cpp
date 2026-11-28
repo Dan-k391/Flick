@@ -18,11 +18,21 @@ namespace {
 ComPtr<IMFMediaEngine> g_engine;
 ComPtr<IMFMediaEngineEx> g_engineEx;
 WPARAM g_mediaGen;  // the UI thread owns the engine and its generation
-ULONGLONG g_frameUntil;  // deadline for fast frame probes, even when paused
+ULONGLONG g_fastProbeUntil;
+constexpr ULONGLONG kFastProbeMs = 300, kSeekProbeMs = 15000, kEndProbeMs = 1000;
+constexpr double kMediaTimeEpsilon = 1e-7;  // one Media Foundation timestamp unit in seconds
+struct SeekFrame {
+    ULONGLONG until;
+    double target;
+    bool copied;
+} g_seekFrame;
+bool g_videoView;
 bool g_error;
 bool g_muted;  // --bench / --mute: tests stay silent
 double g_volume = 1;  // the user's volume and mute, kept for the session
 bool g_userMuted;
+
+bool HasVideoFrames() { return g_videoView && g_engine->HasVideo(); }
 
 class Notify : public IMFMediaEngineNotify {
     std::atomic<LONG> ref_{1};
@@ -120,14 +130,16 @@ void UpdatePump() {
     PumpMode mode = PumpMode::Parked;
     if (!g_error) {
         bool seeking = g_engine->IsSeeking() != FALSE;
+        if (g_seekFrame.copied && !seeking) {
+            g_seekFrame = {};
+            g_fastProbeUntil = 0;
+        }
         bool playing = !seeking && g_engine->GetReadyState() >= MF_MEDIA_ENGINE_READY_HAVE_FUTURE_DATA &&
                        !g_engine->IsPaused() && !g_engine->IsEnded();
-        if (g_engine->HasVideo()) {
-            bool fastProbe = g_frameUntil && GetTickCount64() < g_frameUntil;
-            if (!fastProbe && !seeking) g_frameUntil = 0;
+        if (HasVideoFrames()) {
             if (playing) mode = PumpMode::Video;
-            else if (fastProbe) mode = PumpMode::Probe;
-            else if (g_frameUntil) mode = PumpMode::SlowProbe;  // an in-flight seek still needs a frame pull
+            else if (g_fastProbeUntil) mode = PumpMode::Probe;
+            else if (g_seekFrame.until) mode = PumpMode::SlowProbe;
         } else if (playing) mode = PumpMode::Audio;
     }
     if (g_pump) {
@@ -153,7 +165,7 @@ bool StartMediaFoundation() {
 
 }  // namespace
 
-bool MediaOpen(const std::wstring& path) {
+bool MediaOpen(const std::wstring& path, bool videoView) {
     MediaClose();
     static ComPtr<IMFMediaEngineClassFactory> factory;
     if (!StartMediaFoundation() ||
@@ -164,10 +176,11 @@ bool MediaOpen(const std::wstring& path) {
     ComPtr<IMFMediaEngineNotify> notify;
     notify.Attach(new Notify(g_hwnd, g_mediaGen));
     if (FAILED(MFCreateAttributes(&attrs, 3)) || FAILED(attrs->SetUnknown(MF_MEDIA_ENGINE_CALLBACK, notify.Get())) ||
-        FAILED(attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM)) ||  // frame-server mode
+        (videoView && FAILED(attrs->SetUINT32(MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM))) ||
         FAILED(attrs->SetUINT32(MF_MEDIA_ENGINE_AUDIO_CATEGORY, 3 /* AudioCategory_Media */)) ||
-        FAILED(factory->CreateInstance(0, attrs.Get(), &g_engine)))
+        FAILED(factory->CreateInstance(videoView ? 0 : MF_MEDIA_ENGINE_AUDIOONLY, attrs.Get(), &g_engine)))
         return false;
+    g_videoView = videoView;
     g_engine.As(&g_engineEx);
     g_engine->SetAutoPlay(TRUE);
     g_engine->SetMuted(g_muted || g_userMuted);
@@ -187,7 +200,9 @@ void MediaClose() {
         SetEvent(g_pump->wake);
         g_pump.reset();
     }
-    g_frameUntil = 0;
+    g_fastProbeUntil = 0;
+    g_seekFrame = {};
+    g_videoView = false;
     g_error = false;
     if (g_engine) g_engine->Shutdown();
     g_engineEx.Reset(), g_engine.Reset();
@@ -199,21 +214,32 @@ bool MediaOnTick(WPARAM gen, MediaState& state) {
     PumpMode mode = g_pump->mode;
     if (mode == PumpMode::Parked) return false;
     state = MediaGet();
-    if ((g_frameUntil && GetTickCount64() >= g_frameUntil) ||
-        ((mode == PumpMode::Video || mode == PumpMode::Audio) && (state.paused || state.ended)))
-        UpdatePump();
+    bool update = g_seekFrame.copied || ((mode == PumpMode::Video || mode == PumpMode::Audio) && (state.paused || state.ended));
+    if (g_fastProbeUntil || g_seekFrame.until) {
+        ULONGLONG now = GetTickCount64();
+        if (g_fastProbeUntil && now >= g_fastProbeUntil) g_fastProbeUntil = 0, update = true;
+        if (g_seekFrame.until && now >= g_seekFrame.until) g_seekFrame = {}, update = true;
+    }
+    if (update) UpdatePump();
     return true;
 }
 
 bool MediaOnEvent(WPARAM gen, DWORD event) {
     if (!g_engine || gen != g_mediaGen) return false;
-    if (event == MF_MEDIA_ENGINE_EVENT_ERROR) g_error = true;
-    // SEEKED can precede the actual frame. Retry briefly, stopping as soon as a frame is copied.
-    if (event == MF_MEDIA_ENGINE_EVENT_LOADEDDATA || event == MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY ||
-        event == MF_MEDIA_ENGINE_EVENT_SEEKED || event == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE) {
-        if (g_engine->HasVideo()) {
-            auto until = GetTickCount64() + 300;
-            g_frameUntil = g_engine->IsSeeking() ? std::max(g_frameUntil, until) : until;
+    if (event == MF_MEDIA_ENGINE_EVENT_ERROR) {
+        g_error = true;
+        g_seekFrame = {};
+        g_fastProbeUntil = 0;
+    } else if (HasVideoFrames()) {
+        if (event == MF_MEDIA_ENGINE_EVENT_LOADEDDATA || event == MF_MEDIA_ENGINE_EVENT_FIRSTFRAMEREADY ||
+            event == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE)
+            g_fastProbeUntil = GetTickCount64() + kFastProbeMs;
+        // SEEKED updates the clock. A successful frame transfer completes the frame request.
+        if (event == MF_MEDIA_ENGINE_EVENT_SEEKED && g_seekFrame.until)
+            g_fastProbeUntil = std::min(g_seekFrame.until, GetTickCount64() + kFastProbeMs);
+        if (event == MF_MEDIA_ENGINE_EVENT_ENDED && g_engine->IsEnded()) {
+            g_fastProbeUntil = 0;
+            if (g_seekFrame.until) g_seekFrame.until = std::min(g_seekFrame.until, GetTickCount64() + kEndProbeMs);
         }
     }
     UpdatePump();
@@ -232,7 +258,7 @@ MediaState MediaGet() {
     if (!std::isfinite(s.pos)) s.pos = 0;
     if (!std::isfinite(s.dur)) s.dur = 0;
     DWORD w = 0, h = 0, ax = 1, ay = 1;
-    if (g_engine->HasVideo() && SUCCEEDED(g_engine->GetNativeVideoSize(&w, &h)) && w && h) {
+    if (HasVideoFrames() && SUCCEEDED(g_engine->GetNativeVideoSize(&w, &h)) && w && h) {
         // GetVideoAspectRatio is the picture aspect ratio (16:9), which also covers anamorphic video.
         if (SUCCEEDED(g_engine->GetVideoAspectRatio(&ax, &ay)) && ax && ay) w = (DWORD)std::lround((double)h * ax / ay);
         s.videoW = w, s.videoH = h;
@@ -243,8 +269,12 @@ MediaState MediaGet() {
 // Copies the current frame into `out` (w x h pixels, recreated when the size changes) when a new one
 // is due. False: no new frame.
 bool MediaFrame(UINT w, UINT h, IWICImagingFactory* wic, ComPtr<IWICBitmap>& out) {
+    if (!g_engine || !g_videoView || !w || !h) return false;
+    // Rapid seeks can deliver the earlier seek's frame while the later request is queued. Compare
+    // the clock at the pull, since the pull itself can advance the engine to the next seek.
+    bool requested = g_seekFrame.until && std::abs(g_engine->GetCurrentTime() - g_seekFrame.target) < kMediaTimeEpsilon;
     LONGLONG pts;
-    if (!g_engine || !w || !h || g_engine->OnVideoStreamTick(&pts) != S_OK) return false;
+    if (g_engine->OnVideoStreamTick(&pts) != S_OK) return false;
     UINT cw = 0, ch = 0;
     if (out) out->GetSize(&cw, &ch);
     if ((cw != w || ch != h) && FAILED(wic->CreateBitmap(w, h, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &out)))
@@ -252,7 +282,16 @@ bool MediaFrame(UINT w, UINT h, IWICImagingFactory* wic, ComPtr<IWICBitmap>& out
     RECT dst{0, 0, (LONG)w, (LONG)h};
     MFARGB black{0, 0, 0, 255};
     if (FAILED(g_engine->TransferVideoFrame(out.Get(), nullptr, &dst, &black))) return false;
-    if (g_frameUntil && !g_engine->IsSeeking()) g_frameUntil = 0, UpdatePump();
+    if (g_seekFrame.until) {
+        // A frame can transfer before IsSeeking clears. Keep the evidence until the engine settles.
+        if (requested || (!g_engine->IsSeeking() && !g_engine->IsPaused() && !g_engine->IsEnded())) {
+            g_seekFrame.copied = true;
+            UpdatePump();
+        }
+    } else if (g_fastProbeUntil && !g_engine->IsSeeking()) {
+        g_fastProbeUntil = 0;
+        UpdatePump();
+    }
     return true;
 }
 
@@ -273,10 +312,19 @@ void MediaSetPlaying(bool play) {
 
 void MediaSeek(double seconds) {
     if (!g_engine || g_error || !std::isfinite(seconds)) return;
+    double duration = g_engine->GetDuration();
+    seconds = std::max(seconds, 0.0);
+    if (std::isfinite(duration) && duration > 0) seconds = std::min(seconds, duration);
+    if (!g_engine->IsSeeking() && std::abs(g_engine->GetCurrentTime() - seconds) < kMediaTimeEpsilon) return;
     HRESULT hr = g_engineEx ? g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL)
                            : g_engine->SetCurrentTime(seconds);
     // In frame-server mode a paused seek can wait for OnVideoStreamTick before sending SEEKED.
-    if (SUCCEEDED(hr) && g_engine->HasVideo()) g_frameUntil = GetTickCount64() + 2000;
+    if (SUCCEEDED(hr) && HasVideoFrames()) {
+        ULONGLONG now = GetTickCount64();
+        g_fastProbeUntil = now + kFastProbeMs;
+        // Bound the retries when a source never supplies a frame, especially at EOF.
+        g_seekFrame = {now + (seconds == duration ? kEndProbeMs : kSeekProbeMs), seconds, false};
+    }
     UpdatePump();
 }
 

@@ -1145,17 +1145,18 @@ DWORD WINAPI InfoThread(void* p) {
 }
 
 void OnInfo(InfoJob* job) {
-    if (job->gen == g_infoGen && (g_kind == K_Info || g_kind == K_Media) && g_visible) {
+    const bool audio = g_kind == K_Media && !g_mediaVideo;
+    if (job->gen == g_infoGen && (g_kind == K_Info || audio) && g_visible) {
+        if (job->items >= 0 && g_kind == K_Info && g_info.size() > 1)
+            g_info[1] = std::to_wstring(job->items) + (job->items >= 100000 ? L"+ items"
+                                                       : job->items == 1 ? L" item" : L" items");
         g_info.insert(g_info.begin(), job->lines.begin(), job->lines.end());
-        if (g_kind == K_Media && !g_mediaVideo && !job->lyrics.empty()) SetSubs(job->lyrics);
+        if (audio && !job->lyrics.empty()) SetSubs(job->lyrics);
         if (job->bmp) {
             ComPtr<IWICBitmap> wb;
             if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(job->bmp, nullptr, WICBitmapUsePremultipliedAlpha, &wb)))
                 g_bmp = ToD2D(wb.Get());
         }
-        if (job->items >= 0)
-            g_info[1] = std::to_wstring(job->items) + (job->items >= 100000 ? L"+ items"
-                                                       : job->items == 1 ? L" item" : L" items");
         InvalidateRect(g_hwnd, nullptr, FALSE);
         Log(L"info  thumbnail/count ready %.2f ms after key press", MsSince(job->t0));
     }
@@ -1227,6 +1228,9 @@ void OnMediaEvent(WPARAM gen, DWORD event) {
     } else if (event == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA) {
         g_sub = (s.videoW ? std::to_wstring(s.videoW) + L" × " + std::to_wstring(s.videoH) + L" · " : L"") + Clock(s.dur);
         if (g_mediaVideo) PlaceWindow();
+    } else if (g_mediaVideo && g_visible && !g_seekDrag &&
+               ((event == MF_MEDIA_ENGINE_EVENT_PAUSE && s.paused) || (event == MF_MEDIA_ENGINE_EVENT_ENDED && s.ended))) {
+        TryFrame(s);  // one final pull even if the playback pump has already parked
     }
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -1388,11 +1392,14 @@ void SeekAt(float x) {
 }
 
 void EndSeek() {
+    bool resume = std::exchange(g_seekResume, false);
+    float frac = std::exchange(g_seekFrac, -1.f);
+    g_seekDrag = false;
     g_scrubGen = 0;
     MediaScrubStop();
-    if (g_seekFrac >= 0) MediaSeek(g_seekFrac * MediaGet().dur);
-    g_seekFrac = -1;
-    if (g_seekResume) MediaToggle(), g_seekResume = false;
+    if (frac >= 0) MediaSeek(frac * MediaGet().dur);
+    if (resume) MediaSetPlaying(true);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 void OnScrub(int gen, IWICBitmap* frame) {
@@ -1446,6 +1453,7 @@ void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBru
 
 // Releases everything the current preview holds (memory is given back whenever the preview closes).
 void ClearContent() {
+    ++g_infoGen;
     if (g_kind == K_Image) ++g_imageGen;
     if (g_copyTooLarge) CopyFeedback(false);
     g_bmp.Reset();
@@ -1517,7 +1525,7 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
             OnPoster(g_posterGen, nullptr);
         }
     }
-    else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
+    else if (HasExt(path, kAudioExt) && MediaOpen(path, false)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
     else if (HasExt(path, kSheetExt) && LoadSheet(path)) g_kind = K_Grid;
     else if (HasExt(path, L" .docx .docm .dotx .dotm ") && WordLoad(path, g_sub)) g_kind = K_Word;
@@ -2388,7 +2396,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_CAPTURECHANGED:
             if (g_seekDrag) EndSeek();
-            g_seekDrag = g_volDrag = g_panDrag = false;
+            g_volDrag = g_panDrag = false;
             if (g_selDrag) g_selDrag = false, KillTimer(h, kSelTimer);
             if (g_dragAxis >= 0) g_dragAxis = -1, InvalidateRect(h, nullptr, FALSE);
             return 0;
@@ -2557,7 +2565,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_FLICK_PLAYVIDEO:
             if ((int)w == g_posterGen && g_kind == K_Media && g_mediaVideo) {
                 UpdateWindow(h);  // the poster may have arrived after the initial paint
-                if (!MediaOpen(g_path)) ShowInfo();
+                if (!MediaOpen(g_path, true)) ShowInfo();
             }
             return 0;
         case WM_FLICK_GRID:
