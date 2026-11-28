@@ -302,6 +302,8 @@ struct SubCue {
     std::vector<std::pair<UINT32, UINT32>> italic, bold;
 };
 std::vector<SubCue> ParseSubtitles(const std::wstring& s);
+// LRC lyrics ("[01:02.50][01:30]words"): a line lasts until the next one starts; [ar:..] tags are skipped.
+std::vector<SubCue> ParseLyrics(const std::wstring& s);
 
 // window.cpp helpers for the views
 Microsoft::WRL::ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource*);  // at window DPI, sharing WIC memory

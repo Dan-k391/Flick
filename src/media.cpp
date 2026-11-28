@@ -277,6 +277,28 @@ std::vector<SubCue> ParseSubtitles(const std::wstring& s) {
     return cues;
 }
 
+std::vector<SubCue> ParseLyrics(const std::wstring& s) {
+    std::vector<SubCue> cues;
+    for (size_t i = 0; i < s.size();) {
+        size_t e = std::min(s.find(L'\n', i), s.size());
+        std::wstring_view l = std::wstring_view(s).substr(i, e - i);
+        i = e + 1;
+        std::vector<double> at;
+        for (std::wstring_view p; !l.empty() && l[0] == L'[';) {
+            double t = SubTime(p = l.substr(1));
+            if (t < 0 || p.empty() || p[0] != L']') break;  // [ar:...], [offset:...]
+            at.push_back(t), l = p.substr(1);
+        }
+        while (!l.empty() && (l.back() == L'\r' || l.back() == L' ')) l.remove_suffix(1);
+        while (!l.empty() && l[0] == L' ') l.remove_prefix(1);
+        for (double t : at) cues.push_back({t, 0, std::wstring(l)});
+    }
+    std::stable_sort(cues.begin(), cues.end(), [](const SubCue& x, const SubCue& y) { return x.start < y.start; });
+    for (size_t k = 0; k < cues.size(); k++) cues[k].end = k + 1 < cues.size() ? cues[k + 1].start : cues[k].start + 10;
+    std::erase_if(cues, [](const SubCue& c) { return c.text.empty() || c.end <= c.start; });  // blank lines end the one before
+    return cues;
+}
+
 // Frames straight from a source reader (no playback pipeline): the poster shown while the media engine
 // starts (200-300 ms), and the frames shown while the seek bar is dragged. Worker threads.
 namespace {

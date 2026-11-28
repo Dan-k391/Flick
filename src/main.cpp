@@ -398,6 +398,11 @@ Para ``code`` and `link <http://x>`_.
             has(rst, L"```python\ny = 2\n```", L"rst code");
             if (std::wstring e = OfficeSelfTest(); !e.empty()) ok = false, Log(L"selftest: office %s", e.c_str());
             if (std::wstring e = WordSelfTest(); !e.empty()) ok = false, Log(L"selftest: %s", e.c_str());
+            // Lyrics: two stamps on a line, tags skipped, a blank stamped line ends the one before, sorted by time.
+            auto lrc = ParseLyrics(L"[ar:X]\r\n[00:01.50][00:10]Hello\r\n[00:05.00] World\n[00:07]\nno stamp\n");
+            if (lrc.size() != 3 || lrc[0].start != 1.5 || lrc[0].end != 5 || lrc[0].text != L"Hello" || lrc[1].text != L"World" ||
+                lrc[1].end != 7 || lrc[2].start != 10 || lrc[2].end != 20)
+                ok = false, Log(L"selftest: lyrics");
         }
         {  // tree: a(dir){ b(dir){ c }, d }, e  -> collapsed shows a, e; expanding a shows a, b, d, e
             auto g = std::make_unique<GridData>();

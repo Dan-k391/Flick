@@ -971,6 +971,13 @@ std::wstring FormatTime(const FILETIME& ft) {
     return std::wstring(d) + L", " + t;
 }
 
+// Subtitles beside a video, lyrics beside audio (drawn while it plays).
+void SetSubs(std::vector<SubCue>& subs) {
+    g_subs = std::move(subs), g_subMaxLen = 0;
+    for (auto& c : g_subs) g_subMaxLen = std::max(g_subMaxLen, c.end - c.start);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
+
 // Shell thumbnails (5-60 ms, unbounded for slow handlers) and folder item counts run on a worker
 // thread; the info card is shown immediately and the result is filled in when it arrives.
 struct InfoJob {
@@ -981,6 +988,7 @@ struct InfoJob {
     int items = -1;  // folders only
     bool tags = false;
     std::vector<std::wstring> lines;  // audio: title/artist/album
+    std::vector<SubCue> lyrics;       // audio: name.lrc beside it
 };
 std::atomic<int> g_infoGen;
 
@@ -1008,6 +1016,14 @@ DWORD WINAPI InfoThread(void* p) {
             else if (!artist.empty()) job->lines.push_back(artist);
             if (!album.empty()) job->lines.push_back(album);
         }
+        std::string u8;
+        bool truncated;
+        if (std::wstring lrc = job->path.substr(0, job->path.find_last_of(L'.')) + L".lrc";
+            job->tags && GetFileAttributesW(lrc.c_str()) != INVALID_FILE_ATTRIBUTES && ReadText(lrc, u8, truncated)) {
+            std::wstring w(MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), nullptr, 0), L'\0');
+            MultiByteToWideChar(CP_UTF8, 0, u8.data(), (int)u8.size(), w.data(), (int)w.size());
+            job->lyrics = ParseLyrics(w);
+        }
     }
     CoUninitialize();
     if (job->items >= 0) {
@@ -1031,6 +1047,7 @@ DWORD WINAPI InfoThread(void* p) {
 void OnInfo(InfoJob* job) {
     if (job->gen == g_infoGen && (g_kind == K_Info || g_kind == K_Media) && g_visible) {
         g_info.insert(g_info.begin(), job->lines.begin(), job->lines.end());
+        if (g_kind == K_Media && !g_mediaVideo && !job->lyrics.empty()) SetSubs(job->lyrics);
         if (job->bmp) {
             ComPtr<IWICBitmap> wb;
             if (SUCCEEDED(g_wic->CreateBitmapFromHBITMAP(job->bmp, nullptr, WICBitmapUsePremultipliedAlpha, &wb)))
@@ -1169,10 +1186,7 @@ void OnPoster(int gen, IWICBitmap* frame) {
 }
 
 void OnSubs(int gen, std::vector<SubCue>& subs) {
-    if (gen != g_posterGen || g_kind != K_Media) return;
-    g_subs = std::move(subs), g_subMaxLen = 0;
-    for (auto& c : g_subs) g_subMaxLen = std::max(g_subMaxLen, c.end - c.start);
-    InvalidateRect(g_hwnd, nullptr, FALSE);
+    if (gen == g_posterGen && g_kind == K_Media) SetSubs(subs);
 }
 
 // Indices of the cues on screen at `t` (usually none or one; overlapping cues stack in start order).
@@ -1798,8 +1812,18 @@ void Paint() {
     if (g_kind == K_Info) DrawInfo(area, text.Get(), sub.Get());
     if (g_kind == K_Media) {
         MediaState ms = MediaGet();
-        if (!g_mediaVideo) DrawInfo({area.left, area.top, area.right, area.bottom - 52}, text.Get(), sub.Get());
-        else if (g_frame && (ms.videoW || g_posterW)) g_rt->DrawBitmap(g_frame.Get(), VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        if (!g_mediaVideo) {
+            float lyric = g_subs.empty() ? 0 : 40;  // the current lyric line, between the card and the control bar
+            DrawInfo({area.left, area.top, area.right, area.bottom - 52 - lyric}, text.Get(), sub.Get());
+            if (lyric) {
+                g_subOn = SubsAt(SubClock(ms));
+                std::wstring line;
+                for (size_t i : g_subOn) line += (line.empty() ? L"" : L"  ") + g_subs[i].text;
+                float y = area.bottom - 52 - lyric;
+                g_rt->DrawText(line.c_str(), (UINT32)line.size(), g_fmtName.Get(), {area.left, y + 4, area.right, y + lyric}, text.Get());
+            }
+        } else if (g_frame && (ms.videoW || g_posterW))
+            g_rt->DrawBitmap(g_frame.Get(), VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         DrawControls(sz, text.Get(), fill.Get());
         if (g_mediaVideo) DrawSubs(ms, fill.Get());
     }
