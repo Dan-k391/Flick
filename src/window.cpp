@@ -367,15 +367,19 @@ bool LoadImage(const std::wstring& path) {
     GUID container{};
     UINT frames = 0, w, h;
     std::wstring label;  // "": the decoded size; starting with " ·": appended to it
+    bool own = false;    // imgfmt.cpp: decoded whole already (a zoom has nothing more to decode)
     g_orient = 1;
     if (HasExt(path, kImgOwnExt)) {  // imgfmt.cpp: decoded whole, scaled below like the rest
-        bool vector;
-        ComPtr<IWICBitmap> b = ImgLoad(path, g_dpi / 96.f, vector);
+        double aw, ah;
+        PictureArea(aw, ah);
+        D2D1_SIZE_F natural;
+        ComPtr<IWICBitmap> b = ImgLoad(path, g_dpi / 96.f, {(float)aw, (float)ah}, natural);
         if (!b) return false;
         b->GetSize(&w, &h);
         pic = b;
-        g_natW = vector ? w * 96.f / g_dpi : w, g_natH = vector ? h * 96.f / g_dpi : h;
-        if (vector) label = std::to_wstring(std::lround(g_natW)) + L" × " + std::to_wstring(std::lround(g_natH));
+        own = true;
+        g_natW = natural.width ? natural.width : w, g_natH = natural.width ? natural.height : h;
+        if (natural.width) label = std::to_wstring(std::lround(g_natW)) + L" × " + std::to_wstring(std::lround(g_natH));
     } else {
         // Camera raw: the Store codec's decoder by name (for .dng WIC picks its own DNG decoder, which shows only the
         // small first IFD), and its embedded preview (a JPEG, often full size): demosaicing 24 MP takes ~450 ms.
@@ -412,7 +416,7 @@ bool LoadImage(const std::wstring& path) {
     PictureArea(maxW, maxH);
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = g_decodeScale > 0 ? std::min(1.0, g_decodeScale) : std::min({1.0, maxW / w, maxH / h});
-    g_imgReduced = s < 1;
+    g_imgReduced = s < 1 && !own;  // Sharpen re-decodes; the own formats are whole already
     ComPtr<IWICBitmapSource> src = pic;
     if (s < 1) {
         UINT sw = std::max(1u, (UINT)(w * s)), sh = std::max(1u, (UINT)(h * s));
