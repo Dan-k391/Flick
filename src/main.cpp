@@ -405,6 +405,15 @@ Para ``code`` and `link <http://x>`_.
             if (lrc.size() != 3 || lrc[0].start != 1.5 || lrc[0].end != 5 || lrc[0].text != L"Hello" || lrc[1].text != L"World" ||
                 lrc[1].end != 7 || lrc[2].start != 10 || lrc[2].end != 20)
                 ok = false, Log(L"selftest: lyrics");
+            // A line stamped 20,000 times, 500 characters long: 10,000 cues of 300 characters.
+            std::wstring bomb;
+            for (int k = 0; k < 20000; k++) {
+                wchar_t st[16];
+                swprintf_s(st, L"[%02d:%02d.%02d]", k / 6000, k / 100 % 60, k % 100);
+                bomb += st;
+            }
+            lrc = ParseLyrics(bomb + std::wstring(500, L'a'));
+            if (lrc.size() != 10000 || lrc[0].text.size() != 300) ok = false, Log(L"selftest: lyrics caps");
         }
         {  // tree: a(dir){ b(dir){ c }, d }, e  -> collapsed shows a, e; expanding a shows a, b, d, e
             auto g = std::make_unique<GridData>();

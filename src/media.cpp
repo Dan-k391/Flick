@@ -278,20 +278,22 @@ std::vector<SubCue> ParseSubtitles(const std::wstring& s) {
 }
 
 std::vector<SubCue> ParseLyrics(const std::wstring& s) {
+    // Bounds (the file chooses how often a line repeats): the first 1M characters, 10,000 cues, 300 characters a line.
+    constexpr size_t kChars = 1 << 20, kCues = 10000, kLine = 300;
     std::vector<SubCue> cues;
-    for (size_t i = 0; i < s.size();) {
-        size_t e = std::min(s.find(L'\n', i), s.size());
+    for (size_t i = 0, end = std::min(s.size(), kChars); i < end && cues.size() < kCues;) {
+        size_t e = std::min(s.find(L'\n', i), end);
         std::wstring_view l = std::wstring_view(s).substr(i, e - i);
         i = e + 1;
         std::vector<double> at;
-        for (std::wstring_view p; !l.empty() && l[0] == L'[';) {
+        for (std::wstring_view p; !l.empty() && l[0] == L'[' && at.size() < kCues;) {
             double t = SubTime(p = l.substr(1));
             if (t < 0 || p.empty() || p[0] != L']') break;  // [ar:...], [offset:...]
             at.push_back(t), l = p.substr(1);
         }
         while (!l.empty() && (l.back() == L'\r' || l.back() == L' ')) l.remove_suffix(1);
         while (!l.empty() && l[0] == L' ') l.remove_prefix(1);
-        for (double t : at) cues.push_back({t, 0, std::wstring(l)});
+        for (size_t k = 0; k < at.size() && cues.size() < kCues; k++) cues.push_back({at[k], 0, std::wstring(l.substr(0, kLine))});
     }
     std::stable_sort(cues.begin(), cues.end(), [](const SubCue& x, const SubCue& y) { return x.start < y.start; });
     for (size_t k = 0; k < cues.size(); k++) cues[k].end = k + 1 < cues.size() ? cues[k + 1].start : cues[k].start + 10;
