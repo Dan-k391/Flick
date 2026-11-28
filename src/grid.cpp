@@ -1050,23 +1050,37 @@ bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap) {
 
 // Reads the members `want` accepts (it returns a byte limit, 0 = skip) in one pass: Office files are zips.
 bool ArchiveReadMembers(const std::wstring& path, const std::function<size_t(std::wstring_view)>& want,
-                        std::vector<std::pair<std::wstring, std::string>>& out) {
+                        std::vector<std::pair<std::wstring, std::string>>& out, const std::atomic<int>* gen, int mine) {
+    auto cancelled = [&] { return gen && gen->load(std::memory_order_relaxed) != mine; };
+    if (cancelled()) return false;
     Archive* api = Api();
     if (!api) return false;
     void* a = api->read_new();
+    if (!a) return false;
     api->support_format_all(a);
     void* e;
     bool ok = api->open_filename_w(a, path.c_str(), 1 << 16) == 0;
-    while (ok && api->next_header(a, &e) == 0) {
+    size_t first = out.size();
+    while (ok && !cancelled() && api->next_header(a, &e) == 0) {
+        if (cancelled()) break;
         const wchar_t* name = api->pathname_w(e);
         size_t cap = name ? want(name) : 0;
         if (!cap) continue;  // skipped by seeking, not decompressed
+        if (cancelled()) break;
         std::string data;
-        if (api->size_is_set(e)) data.reserve((size_t)std::min<long long>(api->size(e), cap));
+        if (long long size = api->size_is_set(e) ? api->size(e) : 0; size > 0)
+            data.reserve((size_t)std::min<UINT64>(size, cap));
         char buf[1 << 16];
-        for (long long n; data.size() < cap && (n = api->read_data(a, buf, sizeof buf)) > 0;) data.append(buf, (size_t)n);
+        for (long long n; data.size() < cap && !cancelled() &&
+                          (n = api->read_data(a, buf, std::min(sizeof buf, cap - data.size()))) > 0;)
+            data.append(buf, (size_t)n);
+        if (cancelled()) break;
         out.emplace_back(name, std::move(data));
     }
     api->free(a);
+    if (cancelled()) {
+        out.resize(first);
+        return false;
+    }
     return ok;
 }

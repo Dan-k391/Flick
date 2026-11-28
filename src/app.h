@@ -217,8 +217,10 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep);  
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::atomic<int>& gen, int mine);
 std::unique_ptr<GridData> GridReadFolder(const std::wstring& path, const std::atomic<int>& gen, int mine);
 bool ArchiveReadRaw(const std::wstring& path, std::string& out, size_t cap);   // gunzip & co. (svgz)
+// want: byte limit, 0 = skip. A cancelled read returns false and discards the members from this call.
 bool ArchiveReadMembers(const std::wstring& path, const std::function<size_t(std::wstring_view)>& want,
-                        std::vector<std::pair<std::wstring, std::string>>& out);  // want: byte limit, 0 = skip
+                        std::vector<std::pair<std::wstring, std::string>>& out,
+                        const std::atomic<int>* gen = nullptr, int mine = 0);
 void GridSet(std::unique_ptr<GridData>);  // nullptr clears
 const GridData* GridGet();
 void GridSetCell(size_t bodyRow, size_t col, const std::wstring& value);

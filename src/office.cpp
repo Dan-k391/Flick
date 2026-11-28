@@ -730,11 +730,12 @@ Microsoft::WRL::ComPtr<IWICBitmap> DecodePicture(std::string_view bytes, UINT w,
 namespace {
 
 // Pictures (decoded at drawn size x scale) and charts (placeholders) of a drawing, at their cell anchors.
-void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData& g, float scale) {
+void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData& g, float scale,
+                const std::atomic<int>* gen, int mine) {
     size_t slash = drawing.rfind(L'/');
     std::wstring dir = drawing.substr(0, slash + 1), relsName = dir + L"_rels/" + drawing.substr(slash + 1) + L".rels";
     Members m;
-    ArchiveReadMembers(path, [&](std::wstring_view n) { return n == drawing || n == relsName ? kMaxXml : 0; }, m);
+    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == drawing || n == relsName ? kMaxXml : 0; }, m, gen, mine)) return;
     auto rels = Rels(Member(m, relsName), dir);
     auto edge = [](const std::vector<float>& sizes, float def, long long i) {  // i from the file: any value
         float at = 0;
@@ -778,8 +779,8 @@ void XlPictures(const std::wstring& path, const std::wstring& drawing, GridData&
         else if (n == "graphicFrame") chart = true;
     }
     m.clear();
-    ArchiveReadMembers(path, [&](std::wstring_view n) { return std::find(media.begin(), media.end(), n) != media.end() ? kMaxXml : 0; }, m);
-    for (size_t i = 0; i < g.pics.size(); i++)
+    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return std::find(media.begin(), media.end(), n) != media.end() ? kMaxXml : 0; }, m, gen, mine)) return;
+    for (size_t i = 0; i < g.pics.size() && (!gen || *gen == mine); i++)
         if (std::string_view bytes = media[i].empty() ? std::string_view{} : Member(m, media[i]); !bytes.empty()) {
             D2D1_RECT_F rc = g.pics[i].rc;
             g.pics[i].wic = DecodePicture(bytes, std::max(1u, (UINT)std::lround((rc.right - rc.left) * scale)),
@@ -797,7 +798,7 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
                        (n.starts_with(L"xl/theme/theme") && n.ends_with(L".xml"))
                    ? kMaxXml : 0;
     };
-    if (!ArchiveReadMembers(path, meta, m)) return nullptr;
+    if (!ArchiveReadMembers(path, meta, m, gen, mine)) return nullptr;
     auto g = std::make_unique<GridData>();
     std::vector<std::string> rids;
     bool d1904 = false;
@@ -833,7 +834,7 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
     std::wstring dir = target.substr(0, slash + 1), relsName = dir + L"_rels/" + target.substr(slash + 1) + L".rels";
     m.clear();
     size_t sheetCap = quick ? kQuickXml : 3 * kMaxXml;  // 50k rows of 20 numbers are ~40 MB of XML
-    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == target ? sheetCap : n == relsName ? kMaxXml : 0; }, m)) return nullptr;
+    if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == target ? sheetCap : n == relsName ? kMaxXml : 0; }, m, gen, mine)) return nullptr;
     std::string_view xml = Member(m, target);
     bool cut = xml.size() >= sheetCap;
 
@@ -978,7 +979,8 @@ std::unique_ptr<GridData> XlsxGrid(const std::wstring& path, int want, float pic
     Fill(*g, s, rowXf, colXf);
     if (colW.size() < g->cols) colW.resize(g->cols, g->defColW);  // widths from the sheet, not the text
     if (quick) g->more = more || !drawingId.empty();
-    else if (!drawingId.empty()) XlPictures(path, Rels(Member(m, relsName), dir)[drawingId], *g, picScale);
+    else if (!drawingId.empty()) XlPictures(path, Rels(Member(m, relsName), dir)[drawingId], *g, picScale, gen, mine);
+    if (gen && *gen != mine) return nullptr;
     long long r1, c1;  // the size the sheet says it has, while only its first rows are read
     Ref(dim.substr(std::min(dim.find(':') + 1, dim.size())), r1, c1);
     if (quick && more && r1 > 0 && c1 >= 0)
@@ -1443,8 +1445,7 @@ std::unique_ptr<GridData> OfficeToGrid(const std::wstring& path, int sheet, floa
         // No table within the first part (styles before it): the open path reads the whole XML after all.
         for (size_t cap = quick ? kQuickXml : kMaxXml;; cap = kMaxXml) {
             Members m;
-            ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m);
-            if (m.empty()) break;
+            if (!ArchiveReadMembers(path, [&](std::wstring_view n) { return n == L"content.xml" ? cap : 0; }, m, gen, mine) || m.empty()) break;
             bool cut = m[0].second.size() >= cap;
             more = quick && cut && cap < kMaxXml, truncated = cut && cap == kMaxXml;
             rows = OdsSheet(m[0].second, sheet, tabs, maxRows, more, gen, mine);

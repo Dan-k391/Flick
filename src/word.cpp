@@ -1272,7 +1272,7 @@ DWORD WINAPI PicThread(void* arg) {
         for (auto& w : job->want)
             if (std::get<0>(w) == n) return 64 << 20;
         return 0;
-    }, m);
+    }, m, &g_gen, job->gen);
     for (auto& [name, w, h] : job->want) {
         if (g_gen != job->gen) break;
         auto* msg = new PicMsg{name, DecodePicture(Member(m, name), w, h), w};
