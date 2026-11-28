@@ -130,6 +130,10 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 
 **Misc**
 - `archiveint.dll` (Windows' libarchive, undocumented) lists archives and inflates zips; missing → info card.
+- Gzip-filtered TAR drains member data with `archive_read_data_block` before the next header, checking generation
+  and deadline between native blocks. ZIP and plain TAR keep native header skipping. That path also applies if
+  the optional format, filter or block APIs are missing. Opening, parsing a header (including PAX/GNU metadata),
+  and each native data-block call are still indivisible, including any blocking I/O inside them.
 - Folders scan breadth-first for 60 ms or 10k rows. Archives scan for 3 s or 200k headers and keep at most
   200k rows including omitted parents. Both limit relative paths to 4,096 UTF-16 units and 255 levels below
   the top row, and keep at most 8 Mi UTF-16 units of row paths. Archive directory-index keys are bounded by

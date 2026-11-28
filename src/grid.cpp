@@ -129,10 +129,17 @@ struct Archive {
     int (*is_encrypted)(void*);
     int (*support_format_raw)(void*);
     long long (*read_data)(void*, void*, size_t);
+    int (*filter_code)(void*, int);
+    int (*format)(void*);
+    int (*read_data_block)(void*, const void**, size_t*, long long*);
     bool Load() {
         HMODULE m = LoadLibraryExW(L"archiveint.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!m) return false;
         auto get = [&](auto& fn, const char* name) { return (fn = (std::remove_reference_t<decltype(fn)>)GetProcAddress(m, name)); };
+        // Optional: older system DLLs can still use the default header skip.
+        get(filter_code, "archive_filter_code");
+        get(format, "archive_format");
+        get(read_data_block, "archive_read_data_block");
         return get(read_new, "archive_read_new") && get(support_filter_all, "archive_read_support_filter_all") &&
                get(support_format_all, "archive_read_support_format_all") &&
                get(open_filename_w, "archive_read_open_filename_w") && get(next_header, "archive_read_next_header") &&
@@ -161,6 +168,19 @@ constexpr size_t kArchiveRows = 200000, kFolderRows = 10000;
 constexpr size_t kTreePathUnits = 8 << 20;  // sum of row path lengths, including synthetic parents
 constexpr size_t kTreePathMax = 4096, kTreeDepthMax = 255;
 constexpr double kArchiveReadMs = 3000, kFolderReadMs = 60;
+
+// Gzip has to inflate the TAR member before the next header. Drain native blocks so we can stop between them.
+// This avoids copying the data or materializing holes in a sparse TAR member.
+bool DrainGzipTarMember(const Archive& api, void* reader, const std::atomic<int>& gen, int mine, LONGLONG start) {
+    const void* bytes;
+    size_t size;
+    long long offset;
+    while (gen == mine && MsSince(start) < kArchiveReadMs) {
+        int r = api.read_data_block(reader, &bytes, &size, &offset);
+        if (r != 0) return r == 1 /* ARCHIVE_EOF */ && gen == mine && MsSince(start) < kArchiveReadMs;
+    }
+    return false;
+}
 
 struct TreeEntries {
     size_t maxRows;
@@ -365,9 +385,15 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
     LONGLONG start = Now();
     if (api.open_filename_w(a, path.c_str(), 1 << 16) == 0) {
         ArchiveDirs dirs;
+        constexpr int kFilterGzip = 1, kFormatBaseMask = 0xff0000, kFormatTar = 0x30000;
+        bool gzip = api.filter_code && api.format && api.read_data_block && api.filter_code(a, 0) == kFilterGzip;
+        bool gzipTar = false;
         for (size_t headers = 0; gen == mine; headers++) {
-            // Compressed tarballs must be decompressed to reach every header: bound the work.
             if (headers == kArchiveRows || MsSince(start) >= kArchiveReadMs) {
+                partial = true;
+                break;
+            }
+            if (gzipTar && !DrainGzipTarMember(api, a, gen, mine, start)) {
                 partial = true;
                 break;
             }
@@ -379,6 +405,7 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
                 partial = true;
                 break;
             }
+            if (headers == 0 && gzip) gzipTar = (api.format(a) & kFormatBaseMask) == kFormatTar;
             const wchar_t* p = e ? api.pathname_w(e) : nullptr;
             if (!p) continue;
             size_t len = wcsnlen_s(p, kTreePathMax + 1);
