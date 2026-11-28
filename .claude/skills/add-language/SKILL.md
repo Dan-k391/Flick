@@ -5,7 +5,7 @@ description: Add or fix syntax highlighting for a file extension in Flick's text
 
 # Add a language
 
-Everything is in `src/lang.cpp`.
+File and fence mappings are in `src/lang.cpp`. Linked modules are listed in `src/lexers.inc`.
 
 1. Find the Lexilla lexer name: `grep -n 'LexerModule lm' third_party/lexilla/lexers/Lex*.cxx`
    (the quoted string, e.g. `"cpp"`, `"python"`, `"rust"`).
@@ -16,4 +16,6 @@ Everything is in `src/lang.cpp`.
    keyword lists are space-separated; some lexers expect lowercase).
 5. Add a `const Lang` and an entry in `kMap` with space-delimited lowercase extensions
    (or full file names like `makefile`), e.g. `{L" .zig .zon ", &kLangZig}`.
-6. Build, then preview a sample file (e2e `-Names` or Explorer + Space) and check the screenshot.
+6. If the lexer is new to Flick, add its upstream source stem and module symbol to `src/lexers.inc`.
+7. Add a file and fence sample to `tests/lexers.cpp`. Build the `FlickLexerTest` target, then run it.
+   Preview a sample file and check the screenshot.
