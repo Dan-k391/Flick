@@ -83,10 +83,11 @@ std::wstring_view Cell(const GridData& g, size_t row, size_t col) {
 void DetectNumeric(GridData& g) {
     g.rightAlign.assign(g.cols, false);
     size_t rows = std::min<size_t>(g.Rows(), 500);
-    if (rows <= g.header) return;
+    size_t firstRow = g.header ? 1 : 0;
+    if (rows <= firstRow) return;
     struct Counts { UINT16 num = 0, total = 0; };
     std::vector<Counts> counts(g.cols);
-    for (size_t r = g.header; r < rows; r++) {  // the header is text, whatever the column holds
+    for (size_t r = firstRow; r < rows; r++) {  // the header is text, whatever the column holds
         size_t first = g.RowStart(r);
         for (size_t c = 0, cols = g.RowCols(r); c < cols; c++) {
             auto [off, len] = g.cells[first + c];
