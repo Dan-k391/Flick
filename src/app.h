@@ -62,9 +62,10 @@ std::vector<StyleRun> LexRange(Lexing&, UINT32 from, UINT32 to);  // runs in [fr
 // ---- window.cpp: the preview window
 struct Timing { double sel, load, ready, composed; const wchar_t* kind; };
 bool PreviewInit(HINSTANCE);
-Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0);
+Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0);
 void PreviewHide(bool restoreFocus);
 bool PreviewVisible();
+bool PreviewAcceptsNavigation();  // visible or opening in Explorer
 bool PreviewCanFind();  // a text preview is showing (Ctrl+F opens its search field)
 bool PreviewKey(const MSG&);  // message-loop prefilter for Esc/Space/Enter
 extern HWND g_hwnd;

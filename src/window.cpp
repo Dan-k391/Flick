@@ -77,6 +77,7 @@ std::string g_codeFont;
 UINT g_dpi = 96;
 bool g_dark, g_placing;
 std::atomic<bool> g_visible;
+std::atomic<bool> g_opening;  // Explorer navigation also applies before the first frame
 float g_natW, g_natH;   // size a picture is shown at, in DIPs: 1 image pixel = 1 DIP, like QuickLook
 bool g_decodeForClient;  // re-decoding after a manual resize: fit the current window, not the screen
 void PlaceWindow();
@@ -706,16 +707,41 @@ bool Pending() {
     return (g_kind == K_Pdf && !g_pdfFailed && (g_pageW.empty() || !g_pageW[0])) || (g_kind == K_Grid && g_gridPending);
 }
 
-// Waits (bounded) for content a worker produces (PDF page 1, archive listing), so the first frame
-// shows it instead of an empty placeholder.
-void WaitForContent() {
+struct OpenRequest {
+    std::wstring path;
+    HWND source;
+    LONGLONG pressed;
+};
+
+// Waits (bounded) for the first content. During an Explorer open, take navigation messages here
+// so Escape or a changed selection can replace the request before it reaches the screen.
+bool WaitForContent(OpenRequest& request) {
+    const DWORD wakeMask = QS_SENDMESSAGE | (request.source ? QS_POSTMESSAGE : 0);
     for (LONGLONG start = Now();;) {
         MSG m;
         PeekMessageW(&m, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);  // runs the worker's pending SendMessage
+        if (request.source) {
+            bool input = PeekMessageW(&m, g_hwnd, WM_FLICK_TOGGLE, WM_FLICK_HIDE, PM_REMOVE | PM_QS_POSTMESSAGE);
+            if (!g_opening || (input && m.message == WM_FLICK_HIDE)) break;
+            if (input) {
+                HWND explorer = (HWND)m.wParam;
+                auto path = ExplorerSelection(explorer);
+                if (!g_opening) break;
+                if (!path.empty() && path != request.path) {
+                    request = {std::move(path), explorer, (LONGLONG)m.lParam};
+                    return false;
+                }
+                if (m.message == WM_FLICK_TOGGLE) break;
+                // Releasing an arrow at the edge of the listing leaves the selection alone.
+                continue;
+            }
+        }
         double left = 120 - MsSince(start);  // slow content shows the placeholder, then fills in
-        if (!Pending() || left <= 0) break;
-        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)left + 1, QS_SENDMESSAGE);
+        if (!Pending() || left <= 0) return true;
+        MsgWaitForMultipleObjects(0, nullptr, FALSE, (DWORD)left + 1, wakeMask);
     }
+    request.path.clear();
+    return false;
 }
 
 D2D1::Matrix3x2F Mat(const D2D1_MATRIX_3X2_F& m) { return {m._11, m._12, m._21, m._22, m._31, m._32}; }
@@ -815,7 +841,8 @@ void PlaceWindow() {
         else if (hi > waHi - zone && lo > waLo + zone) pos = hi - size;
         return std::clamp(pos, waLo, std::max(waLo, waHi - size));
     };
-    int x = place(wr.left, wr.right, wa.left, wa.right, w), y = place(wr.top, wr.bottom, wa.top, wa.bottom, h);
+    int x = g_visible ? place(wr.left, wr.right, wa.left, wa.right, w) : (wa.left + wa.right - w) / 2;
+    int y = g_visible ? place(wr.top, wr.bottom, wa.top, wa.bottom, h) : (wa.top + wa.bottom - h) / 2;
     if (x == wr.left && y == wr.top && w == wr.right - wr.left && h == wr.bottom - wr.top) return;
     g_placing = true;
     SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2370,14 +2397,16 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             if (l && !wcscmp((const wchar_t*)l, L"ImmersiveColorSet")) ApplyTheme();
             break;
         case WM_FLICK_TOGGLE: {  // Space: open; on the file already shown, close; on another file, show that
+            g_opening = true;
             std::wstring path = ExplorerSelection((HWND)w);
-            if (!path.empty() && (!g_visible || path != g_path)) PreviewShow(path, (HWND)w, (LONGLONG)l);
+            if (!path.empty() && (!g_visible || path != g_path)) PreviewShow(std::move(path), (HWND)w, (LONGLONG)l);
             else PreviewHide(false);
             return 0;
         }
         case WM_FLICK_FOLLOW:
-            if (auto path = ExplorerSelection((HWND)w); g_visible && !path.empty() && path != g_path)
-                PreviewShow(path, (HWND)w, (LONGLONG)l);
+            if (g_visible)
+                if (auto path = ExplorerSelection((HWND)w); !path.empty() && path != g_path)
+                    PreviewShow(std::move(path), (HWND)w, (LONGLONG)l);
             return 0;
         case WM_FLICK_HIDE:
             PreviewHide(false);
@@ -2463,6 +2492,7 @@ bool HasFont(const wchar_t* family) {
 }  // namespace
 
 bool PreviewVisible() { return g_visible; }
+bool PreviewAcceptsNavigation() { return g_visible || g_opening; }
 ComPtr<ID2D1Bitmap> SharedBitmap(IWICBitmapSource* src) { return ToD2D(src); }
 IWICImagingFactory* WicFactory() { return g_wic.Get(); }
 
@@ -2578,27 +2608,40 @@ x
     return true;
 }
 
-Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
-    Timing t{MsSince(t0)};
-    LONGLONG start = Now();
-    g_source = source;
-    if (!g_visible) {
-        // Centre on the source window's monitor; PlaceWindow sets the size once the content is known.
-        HMONITOR mon = MonitorFromWindow(source ? source : GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
-        MONITORINFO mi{sizeof mi};
-        GetMonitorInfoW(mon, &mi);
-        RECT wa = mi.rcWork, wr;
-        GetWindowRect(g_hwnd, &wr);
-        int w = wr.right - wr.left, h = wr.bottom - wr.top;
-        g_placing = true;  // a move, not a resize: cheap
-        SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, 0, 0,
-                     SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        g_placing = false;
-        g_dpi = GetDpiForWindow(g_hwnd);
+Timing PreviewShow(std::wstring path, HWND source, LONGLONG t0) {
+    OpenRequest request{std::move(path), source, t0};
+    Timing t{};
+    g_opening = source != nullptr;
+    g_canFind = false;
+    for (;;) {
+        t.sel = MsSince(request.pressed);
+        LONGLONG start = Now();
+        g_source = request.source;
+        if (!g_visible) {
+            // Move only to cross monitors so the loaders use the destination DPI and picture area.
+            // PlaceWindow centres and resizes together on the destination monitor.
+            HMONITOR mon = MonitorFromWindow(g_source ? g_source : GetForegroundWindow(), MONITOR_DEFAULTTONEAREST);
+            if (mon != MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST)) {
+                MONITORINFO mi{sizeof mi};
+                GetMonitorInfoW(mon, &mi);
+                RECT wa = mi.rcWork, wr;
+                GetWindowRect(g_hwnd, &wr);
+                int w = wr.right - wr.left, h = wr.bottom - wr.top;
+                g_placing = true;
+                SetWindowPos(g_hwnd, nullptr, (wa.left + wa.right - w) / 2, (wa.top + wa.bottom - h) / 2, 0, 0,
+                             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                g_placing = false;
+                g_dpi = GetDpiForWindow(g_hwnd);
+            }
+        }
+        LoadContent(request.path, request.pressed);
+        t.load = MsSince(start);
+        if (WaitForContent(request)) break;
+        if (request.path.empty()) {
+            PreviewHide(false);
+            return {};
+        }
     }
-    LoadContent(path, t0);
-    t.load = MsSince(start);
-    WaitForContent();
     PlaceWindow();
     Layout();
     if (!g_visible)
@@ -2608,17 +2651,18 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
     if (!g_visible) DefWindowProcW(g_hwnd, WM_NCACTIVATE, TRUE, 0);  // shown without focus: active look anyway
     if (!g_visible && !g_warming) Cloak(FALSE);  // paint first, then reveal: no flash of old content
     g_visible = true;
+    g_opening = false;
     g_canFind = g_kind == K_Text;
-    t.ready = MsSince(t0);
+    t.ready = MsSince(request.pressed);
     DwmFlush();  // returns after DWM composed the frame containing our window
-    t.composed = MsSince(t0);
+    t.composed = MsSince(request.pressed);
     // Scintilla skips scrollbar updates while hidden (text loads hidden): a changed scroll width makes it set
     // them. ~2.5 ms on a visible Scintilla, so after the frame: until then the bars may be the last file's.
     if (sptr_t sw = Sci(SCI_GETSCROLLWIDTH); g_kind == K_Text) Sci(SCI_SETSCROLLWIDTH, sw + 1), Sci(SCI_SETSCROLLWIDTH, sw);
     t.kind = g_kind == K_Text ? L"text" : g_kind == K_Image ? L"image" : g_kind == K_Md ? L"md" : g_kind == K_Pdf ? L"pdf"
              : g_kind == K_Grid ? L"table" : g_kind == K_Font ? L"font" : g_kind == K_Word ? L"word" : g_kind == K_Media ? (g_mediaVideo ? L"video" : L"audio") : L"info";
     Log(L"open %-5s explorer %5.2f + load %5.2f -> ready %5.2f ms, on-screen %5.2f ms  %s", t.kind, t.sel, t.load,
-        t.ready, t.composed, path.c_str());
+        t.ready, t.composed, request.path.c_str());
     if (g_openStale) {  // the default app may have changed since the label was remembered
         g_openStale = false;
         if (std::wstring now = OpenLabel(g_path); now != g_open) {
@@ -2630,11 +2674,12 @@ Timing PreviewShow(const std::wstring& path, HWND source, LONGLONG t0) {
 }
 
 void PreviewHide(bool restoreFocus) {
-    if (!g_visible) return;
+    if (!g_visible && !g_opening) return;
     bool wasForeground = GetForegroundWindow() == g_hwnd;
-    Cloak(TRUE);
+    if (g_visible) Cloak(TRUE);
     if (wasForeground) ShowWindow(g_hwnd, SW_HIDE);  // never leave keyboard focus on an invisible window
     g_visible = false;
+    g_opening = false;
     g_canFind = g_findTookFocus = false;
     g_hot = H_None;
     ClearContent();  // release content memory while idle

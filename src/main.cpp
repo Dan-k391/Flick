@@ -51,7 +51,7 @@ LRESULT CALLBACK KeyboardProc(int code, WPARAM wp, LPARAM lp) {
                 !Down(VK_LWIN) && !Down(VK_RWIN))
                 if (HWND ex = ExplorerWithItemFocus()) PostMessageW(g_hwnd, WM_FLICK_TOGGLE, (WPARAM)ex, Now());
             g_spaceDown = down;
-        } else if (PreviewVisible()) {
+        } else if (PreviewAcceptsNavigation()) {
             if (k->vkCode == 'F' && down && Down(VK_CONTROL) && PreviewCanFind() && ExplorerWithItemFocus()) {
                 PostMessageW(g_hwnd, WM_FLICK_FIND, 0, 0);
                 return 1;  // not Explorer's search box
@@ -141,11 +141,12 @@ int Bench(int argc, wchar_t** argv) {
     for (int i = 2; i < argc; i++) {
         wchar_t full[MAX_PATH];
         GetFullPathNameW(argv[i], MAX_PATH, full, nullptr);
-        std::vector<double> ready, composed;
+        std::vector<double> load, ready, composed;
         Timing first{}, t{};
         for (int r = 0; r < kRuns; r++) {
             t = PreviewShow(full, nullptr, Now());
             if (r == 0) first = t;
+            load.push_back(t.load);
             ready.push_back(t.ready);
             composed.push_back(t.composed);
             Pump();
@@ -155,11 +156,12 @@ int Bench(int argc, wchar_t** argv) {
             PreviewHide(false);
             Pump();
         }
+        std::sort(load.begin(), load.end());
         std::sort(ready.begin(), ready.end());
         std::sort(composed.begin(), composed.end());
         Log(L"BENCH %-5s %-28s first: ready %6.2f ms, on-screen %6.2f ms | median: load %5.2f, ready %6.2f ms, "
             L"on-screen %6.2f ms | min ready %5.2f ms",
-            t.kind, PathFindFileNameW(full), first.ready, first.composed, t.load, ready[kRuns / 2],
+            t.kind, PathFindFileNameW(full), first.ready, first.composed, load[kRuns / 2], ready[kRuns / 2],
             composed[kRuns / 2], ready[0]);
     }
     for (LONGLONG s = Now(); MsSince(s) < 1500;)  // workers of the last preview (a big sheet's rows) wind down
