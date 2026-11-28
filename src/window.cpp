@@ -162,6 +162,16 @@ LPARAM g_selAt;  // the mouse while dragging
 int g_clicks;    // 2 double, 3 triple click
 DWORD g_clickT;
 POINT g_clickAt;
+constexpr UINT_PTR kCopyFeedbackTimer = 4;
+bool g_copyTooLarge;
+
+void CopyFeedback(bool tooLarge) {
+    if (!tooLarge && !g_copyTooLarge) return;
+    g_copyTooLarge = tooLarge;
+    if (tooLarge) SetTimer(g_hwnd, kCopyFeedbackTimer, 2500, nullptr);
+    else KillTimer(g_hwnd, kCopyFeedbackTimer);
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
 
 // Find in text (Ctrl+F): a search field in the title bar. Every match gets one indicator, the current
 // match a stronger one. Searching runs on every keystroke (Scintilla search, at most kMaxHits matches).
@@ -1434,6 +1444,7 @@ void DrawControls(D2D1_SIZE_F sz, ID2D1SolidColorBrush* text, ID2D1SolidColorBru
 // Releases everything the current preview holds (memory is given back whenever the preview closes).
 void ClearContent() {
     if (g_kind == K_Image) ++g_imageGen;
+    if (g_copyTooLarge) CopyFeedback(false);
     g_bmp.Reset();
     g_info.clear();
     MdClear();
@@ -1944,11 +1955,11 @@ void Paint() {
     // Title: file name + dimmed details, trimmed with an ellipsis.
     if (g_kind == K_Pdf && !g_pdfFailed && g_pages.size() > 1)  // reading position: "3 / 94"
         g_sub = std::to_wstring(CurrentItem() + 1) + L" / " + std::to_wstring(g_pages.size());
-    std::wstring title = g_title + (g_sub.empty() ? L"" : L"    " + g_sub);
+    std::wstring title = g_copyTooLarge ? L"Selection too large to copy" : g_title + (g_sub.empty() ? L"" : L"    " + g_sub);
     ComPtr<IDWriteTextLayout> tl;
     g_dw->CreateTextLayout(title.c_str(), (UINT32)title.size(), g_fmtTitle.Get(),
                            std::max(0.f, (g_findOn ? g_findRc.left : g_openRc.left) - 16 - kPad), kTitleH, &tl);
-    if (!g_sub.empty()) tl->SetDrawingEffect(sub.Get(), {(UINT32)g_title.size(), (UINT32)(title.size() - g_title.size())});
+    if (!g_copyTooLarge && !g_sub.empty()) tl->SetDrawingEffect(sub.Get(), {(UINT32)g_title.size(), (UINT32)(title.size() - g_title.size())});
     g_rt->DrawTextLayout({kPad, 0}, tl.Get(), text.Get());
 
     D2D1_RECT_F area{kPad, kTitleH, sz.width - kPad, sz.height - kPad};
@@ -2137,7 +2148,13 @@ void SelectAll() {
 // Plain text onto the clipboard (the text view: Scintilla's own copy).
 void Copy() {
     if (g_kind == K_Text) return (void)Sci(SCI_COPY);
-    std::wstring s = g_kind == K_Word ? WordCopy() : g_kind == K_Md ? MdCopy() : g_kind == K_Grid ? GridCopy() : Selectable() ? SlideCopy() : L"";
+    std::wstring s;
+    if (g_kind == K_Grid) {
+        auto text = GridCopy();
+        CopyFeedback(!text);
+        if (!text) return;
+        s = std::move(*text);
+    } else s = g_kind == K_Word ? WordCopy() : g_kind == K_Md ? MdCopy() : Selectable() ? SlideCopy() : L"";
     size_t bytes = (s.size() + 1) * sizeof(wchar_t);
     HGLOBAL mem = s.empty() ? nullptr : GlobalAlloc(GMEM_MOVEABLE, bytes);
     void* p = mem ? GlobalLock(mem) : nullptr;
@@ -2460,6 +2477,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_TIMER:
             if (w == kZoomTimer) RefineImage();
             if (w == kSelTimer && g_selDrag) EdgeScroll();
+            if (w == kCopyFeedbackTimer) CopyFeedback(false);
             if (w == kGifTimer) {
                 UINT delay = 0;
                 if (g_kind == K_Image && g_gif.dec && g_visible)

@@ -8,6 +8,7 @@
 #include <ctime>
 #include <functional>
 #include <map>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -229,12 +230,7 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
     g->text.reserve(n);
     std::vector<UINT32> rowEnd;  // cells index after each row
     auto endField = [&](size_t start) { g->cells.push_back({(UINT32)start, (UINT32)(g->text.size() - start)}); };
-    auto endRow = [&] {
-        size_t begin = rowEnd.empty() ? 0 : rowEnd.back();
-        if (g->cells.size() - begin == 1 && g->cells.back().second == 0) g->cells.pop_back();  // blank line
-        else rowEnd.push_back((UINT32)g->cells.size());
-    };
-    for (size_t i = 0; i < n;) {
+    for (size_t i = 0, rowStart = 0; i < n;) {
         size_t start = g->text.size();
         if (text[i] == L'"') {
             for (i++; i < n;) {
@@ -258,11 +254,13 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
             if (++i == n) endField(g->text.size());  // trailing separator: empty last field
             continue;
         }
+        if (i == rowStart) g->cells.pop_back();  // physically empty line; a quoted empty field counts
+        else rowEnd.push_back((UINT32)g->cells.size());
         i += text[i] == L'\r' && i + 1 < n && text[i + 1] == L'\n' ? 2 : 1;
-        endRow();
+        rowStart = i;
     }
-    if (rowEnd.empty() || rowEnd.back() != g->cells.size()) endRow();
-    if (rowEnd.empty()) return nullptr;
+    if (g->cells.empty()) return nullptr;  // empty files and files containing only blank lines have no columns
+    if (rowEnd.empty() || rowEnd.back() != g->cells.size()) rowEnd.push_back((UINT32)g->cells.size());
     // Keep the dense path for nearly rectangular files, with at most 25% extra cells.
     // In a ragged file a single wide row must not multiply the storage for all the others.
     UINT32 prev = 0;
@@ -420,17 +418,18 @@ void GridSet(std::unique_ptr<GridData> g) {
     // The selection survives the sheet worker's completed copy of the same sheet (indices are clamped where used).
     if (!g || !g_grid || !g->sheet || !g_grid->sheet || g->tab != g_grid->tab || g->tabs != g_grid->tabs) g_sel = {};
     g_grid = std::move(g);
-    g_colX.clear(), g_rowY.clear(), g_styleFmt.clear(), g_picBmp.clear();
     constexpr size_t kKeepGridCapacity = 4096;
+    // Reuse small buffers across opens and return capacity held by unusually large previews.
+    auto clear = [closing = !g_grid](auto& v) {
+        if (closing && v.capacity() > kKeepGridCapacity) std::remove_reference_t<decltype(v)>{}.swap(v);
+        else v.clear();
+    };
+    clear(g_colX), clear(g_rowY), clear(g_styleFmt), clear(g_picBmp), clear(g_tabRc);
     if (!g_grid && g_mergeAt.bucket_count() > kKeepGridCapacity) decltype(g_mergeAt){}.swap(g_mergeAt);
     else g_mergeAt.clear();
     if (!g_grid) {
-        g_open.clear(), g_shown.clear();
-        // Reuse small buffers across opens and return capacity held by unusually large previews.
-        if (g_open.capacity() > kKeepGridCapacity) decltype(g_open){}.swap(g_open);
-        if (g_shown.capacity() > kKeepGridCapacity) decltype(g_shown){}.swap(g_shown);
-        if (g_colX.capacity() > kKeepGridCapacity) decltype(g_colX){}.swap(g_colX);
-        if (g_rowY.capacity() > kKeepGridCapacity) decltype(g_rowY){}.swap(g_rowY);
+        clear(g_open), clear(g_shown);
+        if (g_fonts.size() > kKeepGridCapacity) g_fonts.clear();
         return;
     }
     g_open.assign(g_grid->folder.size(), false);
@@ -914,31 +913,49 @@ void GridSelectAll() {
     if (g_grid && g_grid->folder.empty()) g_sel = {{0, 0}, {0, 0}, 3, true};
 }
 
-std::wstring GridCopy() {
+std::optional<std::wstring> GridCopy() {
     size_t r0, c0, r1, c1;
-    return g_grid && g_grid->folder.empty() && SelRect(*g_grid, r0, c0, r1, c1) ? GridRangeText(*g_grid, r0, c0, r1, c1) : L"";
+    if (!g_grid || !g_grid->folder.empty() || !SelRect(*g_grid, r0, c0, r1, c1)) return std::wstring{};
+    return GridRangeText(*g_grid, r0, c0, r1, c1);
 }
 
 // Excel's plain text: tabs between cells, CRLF after each row; a cell with a tab, line break or quote in quotes.
-std::wstring GridRangeText(const GridData& g, size_t r0, size_t c0, size_t r1, size_t c1) {
+std::optional<std::wstring> GridRangeText(const GridData& g, size_t r0, size_t c0, size_t r1, size_t c1) {
     std::wstring s;
-    if (r0 > r1 || c0 > c1 || !g.cols || !g.Rows()) return s;
+    if (!g.cols || !g.Rows()) return s;
     r1 = std::min(r1, g.Rows() - 1), c1 = std::min<size_t>(c1, g.cols - 1);
     if (r0 > r1 || c0 > c1) return s;
-    // A ragged CSV can contain billions of implicit blanks. Bound their expansion into clipboard text.
-    constexpr size_t kMaxCsvCopy = 32 << 20;  // UTF-16 characters, before quoting cell contents
-    if (!g.rowEnds.empty() && r1 - r0 + 1 > kMaxCsvCopy / (c1 - c0 + 2)) return s;
+    auto quoted = [](std::wstring_view v) { return v.find_first_of(L"\t\r\n\"") != v.npos; };
+    // Preflight ragged CSVs. Count the entire clipboard text before allocating a rectangular copy.
+    if (!g.rowEnds.empty()) {
+        constexpr size_t kMaxCsvCopy = (32 << 20) - 1;  // UTF-16 code units, leaving one for the terminator
+        size_t rows = r1 - r0 + 1, separators = c1 - c0 + 2;  // tabs and CRLF per row
+        if (rows > kMaxCsvCopy / separators) return std::nullopt;
+        size_t left = kMaxCsvCopy - rows * separators;
+        for (size_t r = r0; r <= r1; r++) {
+            for (size_t c = c0, end = std::min(c1 + 1, g.RowCols(r)); c < end; c++) {
+                std::wstring_view v = Cell(g, r, c);
+                size_t chars = v.size();
+                if (quoted(v)) chars += 2 + std::count(v.begin(), v.end(), L'"');
+                if (chars > left) return std::nullopt;
+                left -= chars;
+            }
+        }
+        s.reserve(kMaxCsvCopy - left);
+    }
     for (size_t r = r0; r <= r1; r++) {
-        for (size_t c = c0; c <= c1; c++) {
+        size_t end = std::min(c1 + 1, g.RowCols(r));
+        for (size_t c = c0; c < end; c++) {
             if (c > c0) s += L'\t';
             std::wstring_view v = Cell(g, r, c);
-            if (v.find_first_of(L"\t\r\n\"") == v.npos) s += v;
+            if (!quoted(v)) s += v;
             else {
                 s += L'"';
                 for (wchar_t ch : v) s.append(ch == L'"' ? 2 : 1, ch);
                 s += L'"';
             }
         }
+        s.append(c1 + 1 - std::max(end, c0 + 1), L'\t');  // missing fields at the end of a short row
         s += L"\r\n";
     }
     return s;

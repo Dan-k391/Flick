@@ -1520,20 +1520,32 @@ std::wstring OfficeSelfTest() {
     for (auto& n : nums)
         if (std::string got = FormatNumber(n.v, n.code); got != n.want) return L"number format " + Wide(n.code) + L": " + Wide(got);
     if (FormatNumber(0, "yyyy-mm-dd", true) != "1904-01-01") return L"1904 dates";
+    if (GridParseCsv(L"", 0) || GridParseCsv(L"\r\n\n\r\n", 0)) return L"blank CSV";
+    auto header = GridParseCsv(L"name,detail\r\n", 0);
+    auto emptyHeader = GridParseCsv(L"\"\"", 0);
+    if (!header || header->Rows() != 1 || header->cols != 2 || GridRangeText(*header, 0, 0, 9, 9) != L"name\tdetail\r\n" ||
+        !emptyHeader || emptyHeader->Rows() != 1 || emptyHeader->cols != 1 || GridRangeText(*emptyHeader, 0, 0, 9, 9) != L"\r\n")
+        return L"header-only CSV";
+    auto emptyFields = GridParseCsv(L"name\r\n\r\n\"\"\r\n1,,\r\n2,,", 0);
+    if (!emptyFields || emptyFields->Rows() != 4 || emptyFields->cols != 3 || emptyFields->RowCols(1) != 1 ||
+        emptyFields->RowCols(2) != 3 || emptyFields->RowCols(3) != 3 ||
+        GridRangeText(*emptyFields, 1, 0, 9, 9) != L"\t\t\r\n1\t\t\r\n2\t\t\r\n") return L"empty CSV fields";
     // The grid is shared with CSV. A short row has implicit blanks, alongside explicitly empty fields.
     auto ragged = GridParseCsv(L"id,unused,value,tail\r\n1\r\n\r\n2,,\"say \"\"hi\"\"\r\nnow\"\r\n3,\"\",4,", 0);
     if (!ragged || ragged->Rows() != 4 || ragged->cols != 4 || ragged->cells.size() != 12 ||
         ragged->RowCols(1) != 1 || ragged->RowCols(3) != 4 || !ragged->rightAlign[0] || ragged->rightAlign[2] ||
         GridRangeText(*ragged, 1, 0, 99, 99) != L"1\t\t\t\r\n2\t\t\"say \"\"hi\"\"  now\"\t\r\n3\t\t4\t\r\n" ||
         GridRangeText(*ragged, 1, 2, 3, 2) != L"\r\n\"say \"\"hi\"\"  now\"\r\n4\r\n") return L"ragged CSV cells";
-    std::wstring wide;
-    for (int r = 0; r < 8192; r++) wide += L"1\n";
+    std::wstring wide = L"\"\"\n\"\"\"\"\n";
+    for (int r = 2; r < 8192; r++) wide += L"1\n";
     wide.append(8192, L',');
     wide += L"2";
     auto sparse = GridParseCsv(wide, L',');
     if (!sparse || sparse->Rows() != 8193 || sparse->cols != 8193 || sparse->cells.size() != 16385 ||
         GridRangeText(*sparse, 8191, 8191, 8192, 8192) != L"\t\r\n\t2\r\n" ||
-        !GridRangeText(*sparse, 0, 0, 8192, 8192).empty()) return L"ragged CSV storage and copy bounds";
+        GridRangeText(*sparse, 0, 0, 8192, 8192).has_value()) return L"ragged CSV storage and copy bounds";
+    // 4096 × 8191 separators plus 4095 raw text units fit. Escaping the quote tips the copy over the limit.
+    if (GridRangeText(*sparse, 0, 0, 4095, 8189)) return L"ragged CSV copy quoting bound";
     // Malformed input: no crash, no unbounded work.
     if (FormatNumber(NAN, "dddd") != "########") return L"NaN date";
     if (XlColor(R"(indexed="-2000000000")", {}) != 0) return L"negative indexed colour";

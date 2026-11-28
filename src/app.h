@@ -4,6 +4,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include <d2d1.h>
@@ -238,8 +239,9 @@ size_t GridShownRows();  // body rows visible (--selftest)
 bool GridSelect(D2D1_POINT_2F pt, float scrollX, float scrollY, int clicks);  // false: not on a cell or header
 D2D1_RECT_F GridCells();  // the cells' area as last painted (window DIPs): headers, tab strip outside
 void GridSelectAll();
-std::wstring GridCopy();
-std::wstring GridRangeText(const GridData&, size_t r0, size_t c0, size_t r1, size_t c1);  // inclusive, clamped
+// An empty string means no cells were selected. nullopt means the copy would exceed the size limit.
+std::optional<std::wstring> GridCopy();
+std::optional<std::wstring> GridRangeText(const GridData&, size_t r0, size_t c0, size_t r1, size_t c1);  // inclusive, clamped
 D2D1_SIZE_F GridPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scrollX, float scrollY, const MdColors&);
 
 // ---- font.cpp: font specimen (ttf, otf, ttc, woff, woff2)
