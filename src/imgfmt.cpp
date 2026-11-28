@@ -490,8 +490,7 @@ UINT TiffOrientation(const std::wstring& path) {
     return TiffOrient(f);
 }
 
-ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path) {
-    IWICImagingFactory* wic = WicFactory();
+ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* wic) {
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
     if (ext == L".sketch") return ZipPreview(path, {L"previews/preview.png"}, wic);
