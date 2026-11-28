@@ -316,8 +316,7 @@ void LoadImageBlock(Block& b, float width, bool probe, float top = INFINITY, flo
     IWICImagingFactory* wic = WicFactory();
     auto pixels = [&] { return (UINT)std::max(1l, std::lround(width * g_dpi / 96)); };
     UINT px = probe ? 0 : pixels();
-    ComPtr<IWICBitmapSource> src;
-    std::vector<BYTE> bytes;  // data: URI payload, alive until the decoder and frame are released
+    std::vector<BYTE> bytes;  // InitializeFromMemory borrows this through the stream, frame and scaler
     ComPtr<IWICStream> stream;
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
@@ -362,12 +361,24 @@ void LoadImageBlock(Block& b, float width, bool probe, float top = INFINITY, flo
         b.tried = true;
         px = pixels();
     }
-    src = frame;
     ComPtr<IWICBitmapScaler> scaler;
+    IWICBitmapSource* src = frame.Get();
     if (w > px && SUCCEEDED(wic->CreateBitmapScaler(&scaler)) &&
         SUCCEEDED(scaler->Initialize(frame.Get(), px, std::max(1u, (UINT)((UINT64)h * px / w)), WICBitmapInterpolationModeFant)))
-        src = scaler;
-    b.bmp = SharedBitmap(src.Get());
+        src = scaler.Get();
+    ComPtr<IWICBitmap> materialized;
+    if (embedded) {
+        // A decoder may implement IWICBitmap itself. Only share pixels from a bitmap we loaded
+        // independently of the stream. Converting directly to PBGRA lets SharedBitmap share it as-is.
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(wic->CreateFormatConverter(&converter)) ||
+            FAILED(converter->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                         WICBitmapPaletteTypeCustom)) ||
+            FAILED(wic->CreateBitmapFromSource(converter.Get(), WICBitmapCacheOnLoad, &materialized)))
+            return;
+        src = materialized.Get();
+    }
+    b.bmp = SharedBitmap(src);
 }
 
 // A table cell's layout at its column's width (made again after it was released).
@@ -515,6 +526,18 @@ void LayOut(float width, float top, float bottom) {
     }
 }
 
+// Compare the pointer and drawn edges in viewport coordinates, where floats have room for sub-DIP positions.
+float BlockViewY(const Block& b, float top, float scroll) { return top + (b.y - scroll); }
+
+size_t EdgeAt(const std::vector<float>& edges, float origin, float point) {
+    auto end = std::upper_bound(edges.begin(), edges.end(), point, [origin](float v, float edge) { return v < origin + edge; });
+    return end == edges.begin() ? 0 : (size_t)(end - edges.begin() - 1);
+}
+
+D2D1_POINT_2F CellOrigin(const Table& table, size_t ri, size_t ci, float x, float y) {
+    return {x + table.colX[ci] + kCellPadX, y + table.rowY[ri] + kCellPadY};
+}
+
 // The selected part of text `unit` behind it (fill's colour changes).
 void DrawSel(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float y, ID2D1SolidColorBrush* fill) {
     if (UINT32 a, b; g_selOn && unit != ~0ull && t.layout && g_sel.Span(unit, (UINT32)t.s.size(), a, b) && b > a)
@@ -588,8 +611,8 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             fill->SetColor(c.rule);
             for (float cx : b.tab->colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
             // Only the rows in view (a long table: thousands of rows off screen); layouts far from them are released.
-            auto row = [&](float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(b.tab->rowY.begin(), b.tab->rowY.end(), v) - b.tab->rowY.begin() - 1); };
-            size_t laid = b.tab->rowY.size() - 1, r0 = std::min(laid, row(top - y)), r1 = std::min(laid, row(bottom - y) + 1);
+            size_t laid = b.tab->rowY.size() - 1;
+            size_t r0 = std::min(laid, EdgeAt(b.tab->rowY, y, top)), r1 = std::min(laid, EdgeAt(b.tab->rowY, y, bottom) + 1);
             size_t keep0 = r0 > kKeepRows ? r0 - kKeepRows : 0, keep1 = std::min(laid, r1 + kKeepRows);
             for (size_t ri = b.tab->live0; ri < std::min(b.tab->live1, laid); ri++)
                 if (ri < keep0 || ri >= keep1)
@@ -599,9 +622,10 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
                 rt->FillRectangle({x, y + b.tab->rowY[ri], x + b.tab->colX.back() + 1, y + b.tab->rowY[ri] + 1}, fill);
             UINT32 k = b.tab->rowCell[r0];
             for (size_t ri = r0; ri < r1; ri++)
-                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++, k++)
-                    DrawRich(rt, Cell(b, ri, ci), unit + k, x + b.tab->colX[ci] + kCellPadX, y + b.tab->rowY[ri] + kCellPadY,
-                             dim, text, fill, c);
+                for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++, k++) {
+                    auto at = CellOrigin(*b.tab, ri, ci, x, y);
+                    DrawRich(rt, Cell(b, ri, ci), unit + k, at.x, at.y, dim, text, fill, c);
+                }
             break;
         }
     }
@@ -697,7 +721,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
                                   [](const Block& b, float v) { return b.y + b.h + b.after < v; });
     for (auto it = first; it != laidEnd; ++it) {
         Block& b = *it;
-        float y = area.top + (b.y - scroll);
+        float y = BlockViewY(b, area.top, scroll);
         if (y > area.bottom) break;
         DrawBlock(rt, b, (UINT64)(it - g_blocks.begin()) << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
     }
@@ -723,8 +747,8 @@ std::wstring MdOutline() {
 bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
     auto texty = [](const Block& b) { return (b.kind == B_Para || b.kind == B_Head || b.kind == B_Code || b.kind == B_Table) && !(b.kind == B_Table && b.tab->rows.empty()); };
     if (!g_laid) return clicks ? (g_sel = {}, false) : false;
-    size_t k = std::upper_bound(g_blocks.begin(), g_blocks.begin() + g_laid, pt.y - g_top + scroll,
-                                [](float v, const Block& b) { return v < b.y; }) - g_blocks.begin();
+    size_t k = std::upper_bound(g_blocks.begin(), g_blocks.begin() + g_laid, pt.y,
+                                [scroll](float v, const Block& b) { return v < BlockViewY(b, g_top, scroll); }) - g_blocks.begin();
     size_t i = SIZE_MAX;  // the block at the point, else the nearest one with text before it, else after it
     for (size_t j = std::min(k ? k - 1 : 0, g_laid - 1) + 1; j-- > 0 && i == SIZE_MAX;)
         if (texty(g_blocks[j])) i = j;
@@ -735,18 +759,18 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
         return false;
     }
     Block& b = g_blocks[i];
-    float ox = g_x0 + b.indent * kIndent + b.quote * kQuote, oy = g_top - scroll + b.y;
+    float ox = g_x0 + b.indent * kIndent + b.quote * kQuote, oy = BlockViewY(b, g_top, scroll);
     const Text* t = &b.text;
     UINT32 cell = 0;
     if (b.kind == B_Table) {  // the cell under the point (the nearest in its row)
-        auto at = [](const std::vector<float>& e, float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(e.begin(), e.end(), v) - e.begin() - 1); };
         if (b.tab->rowY.size() < 2) return false;
-        size_t ri = std::min(at(b.tab->rowY, pt.y - oy), b.tab->rowY.size() - 2);  // laid out rows only
+        size_t ri = std::min(EdgeAt(b.tab->rowY, oy, pt.y), b.tab->rowY.size() - 2);  // laid out rows only
         while (ri > 0 && b.tab->rows[ri].empty()) ri--;
         if (b.tab->rows[ri].empty()) return false;
-        size_t ci = std::min(at(b.tab->colX, pt.x - ox), b.tab->rows[ri].size() - 1);
+        size_t ci = std::min(EdgeAt(b.tab->colX, ox, pt.x), b.tab->rows[ri].size() - 1);
         cell = b.tab->rowCell[ri] + (UINT32)ci, t = &Cell(b, ri, ci);
-        ox += b.tab->colX[ci] + kCellPadX, oy += b.tab->rowY[ri] + kCellPadY;
+        auto at = CellOrigin(*b.tab, ri, ci, ox, oy);
+        ox = at.x, oy = at.y;
     } else {
         if (!b.text.layout) LayoutBlockText(b, g_width - b.indent * kIndent - b.quote * kQuote);
         if (b.kind == B_Code) ox += kCodePad, oy += CodeTop(b);
