@@ -50,7 +50,7 @@ Typical on-screen medians (bench):
 | code, 5.6 MB log, CSV 20k rows, zip | 8–20 ms |
 | JPEG 1080p / 12 MP / 24 MP | 13 / 22 / 31 ms |
 | pptx page 1, PDF page 1 (simple / real text) | 13–21 / ~20 / ~35 ms |
-| video first frame, folder tree of 10k items | ~50 ms |
+| video first poster, folder tree of 10k items | ~41 / ~28 ms |
 
 Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps ~33 MB).
 
@@ -73,6 +73,8 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   (`PlaceWindow`).
 - Shown `SWP_NOACTIVATE` + topmost so Explorer keeps the keyboard; the hook thread watches Space/Esc/arrows and
   never swallows Space. Hidden on foreground change, except shell UI (Alt+Tab, Start, search).
+- Escape and changed Explorer selections can supersede an open while it waits for its first worker result.
+  The UI handles those requests without painting the superseded preview.
 - The hook is re-installed whenever Explorer takes the foreground: games' hooks swallow Space, and Windows drops
   a hook that once timed out.
 - `IShellWindows` takes 10–60 ms → the focused tab's `IShellBrowser` is cached. Shell thumbnails (5–60 ms) are
@@ -93,12 +95,17 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
   a pointer): long documents have 200k blocks.
 
 **Images, PDF, media**
-- JPEG cost is entropy decoding → decode at window size (DCT scaling), re-decode on resize/zoom (`Sharpen`).
+- JPEG cost is entropy decoding → decode at window size (DCT scaling). A worker refines the raster after
+  resize or zoom and keeps the latest request. Moving a window at the same size and DPI reuses its bitmap.
+- Standalone SVGs are parsed once and drawn directly into premultiplied WIC bitmaps. SVG font aliases share
+  file mappings. A real SVG resize still rerenders on the UI thread.
 - PDF: `RenderToStreamAsync` loads the GPU driver (+200 MB) → `RenderPageToDeviceContext` into a WIC target with
   WARP. Cost is per page. The worker `SendMessage`s each page and the reply names the next one; wait with
   `PeekMessage(PM_QS_SENDMESSAGE)`, then re-check *before* `MsgWaitForMultipleObjects`.
+  The worker sends page one before reading the remaining page sizes.
 - Video: the engine needs ~300 ms for a first frame → a low-latency source reader decodes the poster (~40 ms)
-  first; seek-bar drags show key frames from another reader. `MFShutdown` per preview made memory worse.
+  first. Playback starts after the poster paints. Seek-bar drags show key frames from another reader.
+  `MFShutdown` per preview made memory worse.
 - Subtitles: the engine doesn't draw them in frame-server mode → parsed and drawn by us (`.lrc` beside audio too).
 - Camera RAW: WIC's own DNG decoder shows only the small first IFD → the Raw codec by container GUID, showing
   `GetPreview` (0.6 ms) turned by the TIFF orientation tag; `GetFrame` demosaics (24 MP ~440 ms): no preview, info card.
@@ -123,7 +130,8 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 
 **Misc**
 - `archiveint.dll` (Windows' libarchive, undocumented) lists archives and inflates zips; missing → info card.
-- Folders list breadth-first ≤60 ms / 10k items, sizes on a worker.
+- Folders list breadth-first ≤60 ms / 10k items. Folder totals still require a separate worker walk. Archive
+  trees find omitted parent folders in a hash set, and adjacent rows reuse dates displayed at minute precision.
 - `/GL` gained nothing. lunasvg rejects a UTF-8 BOM. `small`/`near`/`far` are macros.
 - PowerShell 5 reads BOM-less scripts as ANSI, is DPI-unaware, and can't pipe into `git credential` (use bash).
 - No `gh` CLI: releases via curl + the git credential token.
