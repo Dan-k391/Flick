@@ -31,6 +31,7 @@ enum : UINT {
     WM_FLICK_SHOT,                 // scripts/shot.ps1: save the frame as Paint draws it to %FLICK_SHOT% (PNG)
     WM_FLICK_WORD,                 // posted by the docx picture worker (wParam = gen, lParam = its message)
     WM_FLICK_SELECTALL,            // scripts/shot.ps1: Ctrl+A (WM_COPY: Ctrl+C)
+    WM_FLICK_PLAYVIDEO,            // start the media engine after the poster (wParam = preview generation)
 };
 
 // ---- lang.cpp: extension -> Lexilla lexer + keywords + style roles
@@ -241,7 +242,7 @@ float FontPaint(ID2D1RenderTarget*, const D2D1_RECT_F& area, float scroll, const
 
 // ---- svg.cpp: SVG/SVGZ rendered to a bitmap fitting maxW x maxH pixels; w, h = intrinsic size
 Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, IWICImagingFactory*,
-                                             UINT& w, UINT& h);
+                                            UINT& w, UINT& h, float scaleLimit = 0);
 
 // ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...), installers (msi) and certificates (cer, pem,
 // p7b, ...: none for a file that isn't one or holds a private key); sniff: also ELF/Mach-O by their first bytes
@@ -287,8 +288,7 @@ struct MediaState {
     double pos, dur;      // seconds
     UINT videoW, videoH;  // display size of the video (aspect-corrected); 0 for audio
 };
-bool MediaOpen(const std::wstring& path, bool start = true);  // false if Media Foundation is unavailable
-bool MediaStart();  // after MediaOpen(path, false): starts loading and playing
+bool MediaOpen(const std::wstring& path);  // false if Media Foundation is unavailable
 void MediaClose();
 MediaState MediaGet();
 bool MediaFrame(UINT w, UINT h, IWICImagingFactory*, Microsoft::WRL::ComPtr<IWICBitmap>& out);

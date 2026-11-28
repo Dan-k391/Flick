@@ -20,7 +20,6 @@ ComPtr<IMFMediaEngineEx> g_engineEx;
 std::atomic<int> g_pumpGen;  // a pump thread runs while the generation it started with is current
 std::atomic<bool> g_framePending;
 bool g_error;
-std::wstring g_url;  // source of g_engine
 bool g_muted;  // --bench / --mute: tests stay silent
 double g_volume = 1;  // the user's volume and mute, kept for the session
 bool g_userMuted;
@@ -59,14 +58,19 @@ DWORD WINAPI PumpThread(void* gen) {
     return 0;
 }
 
+bool StartMediaFoundation() {
+    static const bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+    return started;
+}
+
 }  // namespace
 
-bool MediaOpen(const std::wstring& path, bool start) {
+bool MediaOpen(const std::wstring& path) {
     MediaClose();
-    static bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     static ComPtr<IMFMediaEngineClassFactory> factory;
-    if (!started || (!factory && FAILED(CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER,
-                                                         IID_PPV_ARGS(&factory)))))
+    if (!StartMediaFoundation() ||
+        (!factory && FAILED(CoCreateInstance(CLSID_MFMediaEngineClassFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                             IID_PPV_ARGS(&factory)))))
         return false;
     ComPtr<IMFAttributes> attrs;
     ComPtr<IMFMediaEngineNotify> notify;
@@ -81,13 +85,7 @@ bool MediaOpen(const std::wstring& path, bool start) {
     g_engine->SetAutoPlay(TRUE);
     g_engine->SetMuted(g_muted || g_userMuted);
     g_engine->SetVolume(g_volume);
-    g_url = path;
-    return !start || MediaStart();
-}
-
-bool MediaStart() {
-    if (!g_engine) return false;
-    BSTR url = SysAllocString(g_url.c_str());
+    BSTR url = SysAllocString(path.c_str());
     HRESULT hr = g_engine->SetSource(url);
     SysFreeString(url);
     if (FAILED(hr)) return MediaClose(), false;
@@ -312,10 +310,9 @@ struct Reader {
 };
 
 bool OpenReader(const std::wstring& path, Reader& r) {
-    static bool started = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
     ComPtr<IMFAttributes> attrs;
     ComPtr<IMFMediaType> type, actual;
-    if (!started || FAILED(MFCreateAttributes(&attrs, 2)) ||
+    if (!StartMediaFoundation() || FAILED(MFCreateAttributes(&attrs, 2)) ||
         FAILED(attrs->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE)) ||
         FAILED(attrs->SetUINT32(MF_LOW_LATENCY, TRUE)) ||  // decoder hands out a frame at once instead of buffering
         FAILED(MFCreateSourceReaderFromURL(path.c_str(), attrs.Get(), &r.reader)) ||

@@ -23,7 +23,7 @@ namespace {
 HANDLE g_wake;
 std::mutex g_mu;
 std::wstring g_wantPath;
-int g_wantGen;
+std::atomic<int> g_wantGen;
 
 // Renders straight into a CPU bitmap through a software Direct2D target. The convenient
 // PdfPage::RenderToStreamAsync uses a hardware device, which loads the GPU driver (~200 MB private).
@@ -72,9 +72,10 @@ DWORD WINAPI PdfThread(void*) {
     std::vector<std::pair<float, float>> sizes;
     UINT32 pages = 0;
     int loaded = -1;
+    bool sizePending = false;
     // Page sizes in DIPs, up to page `n`. A few at first: in a 1000-page book reading them all takes ~50 ms.
-    auto readSizes = [&](UINT32 n) {
-        for (UINT32 i = (UINT32)sizes.size(); i < n; i++) {
+    auto readSizes = [&](UINT32 n, int gen) {
+        for (UINT32 i = (UINT32)sizes.size(); i < n && g_wantGen == gen; i++) {
             auto sz = doc.GetPage(i).Size();
             sizes.push_back({sz.Width, sz.Height});
         }
@@ -90,6 +91,7 @@ DWORD WINAPI PdfThread(void*) {
         PdfMsg msg{gen, -2};  // -2: "idle, what next?"
         if (gen != loaded) {
             loaded = gen, doc = nullptr, office.reset(), sizes.clear(), msg.page = -1;  // -1: opened (sizes) or failed (none)
+            sizePending = false;
             if (path.empty()) {  // closed: release memory, including the renderer's caches
                 renderer.Reset(), dxgi.Reset(), d3d.Reset(), d2d.Reset();
                 continue;
@@ -105,13 +107,27 @@ DWORD WINAPI PdfThread(void*) {
                                                                     winrt::put_abi(file)));
                 doc = PdfDocument::LoadFromStreamAsync(file).get();
                 pages = doc.PageCount();
-                readSizes(std::min(pages, 8u));
+                readSizes(std::min(pages, 8u), gen);
+                sizePending = sizes.size() < pages;
                 msg.sizes = sizes, msg.pageCount = pages;
             } catch (...) {  // damaged or password-protected
                 doc = nullptr;
             }
         }
-        for (LRESULT next; (next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg)) > 0 && (doc || office);) {
+        while (g_wantGen == gen) {
+            LRESULT next = SendMessageW(g_hwnd, WM_FLICK_PDF, 0, (LPARAM)&msg);
+            if (g_wantGen != gen || (!doc && !office)) break;
+            if (msg.page == 0 && sizePending) {
+                // Let the UI paint page one before enumerating the rest. A newer preview cancels the scan.
+                sizePending = false;
+                try {
+                    readSizes(pages, gen);
+                } catch (...) {}
+                msg = {gen, -2};
+                msg.sizes = std::move(sizes);
+                continue;
+            }
+            if (next <= 0) break;
             msg = {gen, (int)(next & 0x7FFFFFFF) - 1};
             if (office) {
                 msg.bmp = PagesRender(*office, msg.page, (UINT)(next >> 32), d2d.Get(), wic.Get(), next & kPdfThumb ? nullptr : &msg.text);
@@ -119,7 +135,6 @@ DWORD WINAPI PdfThread(void*) {
             }
             try {
                 msg.bmp = Render(doc, msg.page, (UINT)(next >> 32), renderer.Get(), d2d.Get(), wic.Get());
-                if (sizes.size() < pages) readSizes(pages), msg.sizes = sizes;  // the rest, after the first page
             } catch (...) {
             }
         }

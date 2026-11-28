@@ -108,7 +108,7 @@ constexpr wchar_t kVideoExt[] = L" .mp4 .m4v .mov .mkv .avi .wmv .webm .mpg .mpe
 constexpr wchar_t kAudioExt[] = L" .mp3 .m4a .m4b .aac .wav .flac .wma .ogg .oga .opus .aiff .aif .amr .ac3 .ec3 .mka .weba ";
 bool g_mediaVideo, g_mouseIn, g_seekDrag, g_volDrag;
 LONGLONG g_mediaT0;
-int g_posterGen;
+std::atomic<int> g_posterGen;
 bool g_posterDone;      // the poster worker answered (with or without a frame)
 UINT g_posterW, g_posterH;  // size of the poster frame, until the engine knows the video size
 ComPtr<IWICBitmap> g_frameWic;
@@ -254,17 +254,22 @@ void CreateTarget() {
 // D2D bitmap at the window DPI, so GetSize() in DIPs maps 1 bitmap pixel to 1 screen pixel.
 // Shares the pixels of a WIC bitmap instead of copying them: the software render target never gives
 // the memory of its own bitmaps back to the OS (~50 MB stayed private after a few PDF pages).
-ComPtr<ID2D1Bitmap> ToD2D(IWICBitmapSource* src) {
-    ComPtr<IWICFormatConverter> conv;
+ComPtr<ID2D1Bitmap> ToD2D(IWICBitmapSource* src, bool copy = false) {
     ComPtr<IWICBitmap> pixels;
+    WICPixelFormatGUID format;
+    if (copy || FAILED(src->GetPixelFormat(&format)) || format != GUID_WICPixelFormat32bppPBGRA ||
+        FAILED(src->QueryInterface(IID_PPV_ARGS(&pixels)))) {
+        ComPtr<IWICFormatConverter> conv;
+        if (FAILED(g_wic->CreateFormatConverter(&conv)) ||
+            FAILED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
+                                    WICBitmapPaletteTypeCustom)) ||
+            FAILED(g_wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &pixels)))
+            return nullptr;
+    }
     ComPtr<IWICBitmapLock> lock;
     ComPtr<ID2D1Bitmap> bmp;
     UINT w, h;
-    if (SUCCEEDED(g_wic->CreateFormatConverter(&conv)) &&
-        SUCCEEDED(conv->Initialize(src, GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0,
-                                   WICBitmapPaletteTypeCustom)) &&
-        SUCCEEDED(g_wic->CreateBitmapFromSource(conv.Get(), WICBitmapCacheOnLoad, &pixels)) &&
-        SUCCEEDED(pixels->GetSize(&w, &h))) {
+    if (SUCCEEDED(pixels->GetSize(&w, &h))) {
         WICRect all{0, 0, (INT)w, (INT)h};
         if (SUCCEEDED(pixels->Lock(&all, WICBitmapLockRead, &lock))) {
             D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
@@ -532,12 +537,8 @@ bool LoadSvg(const std::wstring& path) {
     double maxW, maxH;
     PictureArea(maxW, maxH);
     UINT w = 0, h = 0;
-    SvgRender(path, 0, 0, g_wic.Get(), w, h);  // intrinsic size first: shown at it, never scaled up
-    if (!g_decodeForClient && w && h) {
-        double k = std::min({1.0, maxW / (w * g_dpi / 96.0), maxH / (h * g_dpi / 96.0)});
-        maxW = w * g_dpi / 96.0 * k, maxH = h * g_dpi / 96.0 * k;
-    }
-    auto bmp = SvgRender(path, (float)maxW, (float)maxH, g_wic.Get(), w, h);
+    // Open at intrinsic size or smaller. Manual resize and zoom may scale the vector up.
+    auto bmp = SvgRender(path, (float)maxW, (float)maxH, g_wic.Get(), w, h, g_decodeForClient ? 0 : g_dpi / 96.f);
     if (!bmp || !(g_bmp = ToD2D(bmp.Get()))) return false;
     g_orient = 1;
     g_imgReduced = true;  // vector: render again at the new size after a resize
@@ -1139,7 +1140,7 @@ bool TryFrame() {
     D2D1_RECT_F r = VideoRect(s);
     UINT w = (UINT)std::lround((r.right - r.left) * g_dpi / 96), h = (UINT)std::lround((r.bottom - r.top) * g_dpi / 96);
     if (!MediaFrame(w, h, g_wic.Get(), g_frameWic)) return false;
-    g_frame = ToD2D(g_frameWic.Get());
+    g_frame = ToD2D(g_frameWic.Get(), true);  // the engine writes the next frame into the same WIC bitmap
     return true;
 }
 
@@ -1164,6 +1165,7 @@ struct PosterJob {
 
 DWORD WINAPI PosterThread(void* p) {
     std::unique_ptr<PosterJob> job(static_cast<PosterJob*>(p));
+    if (job->gen != g_posterGen) return 0;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     {
         ComPtr<IWICImagingFactory> wic;
@@ -1171,6 +1173,10 @@ DWORD WINAPI PosterThread(void* p) {
         if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))))
             frame = MediaFirstFrame(job->path, wic.Get());
         SendMessageW(g_hwnd, WM_FLICK_POSTER, job->gen, (LPARAM)frame.Get());
+    }
+    if (job->gen != g_posterGen) {
+        CoUninitialize();
+        return 0;
     }
     // Subtitles after the poster, so they cost the open nothing: "movie.srt", "movie.vtt", else "movie.<lang>.srt".
     std::wstring base = job->path.substr(0, job->path.find_last_of(L'.'));
@@ -1198,9 +1204,6 @@ DWORD WINAPI PosterThread(void* p) {
 void OnPoster(int gen, IWICBitmap* frame) {
     if (gen != g_posterGen || g_kind != K_Media) return;
     g_posterDone = true;
-    // The engine starts only now: starting up alongside the poster's source reader, it made the
-    // reader take 240-320 ms instead of 40 in about half the opens.
-    if (!MediaStart()) return ShowInfo();
     if (frame && !g_frame) {  // the engine's own frames win once they flow
         frame->GetSize(&g_posterW, &g_posterH);
         PlaceWindow();
@@ -1208,6 +1211,9 @@ void OnPoster(int gen, IWICBitmap* frame) {
         Log(L"video poster ready %.2f ms after key press", MsSince(g_mediaT0));
         InvalidateRect(g_hwnd, nullptr, FALSE);
     }
+    // A posted message runs after the synchronous first paint. Starting alongside the source reader
+    // makes both decoders compete and delays the poster.
+    PostMessageW(g_hwnd, WM_FLICK_PLAYVIDEO, gen, 0);
 }
 
 void OnSubs(int gen, std::vector<SubCue>& subs) {
@@ -1425,9 +1431,14 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .pdf ")) g_kind = K_Pdf, LoadPdf(path, t0);
     else if (HasExt(path, L" .md .markdown .mdown .mkd .mkdn .mdx .rmd .qmd .ipynb .adoc .asciidoc .rst .rest ") &&
              LoadMarkdown(path)) g_kind = K_Md;
-    else if (HasExt(path, kVideoExt) && MediaOpen(path, false)) {  // started by OnPoster
+    else if (HasExt(path, kVideoExt)) {
         g_kind = K_Media, g_mediaVideo = true, g_mediaT0 = t0, g_posterDone = false;
-        CloseHandle(CreateThread(nullptr, 0, PosterThread, new PosterJob{path, ++g_posterGen}, 0, nullptr));
+        auto* job = new PosterJob{path, ++g_posterGen};
+        if (HANDLE thread = CreateThread(nullptr, 0, PosterThread, job, 0, nullptr)) CloseHandle(thread);
+        else {
+            delete job;
+            OnPoster(g_posterGen, nullptr);
+        }
     }
     else if (HasExt(path, kAudioExt) && MediaOpen(path)) g_kind = K_Media, LoadInfo(path, fa, t0);
     else if (HasExt(path, L" .csv .tsv .tab .psv ") && LoadCsv(path)) g_kind = K_Grid;
@@ -2400,6 +2411,12 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             return 0;
         case WM_FLICK_POSTER:
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
+            return 0;
+        case WM_FLICK_PLAYVIDEO:
+            if ((int)w == g_posterGen && g_kind == K_Media && g_mediaVideo) {
+                UpdateWindow(h);  // the poster may have arrived after the initial paint
+                if (!MediaOpen(g_path)) ShowInfo();
+            }
             return 0;
         case WM_FLICK_GRID:
             return OnGrid((int)w, reinterpret_cast<GridData*>(l));

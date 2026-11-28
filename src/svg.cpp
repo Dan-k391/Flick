@@ -10,22 +10,25 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
-void MapFont(const char* family, bool bold, bool italic, const wchar_t* file) {
+void MapFont(std::initializer_list<const char*> families, bool bold, bool italic, const wchar_t* file) {
     wchar_t path[MAX_PATH];
     ExpandEnvironmentStringsW((std::wstring(L"%WINDIR%\\Fonts\\") + file).c_str(), path, MAX_PATH);
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER size{};
-    GetFileSizeEx(f, &size);
-    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    HANDLE m = GetFileSizeEx(f, &size) && size.QuadPart > 0 && size.QuadPart <= UINT_MAX
+                   ? CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr) : nullptr;
     CloseHandle(f);
     if (!m) return;
     void* view = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(m);
-    if (view &&
-        !lunasvg_add_font_face_from_data(family, bold, italic, view, (size_t)size.QuadPart,
-                                         [](void* v) { UnmapViewOfFile(v); }, view))
-        UnmapViewOfFile(view);
+    if (!view) return;
+    // Each alias gets its own face, but all aliases share the file mapping.
+    using Mapping = std::shared_ptr<void>;
+    Mapping mapping(view, [](void* v) { UnmapViewOfFile(v); });
+    for (const char* family : families)
+        lunasvg_add_font_face_from_data(family, bold, italic, view, (size_t)size.QuadPart,
+                                       [](void* v) { delete static_cast<Mapping*>(v); }, new Mapping(mapping));
 }
 
 // Generic CSS families and the fonts SVGs ask for most, mapped to what Windows ships.
@@ -47,14 +50,13 @@ void LoadFonts() {
         {{"Georgia"}, {L"georgia.ttf", L"georgiab.ttf", L"georgiai.ttf", L"georgiaz.ttf"}},
     };
     for (auto& f : families)
-        for (const char* name : f.names)
-            for (int i = 0; i < 4; i++) MapFont(name, i & 1, i & 2, f.files[i]);
+        for (int i = 0; i < 4; i++) MapFont(f.names, i & 1, i & 2, f.files[i]);
 }
 
 }  // namespace
 
 ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, IWICImagingFactory* wic, UINT& w,
-                             UINT& h) {
+                             UINT& h, float scaleLimit) {
     std::string data;
     if (path.size() > 5 && !_wcsicmp(path.c_str() + path.size() - 5, L".svgz")) {
         if (!ArchiveReadRaw(path, data, 64 << 20)) return nullptr;
@@ -63,27 +65,42 @@ ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float maxW, float maxH, I
                                FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
         if (f == INVALID_HANDLE_VALUE) return nullptr;
         LARGE_INTEGER size{};
-        GetFileSizeEx(f, &size);
-        data.resize((size_t)std::min<LONGLONG>(size.QuadPart, 64 << 20));
         DWORD read = 0;
-        ReadFile(f, data.data(), (DWORD)data.size(), &read, nullptr);
+        bool ok = GetFileSizeEx(f, &size);
+        if (ok) {
+            data.resize((size_t)std::min<LONGLONG>(size.QuadPart, 64 << 20));
+            ok = ReadFile(f, data.data(), (DWORD)data.size(), &read, nullptr);
+        }
         CloseHandle(f);
+        if (!ok) return nullptr;
         data.resize(read);
     }
     if (data.starts_with("\xEF\xBB\xBF")) data.erase(0, 3);  // UTF-8 BOM: lunasvg rejects it
     if (data.find("<text") != std::string::npos) LoadFonts();
     auto doc = lunasvg::Document::loadFromData(data.data(), data.size());
     if (!doc) return nullptr;
-    float dw = doc->width(), dh = doc->height();
-    if (dw <= 0 || dh <= 0) dw = dh = 512;  // no size and no viewBox
-    w = (UINT)std::lround(dw), h = (UINT)std::lround(dh);
-    if (maxW <= 0) return nullptr;  // size only
-    float s = std::min(maxW / dw, maxH / dh);  // vector: scaled to fit, up or down
-    int bw = std::max(1, (int)std::lround(dw * s)), bh = std::max(1, (int)std::lround(dh * s));
-    lunasvg::Bitmap bmp = doc->renderToBitmap(bw, bh, 0);
-    ComPtr<IWICBitmap> out;
-    if (bmp.isNull() || FAILED(wic->CreateBitmapFromMemory(bw, bh, GUID_WICPixelFormat32bppPBGRA, bmp.stride(),
-                                                             bmp.stride() * bh, bmp.data(), &out)))
+    double dw = doc->width(), dh = doc->height();
+    if (!std::isfinite(dw) || !std::isfinite(dh) || dw <= 0 || dh <= 0 || dw > UINT_MAX || dh > UINT_MAX)
         return nullptr;
+    w = (UINT)std::llround(dw), h = (UINT)std::llround(dh);
+    if (maxW <= 0) return nullptr;  // size only
+    // Bound the raster even for SVGs with an extreme aspect ratio embedded in a document.
+    double s = std::min({std::min<double>(maxW, 30000) / dw, std::min<double>(maxH, 30000) / dh,
+                         std::sqrt((64.0 * (1 << 20)) / (dw * dh))});
+    if (scaleLimit > 0) s = std::min(s, (double)scaleLimit);
+    int bw = std::max(1, (int)std::lround(dw * s)), bh = std::max(1, (int)std::lround(dh * s));
+    ComPtr<IWICBitmap> out;
+    ComPtr<IWICBitmapLock> lock;
+    WICRect all{0, 0, bw, bh};
+    UINT stride, size;
+    BYTE* pixels;
+    if (FAILED(wic->CreateBitmap(bw, bh, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnLoad, &out)) ||
+        FAILED(out->Lock(&all, WICBitmapLockWrite, &lock)) || FAILED(lock->GetStride(&stride)) ||
+        FAILED(lock->GetDataPointer(&size, &pixels)))
+        return nullptr;
+    lunasvg::Bitmap bmp(pixels, bw, bh, stride);
+    if (bmp.isNull()) return nullptr;
+    bmp.clear(0);
+    doc->render(bmp, lunasvg::Matrix((float)(bw / dw), 0, 0, (float)(bh / dh), 0, 0));
     return out;
 }
