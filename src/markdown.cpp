@@ -21,6 +21,7 @@ struct Text {
     std::wstring s;
     std::vector<Run> runs;
     int align = MD_ALIGN_DEFAULT;
+    UINT32 painted = 0;  // brush generation of drawing effects and inline-code backgrounds
     ComPtr<IDWriteTextLayout> layout;
     std::vector<D2D1_RECT_F> codeRects;  // inline-code backgrounds, layout coordinates
 };
@@ -28,6 +29,7 @@ enum BlockKind { B_Para, B_Head, B_Code, B_Rule, B_Table, B_Image };
 struct Table {
     std::vector<std::vector<Text>> rows;  // rows[0] is the header
     std::vector<float> colX, rowY;        // cell edges relative to the block origin; rowY: rows laid out so far
+    std::vector<UINT32> rowCell;         // first cell index of each laid-out row, for selection
     size_t live0 = 0, live1 = 0;          // rows that may hold cell layouts (the rest were released or never made)
 };
 struct Block {  // kept small: a long document has hundreds of thousands
@@ -59,6 +61,7 @@ float g_dpi = 96;
 size_t g_laid;  // blocks [0, g_laid) are laid out for g_width
 float g_width = -1, g_laidH, g_prevAfter;
 ID2D1RenderTarget* g_brushRt;
+UINT32 g_brushGeneration;
 ComPtr<ID2D1SolidColorBrush> g_link, g_dim, g_role[R_Count];  // drawing effects stored in layouts
 // Selection: a paragraph is (block << 32 | table cell, row-major); text comes from the parsed blocks, so copying
 // never needs layout, and positions stay valid when blocks are laid out again (resize, theme, pictures arriving).
@@ -279,11 +282,12 @@ void CodeRects(Text& t) {
     }
 }
 
-float LayoutText(Text& t, IDWriteTextFormat* f, float width, bool dim = false) {
+float LayoutText(Text& t, IDWriteTextFormat* f, float width, bool header = false) {
     g_dw->CreateTextLayout(t.s.c_str(), (UINT32)t.s.size(), f, std::max(width, 1.f), 1e6f, &t.layout);
+    t.painted = 0;
     if (t.align == MD_ALIGN_CENTER) t.layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
     if (t.align == MD_ALIGN_RIGHT) t.layout->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_TRAILING);
-    if (dim) t.layout->SetDrawingEffect(g_dim.Get(), {0, (UINT32)t.s.size()});
+    if (header) t.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)t.s.size()});
     for (auto& r : t.runs) {
         DWRITE_TEXT_RANGE range{r.start, r.len};
         switch (r.kind) {
@@ -293,35 +297,41 @@ float LayoutText(Text& t, IDWriteTextFormat* f, float width, bool dim = false) {
                 t.layout->SetFontFamilyName(g_mono.c_str(), range);
                 t.layout->SetFontSize(f->GetFontSize() * 0.88f, range);
                 break;
-            case RK_Link: t.layout->SetDrawingEffect(g_link.Get(), range); break;
             case RK_Del: t.layout->SetStrikethrough(TRUE, range); break;
             default: break;
         }
     }
-    CodeRects(t);
     DWRITE_TEXT_METRICS m{};
     t.layout->GetMetrics(&m);
     return m.height;
 }
 
-// Reads a Markdown image's natural size (px == 0: cheap, headers only) or decodes it to at most
-// `px` pixels wide.
-void LoadImageBlock(Block& b, UINT px) {
+float ImageScale(const Block& b, float width) { return std::clamp(width / b.imgW, 0.f, 1.f); }
+
+float ImageHeight(const Block& b, float width) { return std::round(b.imgH * ImageScale(b, width)); }
+
+// When a data image is first measured in view, reuse its base64 payload and WIC decoder for
+// the pixels. The payload only lives for this call, including for images skipped during a jump.
+void LoadImageBlock(Block& b, float width, bool probe, float top = INFINITY, float bottom = -INFINITY) {
     IWICImagingFactory* wic = WicFactory();
+    auto pixels = [&] { return (UINT)std::max(1l, std::lround(width * g_dpi / 96)); };
+    UINT px = probe ? 0 : pixels();
     ComPtr<IWICBitmapSource> src;
-    std::string bytes;  // data: URI payload, alive while decoding
+    std::vector<BYTE> bytes;  // data: URI payload, alive until the decoder and frame are released
     ComPtr<IWICStream> stream;
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
-    if (b.src.starts_with(L"data:")) {
+    bool embedded = b.src.starts_with(L"data:");
+    if (embedded) {
         size_t comma = b.src.find(L',');
-        if (comma == std::wstring::npos || b.src.find(L";base64") > comma) return;
-        std::string b64(b.src.begin() + comma + 1, b.src.end());
+        if (comma == std::wstring::npos || comma + 1 == b.src.size() || b.src.find(L";base64") > comma) return;
+        const wchar_t* b64 = b.src.c_str() + comma + 1;
+        DWORD len = (DWORD)(b.src.size() - comma - 1);
         DWORD n = 0;
-        if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr)) return;
+        if (!CryptStringToBinaryW(b64, len, CRYPT_STRING_BASE64, nullptr, &n, nullptr, nullptr) || !n) return;
         bytes.resize(n);
-        if (!CryptStringToBinaryA(b64.c_str(), (DWORD)b64.size(), CRYPT_STRING_BASE64, (BYTE*)bytes.data(), &n, nullptr, nullptr) ||
-            FAILED(wic->CreateStream(&stream)) || FAILED(stream->InitializeFromMemory((BYTE*)bytes.data(), n)) ||
+        if (!CryptStringToBinaryW(b64, len, CRYPT_STRING_BASE64, bytes.data(), &n, nullptr, nullptr) ||
+            FAILED(wic->CreateStream(&stream)) || FAILED(stream->InitializeFromMemory(bytes.data(), n)) ||
             FAILED(wic->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec)))
             return;
     } else {
@@ -346,9 +356,11 @@ void LoadImageBlock(Block& b, UINT px) {
     }
     UINT w, h;
     if (FAILED(dec->GetFrame(0, &frame)) || FAILED(frame->GetSize(&w, &h)) || !w || !h) return;
-    if (!px) {
+    if (probe) {
         b.imgW = (float)w, b.imgH = (float)h;
-        return;
+        if (!embedded || b.y > bottom || b.y + ImageHeight(b, width) < top) return;
+        b.tried = true;
+        px = pixels();
     }
     src = frame;
     ComPtr<IWICBitmapScaler> scaler;
@@ -362,10 +374,8 @@ void LoadImageBlock(Block& b, UINT px) {
 Text& Cell(Block& b, size_t ri, size_t ci) {
     Text& c = b.tab->rows[ri][ci];
     float w = b.tab->colX[ci + 1] - b.tab->colX[ci] - 2 * kCellPadX;
-    if (!c.layout) {
-        LayoutText(c, g_fmtBody.Get(), w, b.quote > 0);
-        if (ri == 0) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
-    } else if (c.layout->GetMaxWidth() != w) c.layout->SetMaxWidth(w), CodeRects(c);
+    if (!c.layout) LayoutText(c, g_fmtBody.Get(), w, ri == 0);
+    else if (c.layout->GetMaxWidth() != w) c.layout->SetMaxWidth(w), c.painted = 0;
     return c;
 }
 
@@ -388,6 +398,7 @@ void TableRows(Block& b, float until) {
         if (size_t old = ri - kKeepRows; until != INFINITY && ri >= first + kKeepRows && old >= t.live0)
             for (auto& c : t.rows[old]) c.layout.Reset();  // measured: its height is all that's needed
         t.rowY.push_back(t.rowY.back() + std::ceil(rh) + 2 * kCellPadY);
+        t.rowCell.push_back(t.rowCell.back() + (UINT32)t.rows[ri].size());
     }
     b.h = t.rowY.back();
 }
@@ -398,46 +409,54 @@ std::vector<StyleRun> ChunkRuns(const Block& b) {
     auto [it, made] = g_lex.try_emplace(first);
     auto& [lex, at] = it->second;
     if (made) {
-        std::wstring all;
-        for (size_t i = first; i < g_blocks.size() && g_blocks[i].part && (i == first || g_blocks[i].part != 1); i++)
-            at.push_back((UINT32)all.size()), all += g_blocks[i].text.s, all += L'\n';
-        at.push_back((UINT32)all.size());
-        lex = LexBegin(all, LangForName(b.src));
+        if (const Lang* lang = LangForName(b.src)) {
+            std::wstring all;
+            for (size_t i = first; i < g_blocks.size() && g_blocks[i].part && (i == first || g_blocks[i].part != 1); i++)
+                at.push_back((UINT32)all.size()), all += g_blocks[i].text.s, all += L'\n';
+            at.push_back((UINT32)all.size());
+            lex = LexBegin(all, lang);
+        }
     }
     if (!lex || (size_t)b.level + 1 >= at.size()) return {};
     return LexRange(*lex, at[b.level], at[b.level + 1]);
 }
 
-void LayoutBlock(Block& b, float width, float until = INFINITY) {
-    float w = width - b.indent * kIndent - b.quote * kQuote, before = 0;
-    bool dim = b.quote > 0;
+float LayoutBlockText(Block& b, float w) {
+    if (b.kind == B_Code) return LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad);
+    auto* format = b.kind == B_Head ? g_fmtHead[std::clamp(b.level, 1, 6) - 1].Get() : g_fmtBody.Get();
+    return LayoutText(b.text, format, w);
+}
+
+bool HasBlockText(const Block& b) {
+    return b.kind == B_Para || b.kind == B_Head || b.kind == B_Code || (b.kind == B_Image && b.imgW <= 0);
+}
+
+void LayoutBlock(Block& b, float width, float top = INFINITY, float bottom = -INFINITY, float until = INFINITY) {
+    float w = width - b.indent * kIndent - b.quote * kQuote;
+    float before = b.kind == B_Head ? (b.level <= 2 ? 24.f : 18.f) : b.kind == B_Rule ? 10.f : 0.f;
+    b.y = g_laidH + std::max(g_prevAfter, before);
     switch (b.kind) {
-        case B_Para: b.h = LayoutText(b.text, g_fmtBody.Get(), w, dim), b.after = b.tight ? 4 : 14; break;
+        case B_Para: b.h = LayoutBlockText(b, w), b.after = b.tight ? 4 : 14; break;
         case B_Head:
-            b.h = LayoutText(b.text, g_fmtHead[std::clamp(b.level, 1, 6) - 1].Get(), w, dim || b.level == 6);
+            b.h = LayoutBlockText(b, w);
             if (b.level <= 2) b.h += 9;  // room for the rule underneath
-            before = b.level <= 2 ? 24 : 18, b.after = 10;
+            b.after = 10;
             break;
         case B_Code:
-            b.h = LayoutText(b.text, g_fmtCode.Get(), w - 2 * kCodePad) + CodeTop(b) + (b.part % 3 == 0 ? kCodePad : 0);
+            b.h = LayoutBlockText(b, w) + CodeTop(b) + (b.part % 3 == 0 ? kCodePad : 0);
             b.after = b.part % 3 == 0 ? 14 : 0;  // chunks of one block: no gap between them
-            for (auto& r : b.part ? ChunkRuns(b) : Highlight(b.text.s, LangForName(b.src)))
-                if (r.start < b.text.s.size())
-                    b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, std::min<UINT32>(r.len, (UINT32)b.text.s.size() - r.start)});
             break;
         case B_Image:
-            if (!b.sized) b.sized = true, LoadImageBlock(b, 0);  // pixels are decoded when first drawn
-            if (b.imgW > 0) {
-                float k = std::min(1.f, w / b.imgW);
-                b.h = std::round(b.imgH * k);
-            } else {  // missing or undecodable: show the alt text
+            if (!b.sized) b.sized = true, LoadImageBlock(b, w, true, top, bottom);
+            if (b.imgW > 0) b.h = ImageHeight(b, w);
+            else {  // missing or undecodable: show the alt text
                 if (b.text.s.empty()) b.text.s = PathFindFileNameW(b.src.c_str());
                 b.text.runs = {{0, (UINT32)b.text.s.size(), RK_Em}};
-                b.h = LayoutText(b.text, g_fmtBody.Get(), w, true);
+                b.h = LayoutBlockText(b, w);
             }
             b.after = 14;
             break;
-        case B_Rule: b.h = 2, before = 10, b.after = 22; break;
+        case B_Rule: b.h = 2, b.after = 22; break;
         case B_Table: {
             size_t cols = 0;
             for (auto& r : b.tab->rows) cols = std::max(cols, r.size());
@@ -453,8 +472,7 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
                     for (int k = 2; k > 0 && (!top[k - 1] || top[k]->s.size() > top[k - 1]->s.size()); k--) std::swap(top[k], top[k - 1]);
                 }
             auto measure = [&](Text& c, size_t ci, bool head, float slack) {
-                LayoutText(c, g_fmtBody.Get(), 1e5f, dim);
-                if (head) c.layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD, {0, (UINT32)c.s.size()});
+                LayoutText(c, g_fmtBody.Get(), 1e5f, head);
                 DWRITE_TEXT_METRICS m{};
                 c.layout->GetMetrics(&m);
                 natural[ci] = std::max(natural[ci], std::ceil(m.widthIncludingTrailingWhitespace * slack) + 2 * kCellPadX);
@@ -473,24 +491,26 @@ void LayoutBlock(Block& b, float width, float until = INFINITY) {
             float k = total > w ? w / total : 1;  // shrink every column alike when the table is too wide
             b.tab->colX.assign(1, 0);
             for (float n : natural) b.tab->colX.push_back(b.tab->colX.back() + std::floor(std::max(48.f, n * k)));
-            b.tab->rowY.assign(1, 0), b.tab->live0 = 0, b.tab->live1 = std::min(b.tab->rows.size(), kSampleRows);
+            b.tab->rowY.assign(1, 0), b.tab->rowCell.assign(1, 0);
+            b.tab->live0 = 0, b.tab->live1 = std::min(b.tab->rows.size(), kSampleRows);
             b.h = 0, b.after = 14;  // rows: TableRows, below
             break;
         }
     }
-    b.y = g_laidH + std::max(g_prevAfter, before);
     if (b.kind == B_Table) TableRows(b, until - b.y);
     g_laidH = b.y + b.h, g_prevAfter = b.after;
+    if (g_laidH + b.after < top) b.text.layout.Reset();
 }
 
 // Lays out blocks (a table part way first) until the document is `until` tall.
-void LayOut(float width, float until) {
+void LayOut(float width, float top, float bottom) {
+    float until = bottom + 400;
     for (;;) {
         if (Block* last = g_laid ? &g_blocks[g_laid - 1] : nullptr; last && Open(*last)) {
             if (g_laidH >= until) break;
             TableRows(*last, until - last->y);
             g_laidH = last->y + last->h;
-        } else if (g_laid < g_blocks.size() && g_laidH < until) LayoutBlock(g_blocks[g_laid++], width, until);
+        } else if (g_laid < g_blocks.size() && g_laidH < until) LayoutBlock(g_blocks[g_laid++], width, top, bottom, until);
         else break;
     }
 }
@@ -501,8 +521,15 @@ void DrawSel(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float y
         fill->SetColor(g_selColor), FillText(rt, t.layout.Get(), a, b, {x, y}, fill);
 }
 
-void DrawRich(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float y, ID2D1SolidColorBrush* text,
+void DrawRich(ID2D1RenderTarget* rt, Text& t, UINT64 unit, float x, float y, bool dim, ID2D1SolidColorBrush* text,
               ID2D1SolidColorBrush* fill, const MdColors& c) {
+    if (t.painted != g_brushGeneration) {
+        t.painted = g_brushGeneration;
+        if (dim) t.layout->SetDrawingEffect(g_dim.Get(), {0, (UINT32)t.s.size()});
+        for (auto& r : t.runs)
+            if (r.kind == RK_Link) t.layout->SetDrawingEffect(g_link.Get(), {r.start, r.len});
+        CodeRects(t);
+    }
     fill->SetColor(c.codeBg);
     for (auto& r : t.codeRects) rt->FillRoundedRectangle({{x + r.left, y + r.top, x + r.right, y + r.bottom}, 4, 4}, fill);
     DrawSel(rt, t, unit, x, y, fill);
@@ -512,6 +539,8 @@ void DrawRich(ID2D1RenderTarget* rt, const Text& t, UINT64 unit, float x, float 
 void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, float width, float top, float bottom,
                ID2D1SolidColorBrush* text, ID2D1SolidColorBrush* fill, const MdColors& c) {
     float x = x0 + b.indent * kIndent + b.quote * kQuote, right = x0 + width;
+    bool dim = b.quote > 0;
+    if (!b.text.layout && HasBlockText(b)) LayoutBlockText(b, width - b.indent * kIndent - b.quote * kQuote);
     fill->SetColor(c.rule);
     for (int q = 0; q < b.quote; q++) {
         float qx = x - (b.quote - q) * kQuote;
@@ -520,13 +549,19 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
     if (!b.bullet.empty())
         rt->DrawText(b.bullet.c_str(), (UINT32)b.bullet.size(), g_fmtBullet.Get(), {x - 60, y, x - 8, y + 100}, text);
     switch (b.kind) {
-        case B_Para: DrawRich(rt, b.text, unit, x, y, text, fill, c); break;
+        case B_Para: DrawRich(rt, b.text, unit, x, y, dim, text, fill, c); break;
         case B_Head:
-            DrawRich(rt, b.text, unit, x, y, text, fill, c);
+            DrawRich(rt, b.text, unit, x, y, dim || b.level == 6, text, fill, c);
             fill->SetColor(c.rule);
             if (b.level <= 2) rt->FillRectangle({x, y + b.h - 1, right, y + b.h}, fill);
             break;
         case B_Code:
+            if (b.text.painted != g_brushGeneration && y + b.h >= top) {
+                b.text.painted = g_brushGeneration;
+                for (auto& r : b.part ? ChunkRuns(b) : Highlight(b.text.s, LangForName(b.src)))
+                    if (r.start < b.text.s.size())
+                        b.text.layout->SetDrawingEffect(g_role[r.role].Get(), {r.start, std::min<UINT32>(r.len, (UINT32)b.text.s.size() - r.start)});
+            }
             fill->SetColor(c.codeBg);
             if (b.part) {  // a chunk: round corners at the block's ends only (the background is translucent: no overlap)
                 rt->PushAxisAlignedClip({x, y, right, y + b.h}, D2D1_ANTIALIAS_MODE_ALIASED);
@@ -538,12 +573,12 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             break;
         case B_Rule: rt->FillRectangle({x, y, right, y + b.h}, fill); break;
         case B_Image:
-            if (b.imgW > 0 && !b.tried) b.tried = true, LoadImageBlock(b, (UINT)std::lround((right - x) * g_dpi / 96));
+            if (b.imgW > 0 && !b.tried && y + b.h >= top) b.tried = true, LoadImageBlock(b, right - x, false);
             if (b.bmp) {
-                float k = std::min(1.f, (right - x) / b.imgW);
-                rt->DrawBitmap(b.bmp.Get(), {x, y, x + std::round(b.imgW * k), y + b.h}, 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                rt->DrawBitmap(b.bmp.Get(), {x, y, x + std::round(b.imgW * ImageScale(b, right - x)), y + b.h}, 1,
+                               D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
             } else if (b.imgW <= 0) {
-                DrawRich(rt, b.text, ~0ull, x, y, text, fill, c);  // alt text: not selectable (copied as nothing)
+                DrawRich(rt, b.text, ~0ull, x, y, true, text, fill, c);  // alt text: not selectable (copied as nothing)
             }
             break;
         case B_Table: {
@@ -554,7 +589,7 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             for (float cx : b.tab->colX) rt->FillRectangle({x + cx, y, x + cx + 1, y + b.h + 1}, fill);
             // Only the rows in view (a long table: thousands of rows off screen); layouts far from them are released.
             auto row = [&](float v) { return (size_t)std::max<ptrdiff_t>(0, std::upper_bound(b.tab->rowY.begin(), b.tab->rowY.end(), v) - b.tab->rowY.begin() - 1); };
-            size_t laid = b.tab->rowY.size() - 1, r0 = std::min(laid, row(top - y)), r1 = std::min(laid, row(bottom - y) + 1), k = 0;
+            size_t laid = b.tab->rowY.size() - 1, r0 = std::min(laid, row(top - y)), r1 = std::min(laid, row(bottom - y) + 1);
             size_t keep0 = r0 > kKeepRows ? r0 - kKeepRows : 0, keep1 = std::min(laid, r1 + kKeepRows);
             for (size_t ri = b.tab->live0; ri < std::min(b.tab->live1, laid); ri++)
                 if (ri < keep0 || ri >= keep1)
@@ -562,10 +597,11 @@ void DrawBlock(ID2D1RenderTarget* rt, Block& b, UINT64 unit, float x0, float y, 
             b.tab->live0 = keep0, b.tab->live1 = b.tab->live1 > laid ? std::max(keep1, b.tab->live1) : keep1;  // unlaid sample rows: later
             for (size_t ri = r0; ri <= r1 && ri < b.tab->rowY.size(); ri++)
                 rt->FillRectangle({x, y + b.tab->rowY[ri], x + b.tab->colX.back() + 1, y + b.tab->rowY[ri] + 1}, fill);
-            for (size_t ri = 0; ri < r0; ri++) k += b.tab->rows[ri].size();
+            UINT32 k = b.tab->rowCell[r0];
             for (size_t ri = r0; ri < r1; ri++)
                 for (size_t ci = 0; ci < b.tab->rows[ri].size(); ci++, k++)
-                    DrawRich(rt, Cell(b, ri, ci), unit + k, x + b.tab->colX[ci] + kCellPadX, y + b.tab->rowY[ri] + kCellPadY, text, fill, c);
+                    DrawRich(rt, Cell(b, ri, ci), unit + k, x + b.tab->colX[ci] + kCellPadX, y + b.tab->rowY[ri] + kCellPadY,
+                             dim, text, fill, c);
             break;
         }
     }
@@ -625,7 +661,8 @@ float MdHeadingY(size_t i, bool layout) {
     if (b >= g_laid) {
         if (!layout || g_width < 0) return -1;
         if (g_laid && Open(g_blocks[g_laid - 1])) TableRows(g_blocks[g_laid - 1], INFINITY), g_laidH = g_blocks[g_laid - 1].y + g_blocks[g_laid - 1].h;
-        while (g_laid <= b) LayoutBlock(g_blocks[g_laid++], g_width);
+        while (g_laid < b) LayoutBlock(g_blocks[g_laid++], g_width);
+        LayoutBlock(g_blocks[g_laid++], g_width, -INFINITY);
     }
     return g_blocks[b].y;
 }
@@ -635,6 +672,7 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
         rt->CreateSolidColorBrush(c.link, g_link.ReleaseAndGetAddressOf());
         rt->CreateSolidColorBrush(c.dim, g_dim.ReleaseAndGetAddressOf());
         for (auto& b : g_role) rt->CreateSolidColorBrush(c.text, b.ReleaseAndGetAddressOf());
+        g_brushGeneration++;
         g_brushRt = rt, g_width = -1;
     }
     g_link->SetColor(c.link);
@@ -646,18 +684,22 @@ float MdPaint(ID2D1RenderTarget* rt, const D2D1_RECT_F& area, float scroll, cons
     g_selOn = !g_sel.Empty(), g_selColor = c.sel;
     float width = std::min(kMaxWidth, area.right - area.left), viewH = area.bottom - area.top;
     if (width != g_width) g_width = width, g_laid = 0, g_laidH = 0, g_prevAfter = 8;
-    LayOut(width, scroll + viewH + 400);
+    LayOut(width, scroll, scroll + viewH);
 
     ComPtr<ID2D1SolidColorBrush> text, fill;
     rt->CreateSolidColorBrush(c.text, &text);
     rt->CreateSolidColorBrush(c.rule, &fill);
     float x0 = std::round(area.left + (area.right - area.left - width) / 2);
     g_x0 = x0, g_top = area.top;
-    for (size_t i = 0; i < g_laid; i++) {
-        Block& b = g_blocks[i];
-        float y = area.top + b.y - scroll;
+    // The next block starts at or after this block's end plus its gap (also the end of a quote bar).
+    auto laidEnd = g_blocks.begin() + g_laid;
+    auto first = std::lower_bound(g_blocks.begin(), laidEnd, scroll,
+                                  [](const Block& b, float v) { return b.y + b.h + b.after < v; });
+    for (auto it = first; it != laidEnd; ++it) {
+        Block& b = *it;
+        float y = area.top + (b.y - scroll);
         if (y > area.bottom) break;
-        if (y + b.h + b.after >= area.top) DrawBlock(rt, b, (UINT64)i << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
+        DrawBlock(rt, b, (UINT64)(it - g_blocks.begin()) << 32, x0, y, width, area.top, area.bottom, text.Get(), fill.Get(), c);
     }
     // Estimates until all is laid out: blocks at their average height so far; an open table's rows at theirs (the blocks
     // after it at the average of those before it).
@@ -703,10 +745,12 @@ bool MdSelect(D2D1_POINT_2F pt, float scroll, int clicks) {
         while (ri > 0 && b.tab->rows[ri].empty()) ri--;
         if (b.tab->rows[ri].empty()) return false;
         size_t ci = std::min(at(b.tab->colX, pt.x - ox), b.tab->rows[ri].size() - 1);
-        for (size_t r = 0; r < ri; r++) cell += (UINT32)b.tab->rows[r].size();
-        cell += (UINT32)ci, t = &Cell(b, ri, ci);
+        cell = b.tab->rowCell[ri] + (UINT32)ci, t = &Cell(b, ri, ci);
         ox += b.tab->colX[ci] + kCellPadX, oy += b.tab->rowY[ri] + kCellPadY;
-    } else if (b.kind == B_Code) ox += kCodePad, oy += CodeTop(b);
+    } else {
+        if (!b.text.layout) LayoutBlockText(b, g_width - b.indent * kIndent - b.quote * kQuote);
+        if (b.kind == B_Code) ox += kCodePad, oy += CodeTop(b);
+    }
     if (!t->layout) return false;
     if (clicks) g_sel.unit = std::min(clicks, 3);
     UINT32 from, to;
