@@ -949,7 +949,7 @@ DWORD WINAPI GridThread(void* p) {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);  // WIC for the pictures
         g = OfficeToGrid(job->path, job->sheet, job->scale, &g_gridGen, job->gen).release();
     } else g = (job->folder ? GridReadFolder(job->path, g_gridGen, job->gen) : GridReadArchive(job->path, g_gridGen, job->gen)).release();
-    if (!SendMessageW(g_hwnd, WM_FLICK_GRID, job->gen, (LPARAM)g)) delete g;  // reply 1: the UI took it
+    if (job->gen != g_gridGen || !SendMessageW(g_hwnd, WM_FLICK_GRID, job->gen, (LPARAM)g)) delete g;  // reply 1: the UI took it
     return 0;
 }
 
@@ -958,15 +958,21 @@ void StartSheetWorker(const std::wstring& path, int sheet) {
     CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, g_gridGen, false, sheet, g_dpi / 96.f}, 0, nullptr));
 }
 
+void ShowInfo();
 // Archive or folder contents as a tree, listed on a worker thread.
 void LoadTree(const std::wstring& path, bool folder) {
     g_gridPending = true;
     g_gridFolder = folder, g_gridSheet = false;
     g_sub = L"reading…";
-    CloseHandle(CreateThread(nullptr, 0, GridThread, new GridJob{path, ++g_gridGen, folder}, 0, nullptr));
+    auto* job = new GridJob{path, ++g_gridGen, folder};
+    if (HANDLE thread = CreateThread(nullptr, 0, GridThread, job, 0, nullptr)) CloseHandle(thread);
+    else {
+        delete job;
+        g_gridPending = false;
+        ShowInfo();
+    }
 }
 
-void ShowInfo();
 // Folder size: every file below the folder (hidden ones too, links not followed), counted on a worker.
 // The title counts up every 100 ms; at the end each folder row in the tree gets its own total.
 struct SizeMsg {
@@ -1038,6 +1044,7 @@ void OnFolderSize(const SizeMsg& m) {
     if (m.gen != g_sizeGen || g_kind != K_Grid || !g) return;
     g_sub = std::to_wstring(m.dirs) + (m.dirs == 1 ? L" folder, " : L" folders, ") + std::to_wstring(m.files) +
             (m.files == 1 ? L" file · " : L" files · ") + ByteSize(m.bytes) + (m.done ? L"" : L"…");
+    if (g->treePartial) g_sub += L" · first " + std::to_wstring(g->paths.size()) + L" items";
     if (m.done)
         for (size_t i = 0; i < g->paths.size(); i++)
             if (g->folder[i])
@@ -1465,8 +1472,8 @@ void ClearContent() {
     g_pageText.clear(), g_slidePage = -1, g_slideSel = {};
     if (g_selDrag) ReleaseCapture();
     g_sideCurrent = -1, g_sideFocus = false;
+    ++g_gridGen;  // stop reading before releasing the old grid
     GridSet(nullptr);
-    ++g_gridGen;  // a worker still reading stops
     FontClear();
     MediaClose();
     MediaScrubStop();
@@ -1479,7 +1486,7 @@ void ClearContent() {
     g_gif = {};
     g_zoom = 1, g_panX = g_panY = 0, g_panDrag = false;
     g_findOn = false, g_hits.clear(), g_hit = -1;
-    g_gridGen++, g_gridPending = false, g_sizeGen++;
+    g_gridPending = false, g_sizeGen++;
     for (int a = 0; a < 3; a++) g_scroll[a] = g_doc[a] = 0;
     g_kind = K_None;
 }

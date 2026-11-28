@@ -130,8 +130,11 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 
 **Misc**
 - `archiveint.dll` (Windows' libarchive, undocumented) lists archives and inflates zips; missing → info card.
-- Folders list breadth-first ≤60 ms / 10k items. Folder totals still require a separate worker walk. Archive
-  trees find omitted parent folders in a hash set, and adjacent rows reuse dates displayed at minute precision.
+- Folders scan breadth-first for 60 ms or 10k rows. Archives scan for 3 s or 200k headers and keep at most
+  200k rows including omitted parents. Both limit relative paths to 4,096 UTF-16 units and 255 levels below
+  the top row, and keep at most 8 Mi UTF-16 units of row paths. Archive directory-index keys are bounded by
+  those same paths. Listings sort short runs, then merge and format rows with generation checks. Truncated
+  trees show how many rows were kept alongside the details. Folder totals still use a separate walk and include hidden files.
 - `/GL` gained nothing. lunasvg rejects a UTF-8 BOM. `small`/`near`/`far` are macros.
 - PowerShell 5 reads BOM-less scripts as ANSI, is DPI-unaware, and can't pipe into `git credential` (use bash).
 - No `gh` CLI: releases via curl + the git credential token.

@@ -195,6 +195,7 @@ struct GridData {
     std::vector<UINT8> indent;                     // archives, per body row: tree depth
     std::vector<bool> folder;                      // archives, per body row
     std::vector<std::wstring> paths;               // trees, per body row: path under the root, '/'-separated
+    bool treePartial = false;                      // trees: the scan or expanded listing reached a cap
     std::wstring sub;                              // title-bar details
     bool sheet = false;                            // spreadsheet: A B C / 1 2 3 headers, gridlines, tabs
     std::vector<bool> num;                         // sheets, per cell: right-aligned (numbers, dates)

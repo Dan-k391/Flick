@@ -7,10 +7,10 @@
 #include <cmath>
 #include <ctime>
 #include <functional>
+#include <limits>
 #include <map>
 #include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 
 using Microsoft::WRL::ComPtr;
 
@@ -157,6 +157,65 @@ struct Entry {
     time_t mtime;
 };
 
+constexpr size_t kArchiveRows = 200000, kFolderRows = 10000;
+constexpr size_t kTreePathUnits = 8 << 20;  // sum of row path lengths, including synthetic parents
+constexpr size_t kTreePathMax = 4096, kTreeDepthMax = 255;
+constexpr double kArchiveReadMs = 3000, kFolderReadMs = 60;
+
+struct TreeEntries {
+    size_t maxRows;
+    std::vector<Entry> rows;
+    size_t pathUnits = 0;
+
+    bool Fits(size_t count, size_t units) const {
+        return count <= maxRows - rows.size() && units <= kTreePathUnits - pathUnits;
+    }
+    void Add(Entry e) {
+        pathUnits += e.path.size();
+        rows.push_back(std::move(e));
+    }
+};
+
+struct PathHash {
+    using is_transparent = void;
+    size_t operator()(std::wstring_view path) const { return std::hash<std::wstring_view>{}(path); }
+};
+struct ArchiveDir { size_t row; bool synthetic; };
+using ArchiveDirs = std::unordered_map<std::wstring, ArchiveDir, PathHash, std::equal_to<>>;
+
+// Commit a member together with its missing parents. If it would cross a cap, keep the preceding complete tree.
+bool AddArchiveEntry(TreeEntries& tree, ArchiveDirs& dirs, Entry entry, const std::atomic<int>& gen, int mine, LONGLONG start) {
+    if (gen != mine) return false;
+    if (entry.dir) {
+        auto it = dirs.find(entry.path);
+        if (it != dirs.end() && it->second.synthetic) {
+            // An explicit directory can follow the children that introduced it. Keep its metadata and one row.
+            tree.rows[it->second.row].mtime = entry.mtime;
+            it->second.synthetic = false;
+            return true;
+        }
+    }
+    std::array<size_t, kTreeDepthMax> missing;
+    size_t parents = 0, units = entry.path.size();
+    if (!tree.Fits(1, units)) return false;
+    std::wstring_view path = entry.path;
+    for (size_t slash = path.rfind(L'/'); slash != path.npos && slash > 0; slash = path.rfind(L'/', slash - 1)) {
+        if (gen != mine || MsSince(start) >= kArchiveReadMs) return false;
+        if (dirs.contains(path.substr(0, slash))) break;
+        if (parents == missing.size() || !tree.Fits(parents + 2, units + slash)) return false;
+        missing[parents++] = slash, units += slash;
+    }
+    while (parents) {
+        if (gen != mine) return false;
+        std::wstring parent(path.substr(0, missing[--parents]));
+        dirs.try_emplace(parent, ArchiveDir{tree.rows.size(), true});
+        tree.Add({std::move(parent), true, -1, 0});
+    }
+    if (entry.dir) dirs.try_emplace(entry.path, ArchiveDir{tree.rows.size(), false});
+    tree.Add(std::move(entry));
+    return true;
+}
+
 // Directory-tree order: parents before children, folders before files, names in natural order.
 bool TreeLess(const Entry& a, const Entry& b) {
     size_t i = 0, j = 0;
@@ -164,8 +223,8 @@ bool TreeLess(const Entry& a, const Entry& b) {
         size_t ei = std::min(a.path.find(L'/', i), a.path.size()), ej = std::min(b.path.find(L'/', j), b.path.size());
         std::wstring_view ca(a.path.data() + i, ei - i), cb(b.path.data() + j, ej - j);
         bool aDir = ei < a.path.size() || a.dir, bDir = ej < b.path.size() || b.dir;
+        if (aDir != bDir) return aDir;
         if (ca != cb) {
-            if (aDir != bDir) return aDir;
             // Natural order ("file2" < "file10") without copying the names.
             int c = CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS, ca.data(), (int)ca.size(),
                                     cb.data(), (int)cb.size(), nullptr, nullptr, 0);
@@ -191,7 +250,7 @@ std::wstring FormatDate(time_t t) {
 }
 
 std::wstring Bytes(long long n) {
-    wchar_t s[64];
+    wchar_t s[64]{};
     StrFormatByteSizeEx((ULONGLONG)n, SFBS_FLAGS_ROUND_TO_NEAREST_DISPLAYED_DIGIT, s, 64);
     return s;
 }
@@ -289,95 +348,132 @@ std::unique_ptr<GridData> GridParseCsv(const std::wstring& text, wchar_t sep) {
 
 // Worker thread: lists an archive. nullptr when libarchive is missing or can't read the file.
 namespace {
-std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, bool archive);
+std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, const std::atomic<int>& gen, int mine);
 }
 
 std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::atomic<int>& gen, int mine) {
+    if (gen != mine) return nullptr;
     Archive* pa = Api();
     if (!pa) return nullptr;
     Archive& api = *pa;
     void* a = api.read_new();
+    if (!a) return nullptr;
     api.support_filter_all(a);
     api.support_format_all(a);
-    std::vector<Entry> entries;
+    TreeEntries tree{kArchiveRows};
     bool encrypted = false, partial = false;
     LONGLONG start = Now();
     if (api.open_filename_w(a, path.c_str(), 1 << 16) == 0) {
-        void* e;
-        for (int r; (r = api.next_header(a, &e)) == 0 || r == -20 /* ARCHIVE_WARN */;) {
-            if (gen != mine) break;
+        ArchiveDirs dirs;
+        for (size_t headers = 0; gen == mine; headers++) {
             // Compressed tarballs must be decompressed to reach every header: bound the work.
-            if (entries.size() >= 200000 || MsSince(start) > 3000) {
+            if (headers == kArchiveRows || MsSince(start) >= kArchiveReadMs) {
                 partial = true;
                 break;
             }
-            const wchar_t* p = api.pathname_w(e);
+            void* e = nullptr;
+            int r = api.next_header(a, &e);
+            if (r != 0 && r != -20 /* ARCHIVE_WARN */) break;
+            if (gen != mine) break;
+            if (MsSince(start) >= kArchiveReadMs) {
+                partial = true;
+                break;
+            }
+            const wchar_t* p = e ? api.pathname_w(e) : nullptr;
             if (!p) continue;
-            std::wstring s = p;
+            size_t len = wcsnlen_s(p, kTreePathMax + 1);
+            if (len > kTreePathMax) {
+                partial = true;
+                break;
+            }
+            std::wstring_view name(p, len);
+            auto slash = [](wchar_t c) { return c == L'/' || c == L'\\'; };
+            while (name.size() >= 2 && name[0] == L'.' && slash(name[1])) name.remove_prefix(2);
+            bool dir = api.filetype(e) == 0040000 || (!name.empty() && slash(name.back()));
+            while (!name.empty() && slash(name.back())) name.remove_suffix(1);
+            if (name.empty()) continue;
+            std::wstring s(name);  // allocate only the normalized path that counts against the budget
             std::replace(s.begin(), s.end(), L'\\', L'/');
-            while (s.starts_with(L"./")) s.erase(0, 2);
-            bool dir = api.filetype(e) == 0040000 || s.ends_with(L'/');
-            while (!s.empty() && s.back() == L'/') s.pop_back();
-            if (s.empty()) continue;
+            size_t depth = std::count(s.begin(), s.end(), L'/');
+            if (depth > kTreeDepthMax ||
+                !AddArchiveEntry(tree, dirs, {std::move(s), dir, dir || !api.size_is_set(e) ? -1 : api.size(e), api.mtime(e)}, gen, mine, start)) {
+                partial = true;
+                break;
+            }
             encrypted |= api.is_encrypted(e) > 0;
-            entries.push_back({std::move(s), dir, dir || !api.size_is_set(e) ? -1 : api.size(e), api.mtime(e)});
         }
     }
     api.free(a);
-    if (entries.empty() || gen != mine) return nullptr;
-    return BuildTree(std::move(entries), partial, encrypted, true);
+    return BuildTree(std::move(tree.rows), partial, encrypted, gen, mine);
 }
 
 // Worker thread: a folder's contents as a tree, breadth-first so a huge folder still shows its top
 // levels within the time budget (it must arrive while the window waits for it, ~100 ms). Hidden and
 // system items are left out (like Explorer's default view); links are not followed.
 std::unique_ptr<GridData> GridReadFolder(const std::wstring& root, const std::atomic<int>& gen, int mine) {
-    std::vector<Entry> entries;
-    std::vector<std::wstring> queue{L""};  // folders to list, relative, '/'-separated
+    if (gen != mine) return nullptr;
+    TreeEntries tree{kFolderRows};
+    std::vector<size_t> queue{0};  // row index + 1 for each folder to visit, 0 for the root
     bool partial = false;
     LONGLONG start = Now();
     for (size_t q = 0; q < queue.size() && !partial && gen == mine; q++) {
-        std::wstring rel = queue[q], dir = root + L"\\" + rel;
+        if (MsSince(start) >= kFolderReadMs) {
+            partial = true;
+            break;
+        }
+        std::wstring rel = queue[q] ? tree.rows[queue[q] - 1].path : L"";
+        size_t depth = rel.empty() ? 0 : 1 + std::count(rel.begin(), rel.end(), L'/');
+        std::wstring dir = root + L"\\" + rel;
         std::replace(dir.begin(), dir.end(), L'/', L'\\');
         WIN32_FIND_DATAW fd;
         HANDLE h = FindFirstFileExW((dir + (rel.empty() ? L"*" : L"\\*")).c_str(), FindExInfoBasic, &fd, FindExSearchNameMatch,
                                     nullptr, FIND_FIRST_EX_LARGE_FETCH);
         if (h == INVALID_HANDLE_VALUE) continue;
         do {
+            if (gen != mine || MsSince(start) >= kFolderReadMs) {
+                partial = true;
+                break;
+            }
             if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..") ||
                 (fd.dwFileAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)))
                 continue;
             std::wstring path = rel.empty() ? fd.cFileName : rel + L"/" + fd.cFileName;
+            if (path.size() > kTreePathMax || depth > kTreeDepthMax || !tree.Fits(1, path.size())) {
+                partial = true;
+                break;
+            }
             bool isDir = fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY;
             ULONGLONG ft = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
             time_t mtime = ft > 116444736000000000ULL ? (time_t)((ft - 116444736000000000ULL) / 10000000ULL) : 0;
             long long size = isDir ? -1 : (long long)(((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
-            if (isDir && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) queue.push_back(path);
-            entries.push_back({std::move(path), isDir, size, mtime});
-            if (entries.size() >= 10000 || MsSince(start) > 60 || gen != mine) partial = true;
+            if (isDir && !(fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) queue.push_back(tree.rows.size() + 1);
+            tree.Add({std::move(path), isDir, size, mtime});
+            if (tree.rows.size() == kFolderRows) partial = true;
         } while (!partial && FindNextFileW(h, &fd));
         FindClose(h);
     }
-    if (entries.empty() || gen != mine) return nullptr;
-    return BuildTree(std::move(entries), partial, false, false);
+    return BuildTree(std::move(tree.rows), partial, false, gen, mine);
 }
 
 namespace {
 // Tree order (folders first, natural names), indent per depth, Name/Size/Modified columns.
-std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, bool archive) {
-    if (archive) {
-        // Archives can omit explicit directory entries. Use a set so adding parents does not shift the whole list.
-        std::unordered_set<std::wstring> known;
-        known.reserve(entries.size());
-        for (const auto& e : entries) known.insert(e.path);
-        for (size_t i = 0, n = entries.size(); i < n; i++)
-            for (size_t s = entries[i].path.rfind(L'/'); s != std::wstring::npos && s > 0; s = entries[i].path.rfind(L'/', s - 1)) {
-                std::wstring parent = entries[i].path.substr(0, s);
-                if (!known.insert(parent).second) break;
-                entries.push_back({std::move(parent), true, -1, 0});
-            }
+std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bool encrypted, const std::atomic<int>& gen, int mine) {
+    if (entries.empty() || gen != mine) return nullptr;
+    // Sort short runs, then merge one output row at a time. A stale generation never changes the comparator.
+    constexpr size_t kSortRun = 128;
+    struct Run { Entry* next; Entry* end; };
+    auto later = [](const Run& a, const Run& b) { return TreeLess(*b.next, *a.next); };
+    std::vector<Run> runs;
+    runs.reserve((entries.size() + kSortRun - 1) / kSortRun);
+    for (Entry* next = entries.data(), *last = next + entries.size(); next != last;) {
+        if (gen != mine) return nullptr;
+        Entry* end = next + std::min<size_t>(last - next, kSortRun);
+        std::sort(next, end, TreeLess);
+        runs.push_back({next, end});
+        std::push_heap(runs.begin(), runs.end(), later);
+        next = end;
     }
-    std::sort(entries.begin(), entries.end(), TreeLess);
+    if (gen != mine) return nullptr;
 
     auto g = std::make_unique<GridData>();
     g->cols = 3;
@@ -390,7 +486,13 @@ std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bo
     size_t files = 0, folders = 0;
     time_t lastMinute = -2;
     std::wstring date;
-    for (auto& e : entries) {
+    while (!runs.empty()) {
+        if (gen != mine) return nullptr;
+        std::pop_heap(runs.begin(), runs.end(), later);
+        Run& run = runs.back();
+        Entry& e = *run.next++;
+        if (run.next == run.end) runs.pop_back();
+        else std::push_heap(runs.begin(), runs.end(), later);
         size_t slash = e.path.rfind(L'/');
         AddCell(*g, slash == std::wstring::npos ? e.path : std::wstring_view(e.path).substr(slash + 1));
         AddCell(*g, e.size >= 0 ? Bytes(e.size) : L"");
@@ -402,10 +504,15 @@ std::unique_ptr<GridData> BuildTree(std::vector<Entry> entries, bool partial, bo
         g->paths.push_back(std::move(e.path));
         g->folder.push_back(e.dir);
         if (e.dir) folders++;
-        else files++, total += std::max(0LL, e.size);
+        else {
+            files++;
+            total += std::clamp(e.size, 0LL, std::numeric_limits<long long>::max() - total);
+        }
     }
+    if (gen != mine) return nullptr;
     g->header = true;
     g->rightAlign = {false, true, false};
+    g->treePartial = partial;
     g->sub = (folders ? std::to_wstring(folders) + (folders == 1 ? L" folder, " : L" folders, ") : L"") +
              std::to_wstring(files) + (files == 1 ? L" file, " : L" files, ") + Bytes(total) +
              (partial ? L" · first " + std::to_wstring(entries.size()) + L" items" : L"") +
