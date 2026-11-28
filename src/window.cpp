@@ -119,6 +119,7 @@ UINT g_posterW, g_posterH;  // size of the poster frame, until the engine knows 
 ComPtr<IWICBitmap> g_frameWic;
 ComPtr<ID2D1Bitmap> g_frame;
 ComPtr<ID2D1Bitmap> g_scrubFrame;  // provisional key frame until a seek transfers a playback frame
+ComPtr<ID2D1Bitmap> g_seekStartFrame;  // picture visible when this drag began
 D2D1_RECT_F g_playRc, g_trackRc, g_muteRc, g_volRc;
 double g_shownPos = -1;
 float g_seekFrac = -1;  // while dragging the seek bar: where the knob is (0..1)
@@ -1526,6 +1527,7 @@ void DrawSubs(const MediaState& s, ID2D1SolidColorBrush* brush) {
 // shows almost no frames during a stream of seeks). Releasing seeks the engine exactly, once.
 void BeginSeek() {
     g_scrubGen = 0;
+    g_seekStartFrame = g_scrubFrame ? g_scrubFrame : g_frame;
     MediaState s = MediaGet();
     g_seekResume = !s.paused && !s.ended;
     if (g_seekResume) MediaSetPlaying(false);
@@ -1550,7 +1552,11 @@ void EndSeek() {
     g_seekDrag = false;
     g_scrubGen = 0;
     MediaScrubStop();
-    if (frac < 0 || !MediaSeek(frac * MediaGet().dur)) g_scrubFrame.Reset();
+    if (frac < 0 || !MediaSeek(frac * MediaGet().dur)) {
+        if (g_seekStartFrame.Get() == g_frame.Get()) g_scrubFrame.Reset();
+        else g_scrubFrame = std::move(g_seekStartFrame);
+    }
+    g_seekStartFrame.Reset();
     if (resume) MediaSetPlaying(true);
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
@@ -1624,9 +1630,11 @@ void ClearContent() {
     ++g_gridGen;  // stop reading before releasing the old grid
     GridSet(nullptr);
     FontClear();
+    g_scrubGen = 0;
     MediaClose();
     MediaScrubStop();
     g_frame.Reset(), g_frameWic.Reset(), g_scrubFrame.Reset();
+    g_seekStartFrame.Reset();
     g_mediaVideo = g_seekDrag = g_seekResume = false, g_shownPos = -1, g_seekFrac = -1;
     g_subs.clear(), g_subOn.clear(), g_subLayoutOn.clear(), g_subLayout.Reset();
     g_posterGen++, g_posterW = g_posterH = 0;
