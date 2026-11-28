@@ -357,29 +357,55 @@ bool LoadGif(IWICBitmapDecoder* dec, UINT frames) {
     return true;
 }
 
+constexpr wchar_t kRawExt[] = L" .dng .cr2 .cr3 .crw .nef .nrw .arw .srf .sr2 .raf .orf .rw2 .pef .srw .raw .rwl .erf "
+                               L".kdc .dcr .mrw .x3f .3fr .mef .mos .iiq ";
+
 bool LoadImage(const std::wstring& path) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICBitmapSource> pic;
     GUID container{};
-    UINT frames = 0;
-    if (FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand,
-                                                &dec)))
-        return false;
-    if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
-        SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
-        return true;
-    if (FAILED(dec->GetFrame(0, &frame))) return false;
-    UINT w, h;
-    frame->GetSize(&w, &h);
+    UINT frames = 0, w, h;
+    std::wstring label;  // "": the decoded size; starting with " ·": appended to it
     g_orient = 1;
-    ComPtr<IWICMetadataQueryReader> meta;
-    PROPVARIANT pv;
-    PropVariantInit(&pv);
-    if (SUCCEEDED(frame->GetMetadataQueryReader(&meta)) &&
-        SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &pv)) && pv.vt == VT_UI2 && pv.uiVal <= 8)
-        g_orient = pv.uiVal;
-    PropVariantClear(&pv);
-    g_natW = (float)(g_orient >= 5 ? h : w), g_natH = (float)(g_orient >= 5 ? w : h);
+    if (HasExt(path, kImgOwnExt)) {  // imgfmt.cpp: decoded whole, scaled below like the rest
+        bool vector;
+        ComPtr<IWICBitmap> b = ImgLoad(path, g_dpi / 96.f, vector);
+        if (!b) return false;
+        b->GetSize(&w, &h);
+        pic = b;
+        g_natW = vector ? w * 96.f / g_dpi : w, g_natH = vector ? h * 96.f / g_dpi : h;
+        if (vector) label = std::to_wstring(std::lround(g_natW)) + L" × " + std::to_wstring(std::lround(g_natH));
+    } else {
+        // Camera raw: the Store codec's decoder by name (for .dng WIC picks its own DNG decoder, which shows only the
+        // small first IFD), and its embedded preview (a JPEG, often full size): demosaicing 24 MP takes ~450 ms.
+        bool raw = HasExt(path, kRawExt);
+        ComPtr<IWICStream> st;
+        if (raw && (FAILED(g_wic->CreateStream(&st)) || FAILED(st->InitializeFromFilename(path.c_str(), GENERIC_READ)) ||
+                    FAILED(g_wic->CreateDecoder(GUID_ContainerFormatRaw, nullptr, &dec)) ||
+                    FAILED(dec->Initialize(st.Get(), WICDecodeMetadataCacheOnDemand))))
+            dec.Reset();  // no codec: WIC's own choice (DNG) or nothing
+        if (!dec && FAILED(g_wic->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                            WICDecodeMetadataCacheOnDemand, &dec)))
+            return false;
+        if (SUCCEEDED(dec->GetContainerFormat(&container)) && container == GUID_ContainerFormatGif &&
+            SUCCEEDED(dec->GetFrameCount(&frames)) && frames > 1 && LoadGif(dec.Get(), frames))
+            return true;
+        ComPtr<IWICMetadataQueryReader> meta;
+        if (raw && container == GUID_ContainerFormatRaw && SUCCEEDED(dec->GetPreview(&pic)) && SUCCEEDED(pic->GetSize(&w, &h))) {
+            label = L" · embedded preview";  // the sensor's size would need the full decode
+            if (FAILED(dec->GetMetadataQueryReader(&meta)) && SUCCEEDED(pic.As(&frame))) frame->GetMetadataQueryReader(&meta);
+        } else if (pic.Reset(); SUCCEEDED(dec->GetFrame(0, &frame)))
+            frame->GetSize(&w, &h), frame->GetMetadataQueryReader(&meta), pic = frame;
+        else
+            return false;
+        PROPVARIANT pv;
+        PropVariantInit(&pv);
+        if (meta && SUCCEEDED(meta->GetMetadataByName(L"System.Photo.Orientation", &pv)) && pv.vt == VT_UI2 && pv.uiVal <= 8)
+            g_orient = pv.uiVal;
+        PropVariantClear(&pv);
+        g_natW = (float)(g_orient >= 5 ? h : w), g_natH = (float)(g_orient >= 5 ? w : h);
+    }
 
     // Decode no more pixels than the window shows; WM_EXITSIZEMOVE re-decodes after a resize.
     double maxW, maxH;
@@ -387,13 +413,13 @@ bool LoadImage(const std::wstring& path) {
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = g_decodeScale > 0 ? std::min(1.0, g_decodeScale) : std::min({1.0, maxW / w, maxH / h});
     g_imgReduced = s < 1;
-    ComPtr<IWICBitmapSource> src = frame;
+    ComPtr<IWICBitmapSource> src = pic;
     if (s < 1) {
         UINT sw = std::max(1u, (UINT)(w * s)), sh = std::max(1u, (UINT)(h * s));
         // JPEG (and some other codecs) can decode straight to 1/2, 1/4, 1/8 size: far cheaper than a
         // full decode followed by resampling. Use the smallest native size that is still >= target.
         ComPtr<IWICBitmapSourceTransform> xf;
-        if (SUCCEEDED(frame.As(&xf))) {
+        if (SUCCEEDED(pic.As(&xf))) {
             UINT cw = w, ch = h;
             for (UINT d = 2; d <= 8; d *= 2) {
                 UINT tw = (w + d - 1) / d, th = (h + d - 1) / d;
@@ -426,7 +452,7 @@ bool LoadImage(const std::wstring& path) {
     }
     g_bmp = ToD2D(src.Get());
     if (!g_bmp) return false;
-    g_sub = std::to_wstring(w) + L" × " + std::to_wstring(h);
+    g_sub = label.empty() || label[0] == L' ' ? std::to_wstring(w) + L" × " + std::to_wstring(h) + label : label;
     return true;
 }
 
@@ -1416,8 +1442,8 @@ void LoadContent(const std::wstring& path, LONGLONG t0) {
     else if (HasExt(path, L" .zip .7z .rar .tar .gz .tgz .bz2 .tbz .tbz2 .xz .txz .zst .tzst .lz .lzma .lz4 .cab "
                           L".iso .cpio .ar .deb .rpm .jar .war .ear .apk .aab .xapk .nupkg .snupkg .vsix .whl "
                           L".egg .crx .xpi .cbz .cbr .cb7 .cbt .appx .appxbundle .msix .msixbundle ")) g_kind = K_Grid, LoadTree(path, false);
-    else if (HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
-                                  L".wdp .dds ") &&
+    else if ((HasExt(path, L" .jpg .jpeg .jpe .jfif .png .bmp .dib .gif .tif .tiff .ico .webp .heic .heif .avif .jxr "
+                           L".wdp .dds .jxl ") || HasExt(path, kRawExt) || HasExt(path, kImgOwnExt)) &&
              LoadImage(path)) g_kind = K_Image;
     else if (HasExt(path, L" .cer .crt .der .pem .p7b .p7c .p7s ") && !(cert = ProgramInfo(path, false)).empty())
         g_kind = K_Info, LoadInfo(path, fa, t0, &cert);  // a certificate; anything else (a key) as text

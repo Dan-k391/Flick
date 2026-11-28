@@ -247,6 +247,13 @@ Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float max
 // p7b, ...: none for a file that isn't one or holds a private key); sniff: also ELF/Mach-O by their first bytes
 std::vector<std::wstring> ProgramInfo(const std::wstring& path, bool sniff);
 
+// ---- imgfmt.cpp: pictures WIC can't open by name, as 32bpp PBGRA (null: not readable). TGA, QOI, PNM/PAM, HDR, PCX
+// decoded there; EMF/WMF played by GDI at `scale` pixels per DIP (sets `vector`); CUR/ANI (first frame); the preview
+// PNG inside sketch/xmind/kra/ora zips.
+extern const wchar_t kImgOwnExt[];
+Microsoft::WRL::ComPtr<IWICBitmap> ImgLoad(const std::wstring& path, float scale, bool& vector);
+std::wstring ImgSelfTest();  // "" = ok
+
 // ---- convert.cpp: other formats as Markdown text ("" if not parseable)
 std::wstring NotebookToMarkdown(const std::wstring& json);
 std::wstring AsciiDocToMarkdown(const std::wstring& text);
