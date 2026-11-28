@@ -310,12 +310,14 @@ void MediaSetPlaying(bool play) {
     UpdatePump();
 }
 
-void MediaSeek(double seconds) {
-    if (!g_engine || g_error || !std::isfinite(seconds)) return;
+bool MediaSeek(double seconds) {
+    if (!g_engine || g_error || !std::isfinite(seconds)) return false;
     double duration = g_engine->GetDuration();
     seconds = std::max(seconds, 0.0);
     if (std::isfinite(duration) && duration > 0) seconds = std::min(seconds, duration);
-    if (!g_engine->IsSeeking() && std::abs(g_engine->GetCurrentTime() - seconds) < kMediaTimeEpsilon) return;
+    bool atEnd = duration > 0 && seconds == duration;
+    if (!g_engine->IsSeeking() && ((atEnd && g_engine->IsEnded()) ||
+        std::abs(g_engine->GetCurrentTime() - seconds) < kMediaTimeEpsilon)) return false;
     HRESULT hr = g_engineEx ? g_engineEx->SetCurrentTimeEx(seconds, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL)
                            : g_engine->SetCurrentTime(seconds);
     // In frame-server mode a paused seek can wait for OnVideoStreamTick before sending SEEKED.
@@ -323,9 +325,10 @@ void MediaSeek(double seconds) {
         ULONGLONG now = GetTickCount64();
         g_fastProbeUntil = now + kFastProbeMs;
         // Bound the retries when a source never supplies a frame, especially at EOF.
-        g_seekFrame = {now + (seconds == duration ? kEndProbeMs : kSeekProbeMs), seconds, false};
+        g_seekFrame = {now + (atEnd ? kEndProbeMs : kSeekProbeMs), seconds, false};
     }
     UpdatePump();
+    return SUCCEEDED(hr);
 }
 
 void MediaMute(bool muted) { g_muted = muted; }

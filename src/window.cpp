@@ -118,6 +118,7 @@ bool g_posterDone;      // the poster worker answered (with or without a frame)
 UINT g_posterW, g_posterH;  // size of the poster frame, until the engine knows the video size
 ComPtr<IWICBitmap> g_frameWic;
 ComPtr<ID2D1Bitmap> g_frame;
+ComPtr<ID2D1Bitmap> g_scrubFrame;  // provisional key frame until a seek transfers a playback frame
 D2D1_RECT_F g_playRc, g_trackRc, g_muteRc, g_volRc;
 double g_shownPos = -1;
 float g_seekFrac = -1;  // while dragging the seek bar: where the knob is (0..1)
@@ -1364,7 +1365,10 @@ bool TryFrame(const MediaState& s) {
     D2D1_RECT_F r = VideoRect(s);
     UINT w = (UINT)std::lround((r.right - r.left) * g_dpi / 96), h = (UINT)std::lround((r.bottom - r.top) * g_dpi / 96);
     if (!MediaFrame(w, h, g_wic.Get(), g_frameWic)) return false;
-    g_frame = ToD2D(g_frameWic.Get(), true);  // the engine writes the next frame into the same WIC bitmap
+    auto frame = ToD2D(g_frameWic.Get(), true);  // the engine writes the next frame into the same WIC bitmap
+    if (!frame) return false;
+    g_frame = std::move(frame);
+    g_scrubFrame.Reset();
     return true;
 }
 
@@ -1546,14 +1550,14 @@ void EndSeek() {
     g_seekDrag = false;
     g_scrubGen = 0;
     MediaScrubStop();
-    if (frac >= 0) MediaSeek(frac * MediaGet().dur);
+    if (frac < 0 || !MediaSeek(frac * MediaGet().dur)) g_scrubFrame.Reset();
     if (resume) MediaSetPlaying(true);
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
 void OnScrub(int gen, IWICBitmap* frame) {
     if (gen != g_scrubGen || !g_seekDrag || g_kind != K_Media) return;
-    g_frame = ToD2D(frame);
+    g_scrubFrame = ToD2D(frame);
     InvalidateRect(g_hwnd, nullptr, FALSE);
 }
 
@@ -1622,7 +1626,7 @@ void ClearContent() {
     FontClear();
     MediaClose();
     MediaScrubStop();
-    g_frame.Reset(), g_frameWic.Reset();
+    g_frame.Reset(), g_frameWic.Reset(), g_scrubFrame.Reset();
     g_mediaVideo = g_seekDrag = g_seekResume = false, g_shownPos = -1, g_seekFrac = -1;
     g_subs.clear(), g_subOn.clear(), g_subLayoutOn.clear(), g_subLayout.Reset();
     g_posterGen++, g_posterW = g_posterH = 0;
@@ -2198,8 +2202,8 @@ void Paint() {
                 float y = area.bottom - 52 - lyric;
                 g_rt->DrawText(line.c_str(), (UINT32)line.size(), g_fmtName.Get(), {area.left, y + 4, area.right, y + lyric}, text.Get());
             }
-        } else if (g_frame && (ms.videoW || g_posterW))
-            g_rt->DrawBitmap(g_frame.Get(), VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        } else if (auto* frame = g_scrubFrame ? g_scrubFrame.Get() : g_frame.Get(); frame && (ms.videoW || g_posterW))
+            g_rt->DrawBitmap(frame, VideoRect(ms), 1, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
         DrawControls(sz, text.Get(), fill.Get());
         if (g_mediaVideo) DrawSubs(ms, fill.Get());
     }

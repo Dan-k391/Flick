@@ -308,7 +308,7 @@ bool MediaOnTick(WPARAM gen, MediaState& state);
 bool MediaOnEvent(WPARAM gen, DWORD event);
 void MediaToggle();
 void MediaSetPlaying(bool play);  // pause/resume a seek drag without rewinding an ended clip
-void MediaSeek(double seconds);
+bool MediaSeek(double seconds);  // true when the engine accepted a position change
 void MediaMute(bool muted);  // for tests
 void MediaSetVolume(double v);  // 0..1, kept for the session
 double MediaVolume();           // 0 while muted
