@@ -30,12 +30,13 @@ bool ClassIs(HWND h, const wchar_t* name) {
 }
 
 bool IsDesktop(HWND h) { return ClassIs(h, L"Progman") || ClassIs(h, L"WorkerW"); }
+bool IsExplorer(HWND h) { return ClassIs(h, L"CabinetWClass") || IsDesktop(h); }
 
 // True when the foreground window is Explorer/desktop and keyboard focus is on the item view
 // (not the address bar, search box or a rename edit).
 HWND ExplorerWithItemFocus() {
     HWND fg = GetForegroundWindow();
-    if (!ClassIs(fg, L"CabinetWClass") && !IsDesktop(fg)) return nullptr;
+    if (!IsExplorer(fg)) return nullptr;
     GUITHREADINFO gti{sizeof gti};
     if (!GetGUIThreadInfo(GetWindowThreadProcessId(fg, nullptr), &gti)) return nullptr;
     return ClassIs(gti.hwndFocus, L"DirectUIHWND") || ClassIs(gti.hwndFocus, L"SysListView32") ? fg : nullptr;
@@ -81,13 +82,14 @@ void InstallHook() {
 }
 void CALLBACK OnFront(HWINEVENTHOOK, DWORD, HWND h, LONG, LONG, DWORD, DWORD eventTime) {
     ExplorerForeground(h, eventTime);
-    if (ClassIs(h, L"CabinetWClass") || IsDesktop(h)) InstallHook();
+    if (IsExplorer(h)) InstallHook();
 }
 
 // The hook lives on its own thread so a busy UI thread never delays system-wide keyboard input.
 DWORD WINAPI HookThread(void*) {
     InstallHook();
     SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND, nullptr, OnFront, 0, 0, WINEVENT_OUTOFCONTEXT);
+    ExplorerForeground(GetForegroundWindow(), GetTickCount());  // catch a switch before the hook was installed
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {}
     return 0;
@@ -520,9 +522,12 @@ c
     MediaMute(bench || (show && argc > 3 && !wcscmp(argv[3], L"--mute")));
     if (bench) return Bench(argc, argv);
     if (show) {
+        HWND foreground = GetForegroundWindow();
         wchar_t full[MAX_PATH];
         GetFullPathNameW(argv[2], MAX_PATH, full, nullptr);
         PreviewShow(full, Now());
+        if (IsExplorer(foreground)) PreviewAttachExplorer(foreground);
+        if (!PreviewVisible()) return 0;
     } else {
         TrayAdd(inst);
     }

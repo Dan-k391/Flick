@@ -61,6 +61,7 @@ std::vector<StyleRun> LexRange(Lexing&, UINT32 from, UINT32 to);  // runs in [fr
 struct Timing { double sel, load, ready, composed; const wchar_t* kind; };
 bool PreviewInit(HINSTANCE);
 Timing PreviewShow(std::wstring path, LONGLONG t0);
+void PreviewAttachExplorer(HWND source);  // associate a visible --show preview with its Explorer foreground
 void PreviewHide(bool restoreFocus);
 bool PreviewVisible();
 enum class ExplorerKey { Space, Follow, Escape };

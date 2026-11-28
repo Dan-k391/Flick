@@ -2713,7 +2713,8 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         case WM_FLICK_FIND:
-            if (!w || (g_canFind && (HWND)w == g_source && PreviewAcceptsNavigation((HWND)w))) FindOpen();
+            if (!w || (g_canFind && (HWND)w == g_source && GetForegroundWindow() == g_source &&
+                       PreviewAcceptsNavigation((HWND)w))) FindOpen();
             return 0;
         case WM_SETFOCUS:
             if (g_kind == K_Text) SetFocus(g_sci);
@@ -3092,6 +3093,16 @@ void OnExplorerInput() {
 Timing PreviewShow(std::wstring path, LONGLONG t0) {
     OpenRequest request{std::move(path), nullptr, t0};
     return ShowRequest(request);
+}
+
+void PreviewAttachExplorer(HWND source) {
+    if (!g_visible) return;
+    if (!KeepsPreview(GetForegroundWindow(), source)) return PreviewHide(false);
+    std::lock_guard lock(g_intentMutex);
+    g_source = source;
+    uint64_t session = g_intent.generation + 1;
+    g_intent = {source, ExplorerKey::Follow, 0, session, session, GetTickCount()};
+    g_visibleSession = session;
 }
 
 void PreviewHide(bool restoreFocus) {
