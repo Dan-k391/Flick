@@ -246,6 +246,7 @@ Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float max
 // ---- fileinfo.cpp: info-card lines for programs (exe, dll, sys, ...), installers (msi) and certificates (cer, pem,
 // p7b, ...: none for a file that isn't one or holds a private key); sniff: also ELF/Mach-O by their first bytes
 std::vector<std::wstring> ProgramInfo(const std::wstring& path, bool sniff);
+std::wstring FileInfoSelfTest();  // "" = ok
 
 // ---- imgfmt.cpp: pictures WIC can't open by name, as 32bpp PBGRA (null: not readable). TGA, QOI, PNM/PAM, HDR, PCX
 // decoded there; EMF/WMF played by GDI at `scale` pixels per DIP (sets `vector`); CUR/ANI (first frame); the preview

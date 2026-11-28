@@ -165,13 +165,8 @@ void CertInfo(const std::wstring& path, const std::wstring& ext, std::vector<std
 }
 
 // ELF and Mach-O (thin or universal): word size, CPU, kind, OS ABI.
-void NativeInfo(const std::wstring& path, std::vector<std::wstring>& out) {
-    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (f == INVALID_HANDLE_VALUE) return;
-    BYTE b[4096];
-    DWORD n = 0;
-    ReadFile(f, b, sizeof b, &n, nullptr);
-    CloseHandle(f);
+// b: the file's first n bytes (up to 4 KB).
+void NativeLines(const BYTE* b, DWORD n, std::vector<std::wstring>& out) {
     if (n < 8) return;
     if (!memcmp(b, "\x7F" "ELF", 4)) {
         bool is64 = b[4] == 2, be = b[5] == 2;
@@ -194,7 +189,7 @@ void NativeInfo(const std::wstring& path, std::vector<std::wstring>& out) {
             UINT64 ph = is64 ? u64(32) : u32(28);
             UINT size = u16(is64 ? 54 : 42), count = u16(is64 ? 56 : 44);
             kind = L"shared library";
-            for (UINT i = 0; i < count && size >= 4 && ph + (UINT64)(i + 1) * size <= n; i++)
+            for (UINT i = 0; i < count && size >= 4 && ph <= n && i < (n - ph) / size; i++)  // whole entries in b
                 if (u32((size_t)(ph + (UINT64)i * size)) == 3 /* PT_INTERP */) kind = L"executable (PIE)";
         }
         if (*kind) line += L" " + std::wstring(kind);
@@ -239,7 +234,33 @@ void NativeInfo(const std::wstring& path, std::vector<std::wstring>& out) {
                   cpu(rd(4), rd(8)) + (type < 12 && *kinds[type] ? L" " + std::wstring(kinds[type]) : L""));
 }
 
+void NativeInfo(const std::wstring& path, std::vector<std::wstring>& out) {
+    HANDLE f = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    BYTE b[4096];
+    DWORD n = 0;
+    ReadFile(f, b, sizeof b, &n, nullptr);
+    CloseHandle(f);
+    NativeLines(b, n, out);
+}
+
 }  // namespace
+
+std::wstring FileInfoSelfTest() {
+    // ELF64 shared object: program headers at 2^64 - 0xFFFF, 0xFFFF bytes each (an offset check that wraps reads
+    // below the buffer); then the same with one PT_INTERP entry in range: a PIE.
+    BYTE b[128] = {0x7F, 'E', 'L', 'F', 2, 1, 1};
+    b[16] = 3, b[18] = 62;
+    memset(b + 32, 0xFF, 8), b[32] = 1, b[54] = b[55] = 0xFF, b[56] = 1;
+    std::vector<std::wstring> out;
+    NativeLines(b, sizeof b, out);
+    if (out.size() != 1 || out[0] != L"ELF 64-bit x64 shared library") return L"elf wrap";
+    memset(b + 32, 0, 8), b[32] = 64, b[54] = 56, b[55] = 0, b[64] = 3;
+    out.clear();
+    NativeLines(b, sizeof b, out);
+    if (out.size() != 1 || out[0] != L"ELF 64-bit x64 executable (PIE)") return L"elf pie";
+    return L"";
+}
 
 std::vector<std::wstring> ProgramInfo(const std::wstring& path, bool sniff) {
     std::vector<std::wstring> out;
