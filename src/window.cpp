@@ -370,16 +370,12 @@ bool LoadImage(const std::wstring& path) {
     bool own = false;    // imgfmt.cpp: decoded whole already (a zoom has nothing more to decode)
     g_orient = 1;
     if (HasExt(path, kImgOwnExt)) {  // imgfmt.cpp: decoded whole, scaled below like the rest
-        double aw, ah;
-        PictureArea(aw, ah);
-        D2D1_SIZE_F natural;
-        ComPtr<IWICBitmapSource> b = ImgLoad(path, g_dpi / 96.f, {(float)aw, (float)ah}, natural);
+        ComPtr<IWICBitmapSource> b = ImgLoad(path);
         if (!b) return false;
         b->GetSize(&w, &h);
         pic = b;
         own = true;
-        g_natW = natural.width ? natural.width : w, g_natH = natural.width ? natural.height : h;
-        if (natural.width) label = std::to_wstring(std::lround(g_natW)) + L" × " + std::to_wstring(std::lround(g_natH));
+        g_natW = (float)w, g_natH = (float)h;
     } else {
         // Camera raw: only the embedded preview (often a full-size JPEG) of the Store codec's decoder, created by name
         // (for .dng WIC picks its own decoder, which shows the small first IFD). Without a codec or a preview of 256+ px:

@@ -24,7 +24,7 @@ src/word.cpp      docx reading view, OMML math, shared selection   src/pages.cpp
 src/office.cpp    odt/odp/doc/ppt -> Markdown; xlsx/xls/ods -> grid src/xml.h        XML scanner, small DOM, zips
 src/grid.cpp      CSV, sheets, archive and folder trees            src/pdf.cpp       PDF worker (Windows.Data.Pdf)
 src/media.cpp     audio/video (Media Foundation), subtitles        src/highlight.cpp Lexilla outside Scintilla
-src/imgfmt.cpp    TGA/QOI/PNM/HDR/PCX decoders, EMF/WMF via GDI, CUR/ANI, previews inside sketch/xmind/kra/ora
+src/imgfmt.cpp    TGA/QOI/PNM/HDR/PCX decoders, CUR/ANI, previews inside sketch/xmind/kra/ora
 src/font.cpp, svg.cpp (lunasvg), fileinfo.cpp (exe/dll/msi/ELF/Mach-O/certificates), lang.cpp (extension -> lexer), app.h
 third_party/      Scintilla, Lexilla, md4c, lunasvg + plutovg: unmodified, licenses beside them
 scripts/          make-samples.ps1, make-office-samples.ps1 (needs Office), bench.ps1, e2e.ps1, shot.ps1
@@ -102,8 +102,6 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 - Subtitles: the engine doesn't draw them in frame-server mode → parsed and drawn by us (`.lrc` beside audio too).
 - Camera RAW: WIC's own DNG decoder shows only the small first IFD → the Raw codec by container GUID, showing
   `GetPreview` (0.6 ms) turned by the TIFF orientation tag; `GetFrame` demosaics (24 MP ~440 ms): no preview, info card.
-- EMF/WMF: one GDI record can take minutes (a pen 2e9 wide) → pens/fonts clamped in a copy, played record by record
-  for at most 150 ms onto a canvas no larger than the window.
 - Certificates: `CryptQueryObject` with every format took ~5 ms → PEM to DER by hand, then a certificate or PKCS #7.
 
 **Office**
@@ -133,5 +131,6 @@ Memory: idle ~15–17 MB private; ~58 MB after any video (Media Foundation keeps
 ## Not done
 PDF text selection/zoom/find; selection across slides, Shift+click; charts/SmartArt (placeholder box); docx
 headers/footers/footnotes/columns; doc/ppt/odt/odp as pages; xlsb; ods/xls formatting; Markdown links/find;
-HTML; PSD/EPUB/3D; mail; APNG/animated WebP/ANI; RAW without an embedded preview (or past its size); pfx contents (password);
+HTML; PSD/EPUB/3D; mail; APNG/animated WebP/ANI; RAW without an embedded preview (or past its size); pfx contents (password); EMF/WMF (GDI
+playback can't be bounded in-process; needs a helper process);
 embedded subtitle tracks; multi-selection.

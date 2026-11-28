@@ -1,5 +1,5 @@
-// Pictures WIC can't open by file name: TGA, QOI, PNM/PAM, Radiance HDR and PCX decoded here; EMF/WMF played by
-// GDI; CUR/ANI through WIC's ICO decoder; the preview PNG inside sketch/xmind/kra/ora zips. All as 32bpp PBGRA for
+// Pictures WIC can't open by file name: TGA, QOI, PNM/PAM, Radiance HDR and PCX decoded here; CUR/ANI through
+// WIC's ICO decoder; the preview PNG inside sketch/xmind/kra/ora zips. All as 32bpp PBGRA for
 // the image view. Files are untrusted: every read is checked against the end, sizes are capped, and a truncated
 // file decodes as far as it goes (the rest stays transparent).
 #include "app.h"
@@ -12,7 +12,7 @@
 using Microsoft::WRL::ComPtr;
 
 extern const wchar_t kImgOwnExt[] =
-    L" .tga .qoi .pbm .pgm .ppm .pnm .pam .hdr .pcx .emf .wmf .cur .ani .sketch .xmind .kra .ora ";
+    L" .tga .qoi .pbm .pgm .ppm .pnm .pam .hdr .pcx .cur .ani .sketch .xmind .kra .ora ";
 
 namespace {
 
@@ -438,116 +438,6 @@ ComPtr<IWICBitmapSource> Ani(std::string_view f, IWICImagingFactory* wic) {
     return nullptr;
 }
 
-// Pen widths and font heights to at most 65,536 units; a reference device whose pixels per mm aren't plausible
-// (0.5-100) to 96 DPI.
-void TameEmf(std::string& e) {
-    auto i32 = [&](size_t at) -> INT32& { return *(INT32*)&e[at]; };
-    auto clamp = [&](size_t at) { i32(at) = std::clamp(i32(at), -65536, 65536); };
-    if (e.size() < 88) return;
-    for (int axis = 0; axis < 2; axis++) {
-        INT32 px = i32(72 + axis * 4), &mm = i32(80 + axis * 4);
-        if (px > 0 && !(mm > 0 && px >= mm / 2 && px <= mm * 100.0)) {
-            mm = std::max(1, MulDiv(px, 254, 960));
-            if (i32(4) >= 108 && e.size() >= 108) i32(100 + axis * 4) = mm * 1000;  // szlMicrometers
-        }
-    }
-    for (size_t pos = 0; pos + 8 <= e.size();) {
-        UINT32 type = (UINT32)i32(pos), size = (UINT32)i32(pos + 4);
-        if (size < 8 || size % 4 || size > e.size() - pos) break;
-        if (type == EMR_CREATEPEN && size >= 20) clamp(pos + 16);              // lopnWidth.x
-        if (type == EMR_EXTCREATEPEN && size >= 36) clamp(pos + 32);           // elpWidth
-        if (type == EMR_EXTCREATEFONTINDIRECTW && size >= 16) clamp(pos + 12); // lfHeight
-        pos += size;
-    }
-}
-
-// Record by record, until 150 ms or 500,000 records have gone (a file can take seconds or forever): what was drawn
-// by then is shown.
-struct Play {
-    LONGLONG end;
-    UINT records = 0;
-};
-int CALLBACK PlayRecord(HDC dc, HANDLETABLE* t, const ENHMETARECORD* r, int n, LPARAM p) {
-    auto* play = (Play*)p;
-    if (++play->records > 500000 || Now() > play->end) return 0;
-    PlayEnhMetaFileRecord(dc, t, r, n);
-    return 1;
-}
-LONGLONG Freq() {
-    LARGE_INTEGER f;
-    QueryPerformanceFrequency(&f);
-    return f.QuadPart;
-}
-
-// EMF, or WMF (with or without the placeable header; converted to EMF), played by GDI over white at 96 DPI x scale,
-// fitted into box (pixels). natural: its size in DIPs.
-ComPtr<IWICBitmap> Metafile(std::string_view f, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural, IWICImagingFactory* wic) {
-    HENHMETAFILE emf = nullptr;
-    auto* eh = (const ENHMETAHEADER*)f.data();
-    if (f.size() >= sizeof(ENHMETAHEADER) && eh->iType == EMR_HEADER && eh->dSignature == ENHMETA_SIGNATURE)
-        emf = SetEnhMetaFileBits((UINT)f.size(), (const BYTE*)f.data());
-    else if (f.size() >= 22 + 18 && U16(f, 0) == 0xCDD7 && U16(f, 2) == 0x9AC6) {  // placeable: bounds in units per inch
-        int inch = (int)U16(f, 14), l = (short)U16(f, 6), t = (short)U16(f, 8), r = (short)U16(f, 10), b = (short)U16(f, 12);
-        if (inch <= 0 || r <= l || b <= t) return nullptr;
-        METAFILEPICT mp{MM_ANISOTROPIC, MulDiv(r - l, 2540, inch), MulDiv(b - t, 2540, inch), nullptr};  // HIMETRIC
-        emf = SetWinMetaFileBits((UINT)f.size() - 22, (const BYTE*)f.data() + 22, nullptr, &mp);
-    } else if (f.size() >= 18 && (U16(f, 0) == 1 || U16(f, 0) == 2) && U16(f, 2) == 9) {
-        // No size in the file: its first SetWindowExt, taken as 96 DPI pixels (without a size GDI fills the screen).
-        METAFILEPICT mp{MM_ANISOTROPIC, 0, 0, nullptr};
-        for (size_t pos = 18; pos + 6 <= f.size();) {
-            UINT32 words = U16(f, pos) | (UINT32)U16(f, pos + 2) << 16;
-            UINT fn = U16(f, pos + 4);
-            if (fn == 0x020C && pos + 10 <= f.size()) {  // META_SETWINDOWEXT: y, x
-                mp.xExt = MulDiv(abs((short)U16(f, pos + 8)), 2540, 96), mp.yExt = MulDiv(abs((short)U16(f, pos + 6)), 2540, 96);
-                break;
-            }
-            if (words < 3 || !fn) break;  // malformed, or the end record
-            pos += (size_t)words * 2;
-        }
-        emf = SetWinMetaFileBits((UINT)f.size(), (const BYTE*)f.data(), nullptr, mp.xExt && mp.yExt ? &mp : nullptr);
-    }
-    if (!emf) return nullptr;
-    // One record can't be interrupted, and GDI takes minutes over a pen 2e9 units wide or a reference device of 1e9 mm:
-    // such values are tamed in a copy (WMF too, as the EMF it was converted to).
-    std::string e(GetEnhMetaFileBits(emf, 0, nullptr), '\0');
-    GetEnhMetaFileBits(emf, (UINT)e.size(), (BYTE*)e.data());
-    DeleteEnhMetaFile(emf);
-    TameEmf(e);
-    if (!(emf = SetEnhMetaFileBits((UINT)e.size(), (const BYTE*)e.data()))) return nullptr;
-    ENHMETAHEADER hd{};
-    GetEnhMetaFileHeader(emf, sizeof hd, &hd);
-    // Natural size in DIPs from the frame (0.01 mm), else the bounds (pixels); in doubles: the file's ints may overflow.
-    double w = ((double)hd.rclFrame.right - hd.rclFrame.left) * 96 / 2540, h = ((double)hd.rclFrame.bottom - hd.rclFrame.top) * 96 / 2540;
-    if (!(w >= 1 && h >= 1)) w = (double)hd.rclBounds.right - hd.rclBounds.left + 1, h = (double)hd.rclBounds.bottom - hd.rclBounds.top + 1;
-    w = std::clamp(w, 1.0, 1e7), h = std::clamp(h, 1.0, 1e7);
-    natural = {(float)w, (float)h};
-    // Drawn no larger than the picture area (vector: a bigger canvas only makes every record slower).
-    double k = std::min({(double)scale, box.width / w, box.height / h});
-    int pw = std::max(1, (int)std::lround(w * k)), ph = std::max(1, (int)std::lround(h * k));
-    ComPtr<IWICBitmap> out;
-    if (pw >= 1 && ph >= 1 && (UINT64)pw * ph <= kMaxPixels) {
-        BITMAPINFO bi{{sizeof(BITMAPINFOHEADER), pw, -ph, 1, 32, BI_RGB}};
-        void* bits = nullptr;
-        HDC dc = CreateCompatibleDC(nullptr);
-        if (HBITMAP dib = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0)) {
-            HGDIOBJ old = SelectObject(dc, dib);
-            PatBlt(dc, 0, 0, pw, ph, WHITENESS);
-            RECT rc{0, 0, pw, ph};
-            Play play{Now() + (LONGLONG)(0.15 * Freq())};
-            EnumEnhMetaFile(dc, emf, PlayRecord, &play, &rc);
-            GdiFlush();
-            BYTE* p = (BYTE*)bits;
-            for (size_t i = 3; i < (size_t)pw * ph * 4; i += 4) p[i] = 255;  // GDI leaves alpha 0
-            wic->CreateBitmapFromMemory(pw, ph, GUID_WICPixelFormat32bppPBGRA, pw * 4, (UINT)((size_t)pw * ph * 4), p, &out);
-            SelectObject(dc, old);
-            DeleteObject(dib);
-        }
-        DeleteDC(dc);
-    }
-    DeleteEnhMetaFile(emf);
-    return out;
-}
-
 // The preview picture a zip-based format keeps (first one found in this order).
 ComPtr<IWICBitmapSource> ZipPreview(const std::wstring& path, std::initializer_list<const wchar_t*> names, IWICImagingFactory* wic) {
     std::vector<std::pair<std::wstring, std::string>> m;
@@ -600,11 +490,10 @@ UINT TiffOrientation(const std::wstring& path) {
     return TiffOrient(f);
 }
 
-ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural) {
+ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path) {
     IWICImagingFactory* wic = WicFactory();
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
-    natural = {};
     if (ext == L".sketch") return ZipPreview(path, {L"previews/preview.png"}, wic);
     if (ext == L".xmind") return ZipPreview(path, {L"Thumbnails/thumbnail.png"}, wic);
     if (ext == L".kra") return ZipPreview(path, {L"mergedimage.png", L"preview.png"}, wic);
@@ -613,7 +502,6 @@ ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZ
     if (!ReadAll(path, f)) return nullptr;
     if (ext == L".cur") return Icon(f, wic);
     if (ext == L".ani") return Ani(f, wic);
-    if (ext == L".emf" || ext == L".wmf") return Metafile(f, scale, box, natural, wic);
     Img im;
     return Decode(f, ext, im) ? ToWic(im, wic) : nullptr;
 }

@@ -248,11 +248,10 @@ Microsoft::WRL::ComPtr<IWICBitmap> SvgRender(const std::wstring& path, float max
 std::vector<std::wstring> ProgramInfo(const std::wstring& path, bool sniff);
 std::wstring FileInfoSelfTest();  // "" = ok
 
-// ---- imgfmt.cpp: pictures WIC can't open by name, as 32bpp PBGRA (null: not readable). TGA, QOI, PNM/PAM, HDR, PCX
-// decoded there; EMF/WMF played by GDI at `scale` pixels per DIP, fitted into `box` pixels (sets `natural`, DIPs;
-// else 0 x 0); CUR/ANI (first frame); the preview PNG inside sketch/xmind/kra/ora zips.
+// ---- imgfmt.cpp: pictures WIC can't open by name, as WIC sources (null: not readable). TGA, QOI, PNM/PAM, HDR, PCX
+// decoded there; CUR/ANI (first frame); the preview PNG inside sketch/xmind/kra/ora zips.
 extern const wchar_t kImgOwnExt[];
-Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural);
+Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path);
 std::wstring ImgSelfTest();  // "" = ok
 UINT TiffOrientation(const std::wstring& path);  // EXIF-style 1-8 from a TIFF-based file's first IFD (camera raw); 1 if none
 
