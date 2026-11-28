@@ -367,14 +367,12 @@ bool LoadImage(const std::wstring& path) {
     GUID container{};
     UINT frames = 0, w, h;
     std::wstring label;  // "": the decoded size; starting with " ·": appended to it
-    bool own = false;    // imgfmt.cpp: decoded whole already (a zoom has nothing more to decode)
     g_orient = 1;
     if (HasExt(path, kImgOwnExt)) {  // imgfmt.cpp: decoded whole, scaled below like the rest
         ComPtr<IWICBitmapSource> b = ImgLoad(path);
         if (!b) return false;
         b->GetSize(&w, &h);
         pic = b;
-        own = true;
         g_natW = (float)w, g_natH = (float)h;
     } else {
         // Camera raw: only the embedded preview (often a full-size JPEG) of the Store codec's decoder, created by name
@@ -412,7 +410,7 @@ bool LoadImage(const std::wstring& path) {
     PictureArea(maxW, maxH);
     if (g_orient >= 5) std::swap(maxW, maxH);
     double s = g_decodeScale > 0 ? std::min(1.0, g_decodeScale) : std::min({1.0, maxW / w, maxH / h});
-    g_imgReduced = s < 1 && !own;  // Sharpen re-decodes; the own formats are whole already
+    g_imgReduced = s < 1;  // Sharpen decodes again when a zoom shows more than this (own formats too: from the file)
     ComPtr<IWICBitmapSource> src = pic;
     if (s < 1) {
         UINT sw = std::max(1u, (UINT)(w * s)), sh = std::max(1u, (UINT)(h * s));
