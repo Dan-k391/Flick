@@ -21,8 +21,8 @@ constexpr UINT64 kMaxPixels = 64 << 20;  // as the GIF canvas: 256 MB of pixels
 constexpr size_t kCancelPixels = 16 << 10;
 
 struct DecodeCancel {
-    const std::atomic<UINT>* gen = nullptr;
-    UINT mine = 0;
+    const std::atomic<int>* gen = nullptr;
+    int mine = 0;
     bool operator()() const { return gen && gen->load(std::memory_order_relaxed) != mine; }
 };
 
@@ -482,19 +482,25 @@ ComPtr<IWICBitmapSource> Ani(std::string_view f, IWICImagingFactory* wic) {
 }
 
 // The preview picture a zip-based format keeps (first one found in this order).
-ComPtr<IWICBitmapSource> ZipPreview(const std::wstring& path, std::initializer_list<const wchar_t*> names, IWICImagingFactory* wic) {
+ComPtr<IWICBitmapSource> ZipPreview(const std::wstring& path, std::initializer_list<const wchar_t*> names,
+                                    IWICImagingFactory* wic, DecodeCancel cancelled) {
     std::vector<std::pair<std::wstring, std::string>> m;
-    ArchiveReadMembers(path, [&](std::wstring_view n) -> size_t {  // the first of each name only (a zip may repeat it)
+    auto want = [&](std::wstring_view n) -> size_t {  // the first of each name only (a zip may repeat it)
         for (auto& [had, d] : m)
             if (had == n) return 0;
         for (auto* k : names)
             if (n == k) return 64 << 20;
         return 0;
-    }, m);
+    };
+    if (!ArchiveReadMembers(path, want, m, cancelled.gen, cancelled.mine)) return nullptr;
     for (auto* k : names)
-        for (auto& [n, d] : m)
-            if (n == k)
-                if (auto b = FromBytes(d, wic)) return b;
+        for (auto& [n, d] : m) {
+            if (n != k) continue;
+            if (cancelled()) return nullptr;
+            auto b = FromBytes(d, wic);
+            if (cancelled()) return nullptr;
+            if (b) return b;
+        }
     return nullptr;
 }
 
@@ -533,15 +539,15 @@ UINT TiffOrientation(const std::wstring& path) {
     return TiffOrient(f);
 }
 
-ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* wic, const std::atomic<UINT>* gen, UINT mine) {
+ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory* wic, const std::atomic<int>* gen, int mine) {
     DecodeCancel cancelled{gen, mine};
     if (cancelled()) return nullptr;
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
-    if (ext == L".sketch") return ZipPreview(path, {L"previews/preview.png"}, wic);
-    if (ext == L".xmind") return ZipPreview(path, {L"Thumbnails/thumbnail.png"}, wic);
-    if (ext == L".kra") return ZipPreview(path, {L"mergedimage.png", L"preview.png"}, wic);
-    if (ext == L".ora") return ZipPreview(path, {L"mergedimage.png", L"Thumbnails/thumbnail.png"}, wic);
+    if (ext == L".sketch") return ZipPreview(path, {L"previews/preview.png"}, wic, cancelled);
+    if (ext == L".xmind") return ZipPreview(path, {L"Thumbnails/thumbnail.png"}, wic, cancelled);
+    if (ext == L".kra") return ZipPreview(path, {L"mergedimage.png", L"preview.png"}, wic, cancelled);
+    if (ext == L".ora") return ZipPreview(path, {L"mergedimage.png", L"Thumbnails/thumbnail.png"}, wic, cancelled);
     std::string f;
     if (!ReadAll(path, f, cancelled)) return nullptr;
     if (ext == L".cur") return Icon(f, wic);

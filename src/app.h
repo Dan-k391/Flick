@@ -264,7 +264,7 @@ std::wstring FileInfoSelfTest();  // "" = ok
 // decoded there; CUR/ANI (first frame); the preview PNG inside sketch/xmind/kra/ora zips.
 extern const wchar_t kImgOwnExt[];
 Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, IWICImagingFactory*,
-                                               const std::atomic<UINT>* gen = nullptr, UINT mine = 0);
+                                               const std::atomic<int>* gen = nullptr, int mine = 0);
 std::wstring ImgSelfTest();  // "" = ok
 UINT TiffOrientation(const std::wstring& path);  // EXIF-style 1-8 from a TIFF-based file's first IFD (camera raw); 1 if none
 

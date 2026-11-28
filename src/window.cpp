@@ -195,7 +195,7 @@ constexpr UINT_PTR kGifTimer = 1, kZoomTimer = 2, kSelTimer = 3;
 float g_zoom = 1, g_panX, g_panY;  // pan: offset of the picture's centre from the area's centre, DIPs
 bool g_panDrag;
 POINT g_panAt;
-std::atomic<UINT> g_imageGen;
+std::atomic<int> g_imageGen;
 bool g_imagePending, g_imagePendingResized, g_imagePlaceholderSized, g_imagePlaceholderDrawn;
 bool g_imageSizingChanged;  // an intermediate size invalidated refinement, even if the final size is unchanged
 LONGLONG g_imageT0;
@@ -440,7 +440,7 @@ ComPtr<IWICBitmap> NativeReduced(IWICImagingFactory* wic, IWICBitmapSourceTransf
 // Opening uses the monitor area and may start a GIF on the UI thread. Refinement supplies a scale
 // and returns only a fully decoded bitmap and its metadata, with no window or D2D calls.
 bool DecodeRaster(const std::wstring& path, IWICImagingFactory* wic, double maxW, double maxH,
-                  double requestedScale, ImageFrame& image, const std::atomic<UINT>* gen = nullptr, UINT mine = 0) {
+                  double requestedScale, ImageFrame& image, const std::atomic<int>* gen = nullptr, int mine = 0) {
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
     ComPtr<IWICBitmapSource> pic;
@@ -1779,7 +1779,7 @@ void ZoomAt(float mx, float my, float factor) {
 struct ImageJob {
     std::wstring path;
     double scale, maxW, maxH;  // scale 0: initial fit to the monitor
-    UINT gen;
+    int gen;
 };
 
 SRWLOCK g_imageLock = SRWLOCK_INIT;
@@ -1849,7 +1849,7 @@ void ImageGeometryChanged() {
     if (!g_sizing) RefineImage(true);
 }
 
-void OnImage(UINT gen, const ImageFrame* image) {
+void OnImage(int gen, const ImageFrame* image) {
     if (gen != g_imageGen || g_kind != K_Image) return;
     if (std::exchange(g_imagePending, false)) {
         bool resized = std::exchange(g_imagePendingResized, false);
@@ -2755,7 +2755,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             OnPoster((int)w, reinterpret_cast<IWICBitmap*>(l));
             return 0;
         case WM_FLICK_IMAGE:
-            OnImage((UINT)w, reinterpret_cast<ImageFrame*>(l));
+            OnImage((int)w, reinterpret_cast<ImageFrame*>(l));
             return 0;
         case WM_FLICK_PLAYVIDEO:
             if ((int)w == g_posterGen && g_kind == K_Media && g_mediaVideo) {
