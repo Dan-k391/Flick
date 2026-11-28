@@ -169,9 +169,10 @@ constexpr size_t kTreePathUnits = 8 << 20;  // sum of row path lengths, includin
 constexpr size_t kTreePathMax = 4096, kTreeDepthMax = 255;
 constexpr double kArchiveReadMs = 3000, kFolderReadMs = 60;
 
-// Gzip has to inflate the TAR member before the next header. Drain native blocks so we can stop between them.
+// A filtered TAR stream has to go through the filter before reaching the next header. Drain native blocks
+// so we can stop between them.
 // This avoids copying the data or materializing holes in a sparse TAR member.
-bool DrainGzipTarMember(const Archive& api, void* reader, const std::atomic<int>& gen, int mine, LONGLONG start) {
+bool DrainTarMember(const Archive& api, void* reader, const std::atomic<int>& gen, int mine, LONGLONG start) {
     const void* bytes;
     size_t size;
     long long offset;
@@ -385,15 +386,16 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
     LONGLONG start = Now();
     if (api.open_filename_w(a, path.c_str(), 1 << 16) == 0) {
         ArchiveDirs dirs;
-        constexpr int kFilterGzip = 1, kFormatBaseMask = 0xff0000, kFormatTar = 0x30000;
-        bool gzip = api.filter_code && api.format && api.read_data_block && api.filter_code(a, 0) == kFilterGzip;
-        bool gzipTar = false;
+        constexpr int kFormatBaseMask = 0xff0000, kFormatTar = 0x30000;
+        // Index 0 is closest to the archive format; unfiltered streams have only the NONE filter (0).
+        const bool filtered = api.filter_code && api.format && api.read_data_block && api.filter_code(a, 0) > 0;
+        bool filteredTar = false;
         for (size_t headers = 0; gen == mine; headers++) {
             if (headers == kArchiveRows || MsSince(start) >= kArchiveReadMs) {
                 partial = true;
                 break;
             }
-            if (gzipTar && !DrainGzipTarMember(api, a, gen, mine, start)) {
+            if (filteredTar && !DrainTarMember(api, a, gen, mine, start)) {
                 partial = true;
                 break;
             }
@@ -405,7 +407,7 @@ std::unique_ptr<GridData> GridReadArchive(const std::wstring& path, const std::a
                 partial = true;
                 break;
             }
-            if (headers == 0 && gzip) gzipTar = (api.format(a) & kFormatBaseMask) == kFormatTar;
+            if (headers == 0 && filtered) filteredTar = (api.format(a) & kFormatBaseMask) == kFormatTar;
             const wchar_t* p = e ? api.pathname_w(e) : nullptr;
             if (!p) continue;
             size_t len = wcsnlen_s(p, kTreePathMax + 1);
