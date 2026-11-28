@@ -252,7 +252,7 @@ std::wstring FileInfoSelfTest();  // "" = ok
 // decoded there; EMF/WMF played by GDI at `scale` pixels per DIP, fitted into `box` pixels (sets `natural`, DIPs;
 // else 0 x 0); CUR/ANI (first frame); the preview PNG inside sketch/xmind/kra/ora zips.
 extern const wchar_t kImgOwnExt[];
-Microsoft::WRL::ComPtr<IWICBitmap> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural);
+Microsoft::WRL::ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural);
 std::wstring ImgSelfTest();  // "" = ok
 
 // ---- convert.cpp: other formats as Markdown text ("" if not parseable)

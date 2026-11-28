@@ -22,8 +22,11 @@ constexpr UINT64 kMaxPixels = 64 << 20;  // as the GIF canvas: 256 MB of pixels
 struct Img {
     UINT w = 0, h = 0;
     std::vector<BYTE> px;  // BGRA, straight alpha (premultiplied by ToWic)
-    bool Init(UINT64 W, UINT64 H) {
-        if (!W || !H || W > kMaxSide || H > kMaxSide || W * H > kMaxPixels) return false;
+    // most: the pixels the rest of the file could encode at the format's best ratio; more is a header asking for memory
+    // its data can't fill (21 bytes asked for 540 MB). Uncompressed data may be cut to a quarter and still show its top
+    // (exactly, a cut PPM fell to the text view: 360 ms): at most 16 bytes allocated per byte of file.
+    bool Init(UINT64 W, UINT64 H, UINT64 most) {
+        if (!W || !H || W > kMaxSide || H > kMaxSide || W * H > std::min(kMaxPixels, most)) return false;
         w = (UINT)W, h = (UINT)H;
         px.assign((size_t)W * H * 4, 0);
         return true;
@@ -40,6 +43,7 @@ struct Img {
 };
 
 UINT U16(std::string_view f, size_t i) { return (BYTE)f[i] | (BYTE)f[i + 1] << 8; }
+UINT32 U32(std::string_view f, size_t i) { return U16(f, i) | (UINT32)U16(f, i + 2) << 16; }
 UINT32 Be32(std::string_view f, size_t i) {
     return (UINT32)(BYTE)f[i] << 24 | (BYTE)f[i + 1] << 16 | (BYTE)f[i + 2] << 8 | (BYTE)f[i + 3];
 }
@@ -75,8 +79,10 @@ bool Tga(std::string_view f, Img& im) {
         }
         pos += (size_t)cmLen * eb;
     }
-    if (pos >= f.size() || !im.Init(w, h)) return false;
     UINT pb = (bpp + 7) / 8;
+    if (pos >= f.size()) return false;
+    size_t rest = f.size() - pos;
+    if (!im.Init(w, h, rle ? (rest / (1 + pb) + 1) * 128 : rest / pb * 4)) return false;
     auto pixel = [&](const BYTE* p) {
         if (base != 1) return color(p, pb, base == 3);
         UINT i = (pb == 1 ? p[0] : p[0] | p[1] << 8) - cmFirst;
@@ -111,7 +117,8 @@ bool Tga(std::string_view f, Img& im) {
 
 // ---- QOI (qoiformat.org)
 bool Qoi(std::string_view f, Img& im) {
-    if (f.size() < 14 || f.compare(0, 4, "qoif") || !im.Init(Be32(f, 4), Be32(f, 8))) return false;
+    if (f.size() < 14 || f.compare(0, 4, "qoif") || !im.Init(Be32(f, 4), Be32(f, 8), (f.size() - 14) * 62))
+        return false;
     const BYTE* d = (const BYTE*)f.data();
     BYTE index[64][4] = {}, c[4] = {0, 0, 0, 255};  // r g b a
     size_t pos = 14, end = f.size();
@@ -178,7 +185,9 @@ bool Pnm(std::string_view f, Img& im) {
         return false;
     if (maxval < 1 || maxval > 65535) return false;
     if (pos < f.size() && kind != 1 && kind != 2 && kind != 3) pos++;  // the single whitespace before the raster
-    if (!im.Init(w, h)) return false;
+    size_t rest = f.size() - std::min(pos, f.size());
+    UINT64 most = !w ? 0 : kind == 4 ? rest / ((w + 7) / 8) * w * 4 : kind <= 3 ? rest / (kind == 1 ? 1 : depth) : rest / (depth * (maxval > 255 ? 2 : 1)) * 4;
+    if (!im.Init(w, h, most)) return false;
     bool plain = kind <= 3, bits = kind == 1 || kind == 4, wide = maxval > 255;
     UINT ch = (UINT)depth;
     auto sample = [&](UINT64& v) {  // false at the end of the data
@@ -237,8 +246,9 @@ bool Hdr(std::string_view f, Img& im) {
     std::string res(line());
     char ys = 0, xs = 0;
     unsigned h = 0, w = 0;
+    size_t rest = f.size() - pos;
     if (sscanf_s(res.c_str(), "%cY %u %cX %u", &ys, 1, &h, &xs, 1, &w) != 4 || xs != '+' || (ys != '-' && ys != '+') ||
-        !im.Init(w, h))
+        !im.Init(w, h, w >= 8 && w < 32768 ? rest / 8 * 127 + 127 : rest / 4))
         return false;
     std::vector<BYTE> row((size_t)w * 4);
     std::vector<BYTE> lut(256 * 256);  // exponent, mantissa -> shown value
@@ -292,7 +302,9 @@ bool Pcx(std::string_view f, Img& im) {
     UINT w = x1 - x0 + 1, h = y1 - y0 + 1;
     bool ok = (bpp == 1 && planes >= 1 && planes <= 4) || ((bpp == 2 || bpp == 4) && planes == 1) ||
               (bpp == 8 && (planes == 1 || planes == 3 || planes == 4));
-    if (!ok || bpl < ((size_t)w * bpp + 7) / 8 || bpl > ((size_t)w * bpp + 7) / 8 + 8 || !im.Init(w, h)) return false;
+    if (!ok || bpl < ((size_t)w * bpp + 7) / 8 || bpl > ((size_t)w * bpp + 7) / 8 + 8 ||
+        !im.Init(w, h, (f[2] == 1 ? ((f.size() - 128) / 2 + 1) * 63 : (f.size() - 128) * 4) / ((size_t)planes * bpl) * w))
+        return false;
     const BYTE* d = (const BYTE*)f.data();
     UINT32 pal[256];
     for (UINT i = 0; i < 16; i++) pal[i] = d[16 + i * 3] << 16 | d[17 + i * 3] << 8 | d[18 + i * 3];
@@ -369,40 +381,47 @@ bool ReadAll(const std::wstring& path, std::string& out) {
     return ok;
 }
 
-// Any WIC format from memory (the stream reads the bytes in place: decoded before they go).
-ComPtr<IWICBitmap> FromBytes(std::string_view bytes, IWICImagingFactory* wic, const GUID* container = nullptr) {
-    ComPtr<IWICStream> st;
+// Any WIC format from memory: its frame, decoded later at the size shown (the image path scales big ones down while
+// decoding). Null over 30,000 px a side or 64 MP, as the decoders above.
+ComPtr<IWICBitmapSource> FromBytes(std::string_view bytes, IWICImagingFactory* wic, const GUID* container = nullptr) {
+    ComPtr<IStream> st;
+    st.Attach(SHCreateMemStream((const BYTE*)bytes.data(), (UINT)bytes.size()));  // a copy: outlives `bytes`
     ComPtr<IWICBitmapDecoder> dec;
     ComPtr<IWICBitmapFrameDecode> frame;
-    ComPtr<IWICFormatConverter> cv;
-    ComPtr<IWICBitmap> out;
-    if (FAILED(wic->CreateStream(&st)) || FAILED(st->InitializeFromMemory((BYTE*)bytes.data(), (DWORD)bytes.size())))
+    UINT w = 0, h = 0;
+    if (!st ||
+        (container ? FAILED(wic->CreateDecoder(*container, nullptr, &dec)) || FAILED(dec->Initialize(st.Get(), WICDecodeMetadataCacheOnDemand))
+                   : FAILED(wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec))) ||
+        FAILED(dec->GetFrame(0, &frame)) || FAILED(frame->GetSize(&w, &h)) || !w || !h || w > kMaxSide || h > kMaxSide ||
+        (UINT64)w * h > kMaxPixels)
         return nullptr;
-    if (container ? FAILED(wic->CreateDecoder(*container, nullptr, &dec)) || FAILED(dec->Initialize(st.Get(), WICDecodeMetadataCacheOnDemand))
-                  : FAILED(wic->CreateDecoderFromStream(st.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &dec)))
-        return nullptr;
-    UINT frames = 0, best = 0;
-    UINT64 most = 0;
-    dec->GetFrameCount(&frames);
-    for (UINT i = 0; i < frames && container; i++)  // icons: the largest image
-        if (UINT w, h; SUCCEEDED(dec->GetFrame(i, &frame)) && SUCCEEDED(frame->GetSize(&w, &h)) && (UINT64)w * h > most)
-            most = (UINT64)w * h, best = i;
-    if (FAILED(dec->GetFrame(best, &frame)) || FAILED(wic->CreateFormatConverter(&cv)) ||
-        FAILED(cv->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr, 0, WICBitmapPaletteTypeCustom)) ||
-        FAILED(wic->CreateBitmapFromSource(cv.Get(), WICBitmapCacheOnLoad, &out)))
-        return nullptr;
-    return out;
+    return frame;
 }
 
-// CUR (or ICO) bytes: WIC's ICO decoder wants type 1, a cursor says 2 (the rest of the layout is the same).
-ComPtr<IWICBitmap> Icon(std::string f, IWICImagingFactory* wic) {
-    if (f.size() < 6 || U16(f, 0) != 0 || (U16(f, 2) != 1 && U16(f, 2) != 2)) return nullptr;
-    f[2] = 1;
-    return FromBytes(f, wic, &GUID_ContainerFormatIco);
+// CUR/ICO bytes: the largest of the first 256 directory entries, alone in a one-image ICO (WIC's decoder wants type 1,
+// a cursor says 2; and picking by GetFrame decoded every entry: 65,535 of them never finished).
+size_t IconPick(std::string_view f) {  // -> the entry's offset, 0: none
+    if (f.size() < 6 || U16(f, 0) != 0 || (U16(f, 2) != 1 && U16(f, 2) != 2)) return 0;
+    size_t best = 0;
+    UINT64 most = 0;
+    for (size_t i = 0, n = std::min(U16(f, 4), 256u); i < n && 6 + (i + 1) * 16 <= f.size(); i++) {
+        size_t e = 6 + i * 16;
+        UINT64 px = (UINT64)((BYTE)f[e] ? (BYTE)f[e] : 256) * ((BYTE)f[e + 1] ? (BYTE)f[e + 1] : 256);  // 0 means 256
+        if (px > most) most = px, best = e;
+    }
+    return best;
+}
+ComPtr<IWICBitmapSource> Icon(std::string_view f, IWICImagingFactory* wic) {
+    size_t best = IconPick(f);
+    if (!best) return nullptr;
+    UINT32 size = U32(f, best + 8), at = U32(f, best + 12);
+    if (at > f.size() || size > f.size() - at) return nullptr;
+    std::string one = std::string("\0\0\1\0\1\0", 6) + std::string(f.substr(best, 12)) + std::string("\x16\0\0\0", 4);
+    return FromBytes(one + std::string(f.substr(at, size)), wic, &GUID_ContainerFormatIco);
 }
 
 // ANI: RIFF "ACON"; the first "icon" chunk of the LIST "fram" is a CUR/ICO. Only that first frame is shown.
-ComPtr<IWICBitmap> Ani(std::string_view f, IWICImagingFactory* wic) {
+ComPtr<IWICBitmapSource> Ani(std::string_view f, IWICImagingFactory* wic) {
     if (f.size() < 12 || f.compare(0, 4, "RIFF") || f.compare(8, 4, "ACON")) return nullptr;
     auto u32 = [&](size_t i) { return (UINT32)U16(f, i) | (UINT32)U16(f, i + 2) << 16; };
     for (size_t pos = 12; pos + 8 <= f.size();) {
@@ -411,7 +430,7 @@ ComPtr<IWICBitmap> Ani(std::string_view f, IWICImagingFactory* wic) {
         if (!f.compare(pos, 4, "LIST") && end - body >= 4 && !f.compare(body, 4, "fram"))
             for (size_t q = body + 4; q + 8 <= end;) {
                 UINT32 m = u32(q + 4);
-                if (!f.compare(q, 4, "icon")) return Icon(std::string(f.substr(q + 8, std::min<size_t>(m, end - q - 8))), wic);
+                if (!f.compare(q, 4, "icon")) return Icon(f.substr(q + 8, std::min<size_t>(m, end - q - 8)), wic);
                 q += 8 + (size_t)m + (m & 1);
             }
         pos = body + (size_t)n + (n & 1);
@@ -530,9 +549,11 @@ ComPtr<IWICBitmap> Metafile(std::string_view f, float scale, D2D1_SIZE_F box, D2
 }
 
 // The preview picture a zip-based format keeps (first one found in this order).
-ComPtr<IWICBitmap> ZipPreview(const std::wstring& path, std::initializer_list<const wchar_t*> names, IWICImagingFactory* wic) {
+ComPtr<IWICBitmapSource> ZipPreview(const std::wstring& path, std::initializer_list<const wchar_t*> names, IWICImagingFactory* wic) {
     std::vector<std::pair<std::wstring, std::string>> m;
-    ArchiveReadMembers(path, [&](std::wstring_view n) -> size_t {
+    ArchiveReadMembers(path, [&](std::wstring_view n) -> size_t {  // the first of each name only (a zip may repeat it)
+        for (auto& [had, d] : m)
+            if (had == n) return 0;
         for (auto* k : names)
             if (n == k) return 64 << 20;
         return 0;
@@ -546,7 +567,7 @@ ComPtr<IWICBitmap> ZipPreview(const std::wstring& path, std::initializer_list<co
 
 }  // namespace
 
-ComPtr<IWICBitmap> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural) {
+ComPtr<IWICBitmapSource> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F box, D2D1_SIZE_F& natural) {
     IWICImagingFactory* wic = WicFactory();
     std::wstring ext = PathFindExtensionW(path.c_str());
     for (auto& c : ext) c = towlower(c);
@@ -557,7 +578,7 @@ ComPtr<IWICBitmap> ImgLoad(const std::wstring& path, float scale, D2D1_SIZE_F bo
     if (ext == L".ora") return ZipPreview(path, {L"mergedimage.png", L"Thumbnails/thumbnail.png"}, wic);
     std::string f;
     if (!ReadAll(path, f)) return nullptr;
-    if (ext == L".cur") return Icon(std::move(f), wic);
+    if (ext == L".cur") return Icon(f, wic);
     if (ext == L".ani") return Ani(f, wic);
     if (ext == L".emf" || ext == L".wmf") return Metafile(f, scale, box, natural, wic);
     Img im;
@@ -603,7 +624,10 @@ std::wstring ImgSelfTest() {
     if (!dec("P1 2 1 #x\n01", L".pbm", im) || px(im, 0, 0) != 0xFFFFFFFF || px(im, 1, 0) != 0xFF000000) return L"pbm";
     if (!dec("P5 2 1 65535\n\xFF\xFF\x00\x00"s, L".pgm", im) || px(im, 0, 0) != 0xFFFFFFFF || px(im, 1, 0) != 0xFF000000)
         return L"pgm 16";
-    if (!dec("P6 2 2 255\n\xFF\x00\x00\x00"s, L".ppm", im) || px(im, 0, 0) != 0xFFFF0000 || px(im, 1, 0) != 0) return L"ppm cut";
+    // Raw data cut short shows what is there, down to a quarter of what the header asks for.
+    if (!dec("P6 2 2 255\n\xFF\x00\x00\x00"s, L".ppm", im) || px(im, 0, 0) != 0xFFFF0000 || px(im, 1, 0) != 0 ||
+        dec("P6 3 3 255\n\xFF\x00\x00\x00\x00"s, L".ppm", im))
+        return L"ppm cut";
     if (!dec("P7\nWIDTH 1\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n\x01\x02\x03\x80"s, L".pam", im) ||
         px(im, 0, 0) != 0x80010203)
         return L"pam";
@@ -628,5 +652,14 @@ std::wstring ImgSelfTest() {
     if (!dec(ega + "\x80\x00\x80\x00"s, L".pcx", im) || im.w != 1 || px(im, 0, 0) != 0xFF112233) return L"pcx ega";
     pcx[66] = (char)200;
     if (dec(pcx, L".pcx", im)) return L"pcx bad";
+    // Headers asking for more pixels than their data could encode at the format's best ratio: rejected before allocating.
+    if (dec(tga(2, 30000, 2000, 24, 0, "abc"), L".tga", im) || dec(tga(10, 30000, 2000, 24, 0, "\xFF\x01\x02\x03"s), L".tga", im) ||
+        dec("qoif\0\0\x1F\x40\0\0\x1F\x40\4\0\xC0"s, L".qoi", im) || dec("P5 20000 20000 255\n\x01"s, L".pgm", im) ||
+        dec("#?RADIANCE\n\n-Y 8000 +X 8000\n\x02\x02\x1F\x40"s, L".hdr", im))
+        return L"plausible";
+    // CUR/ICO: of a directory claiming 65,535 entries, the first 256 are looked at (the 257th, larger, isn't).
+    std::string cur = "\0\0\2\0\xFF\xFF"s + std::string(65535 * 16, '\0');
+    for (int i = 0; i < 257; i++) cur[6 + i * 16] = cur[7 + i * 16] = (char)(i == 100 ? 64 : i == 256 ? 128 : 16);
+    if (IconPick(cur) != 6 + 100 * 16 || IconPick(cur.substr(0, 5)) || IconPick("\0\0\3\0\1\0"s)) return L"cur pick";
     return L"";
 }

@@ -373,7 +373,7 @@ bool LoadImage(const std::wstring& path) {
         double aw, ah;
         PictureArea(aw, ah);
         D2D1_SIZE_F natural;
-        ComPtr<IWICBitmap> b = ImgLoad(path, g_dpi / 96.f, {(float)aw, (float)ah}, natural);
+        ComPtr<IWICBitmapSource> b = ImgLoad(path, g_dpi / 96.f, {(float)aw, (float)ah}, natural);
         if (!b) return false;
         b->GetSize(&w, &h);
         pic = b;
